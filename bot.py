@@ -8,8 +8,10 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = "8751822340:AAH-sKgtw58OUiUPnor5av_VeoIAMyWb5JA"
 CHAT_ID = "426470592"
+CMC_API_KEY = "b2e925cc66dc4dacacb1c3de4af26f35"
 
 TG_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
 UPSCALE_SYMBOLS = [
     "ETH","BNB","XRP","SOL","AAVE","ADA","ALGO","APT","ARB","ATOM",
@@ -37,43 +39,41 @@ def send_tg(text):
         logger.error(f"TG error: {e}")
 
 def get_prices():
-    """Используем CoinCap API - работает без блокировок"""
     try:
-        # Сначала получаем BTC
-        btc_r = requests.get(
-            "https://api.coincap.io/v2/assets/bitcoin",
-            timeout=15
-        )
-        btc_data = btc_r.json()
-        btc_change = float(btc_data["data"]["changePercent24Hr"])
-        btc_price = float(btc_data["data"]["priceUsd"])
-
-        # Получаем топ 200 монет
-        r = requests.get(
-            "https://api.coincap.io/v2/assets",
-            params={"limit": 200},
-            timeout=15
-        )
+        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
+        params = {
+            "limit": 200,
+            "convert": "USD",
+            "sort": "market_cap"
+        }
+        r = requests.get(CMC_URL, headers=headers, params=params, timeout=15)
         data = r.json()
 
-        prices = {"BTC": {"price": btc_price, "change": btc_change}}
+        if data.get("status", {}).get("error_code") != 0:
+            logger.error(f"CMC error: {data.get('status')}")
+            return None
 
-        for asset in data["data"]:
-            sym = asset["symbol"].upper()
-            if sym in UPSCALE_SYMBOLS:
-                try:
+        prices = {}
+        for coin in data["data"]:
+            sym = coin["symbol"]
+            try:
+                change = coin["quote"]["USD"]["percent_change_24h"]
+                price = coin["quote"]["USD"]["price"]
+                volume = coin["quote"]["USD"]["volume_24h"]
+                if sym == "BTC" or sym in UPSCALE_SYMBOLS:
                     prices[sym] = {
-                        "price": float(asset["priceUsd"]),
-                        "change": float(asset["changePercent24Hr"])
+                        "price": price,
+                        "change": change,
+                        "volume": volume
                     }
-                except:
-                    pass
+            except:
+                pass
 
-        logger.info(f"Got {len(prices)} prices from CoinCap")
+        logger.info(f"Got {len(prices)} prices from CMC")
         return prices
 
     except Exception as e:
-        logger.error(f"CoinCap error: {e}")
+        logger.error(f"CMC error: {e}")
         return None
 
 def fmt(p):
@@ -101,6 +101,7 @@ def scan():
                 "sym": sym,
                 "price": info["price"],
                 "change": info["change"],
+                "volume": info["volume"],
                 "diff": diff
             })
 
@@ -108,7 +109,7 @@ def scan():
     top = candidates[:3]
 
     if not top:
-        logger.info("No candidates with decorrelation")
+        logger.info("No candidates found")
         return
 
     now = datetime.now().strftime("%H:%M")
@@ -131,11 +132,11 @@ def scan():
     msg += "💡 Входи в 1-2 лучших\nЕсли один против — выходишь, второй держишь"
 
     send_tg(msg)
-    logger.info(f"Signal sent: {[c['sym'] for c in top]}")
+    logger.info(f"Signals sent: {[c['sym'] for c in top]}")
 
 def main():
     logger.info("Upscale Signal Bot started!")
-    send_tg("🤖 <b>Upscale Signal Bot запущен!</b>\nСканирую каждые 15 минут...\nИсточник: CoinCap API")
+    send_tg("🤖 <b>Upscale Signal Bot запущен!</b>\nСканирую каждые 15 минут...\nИсточник: CoinMarketCap API ✅")
 
     while True:
         try:
