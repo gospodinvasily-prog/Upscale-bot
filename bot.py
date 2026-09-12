@@ -2,6 +2,7 @@ import logging
 import requests
 import time
 from datetime import datetime
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,8 +42,12 @@ UPSCALE_SYMBOLS = set([
 
 START_HOUR = 4
 END_HOUR = 22
+MIN_SCANS_FOR_BASE = 4   # минимум 4 скана (1 час) для базы
+RVOL_THRESHOLD = 2.0     # спайк = текущий прирост в 2x выше среднего
 
-prev_volumes = {}
+# Память
+prev_volumes = {}                          # объём предыдущего скана
+volume_deltas = defaultdict(list)          # история приростов за день
 scan_count = 0
 last_status_hour = -1
 
@@ -103,6 +108,44 @@ def fmt(p):
     if p >= 0.01: return f"${p:.5f}"
     return f"${p:.8f}"
 
+def get_rvol(sym, cur_vol):
+    """
+    RVOL логика:
+    1. Считаем прирост объёма за 15 минут (дельта)
+    2. Сравниваем с средним приростом за день
+    3. Если текущий прирост в 2x выше среднего — спайк
+    """
+    prev_vol = prev_volumes.get(sym, 0)
+    if prev_vol <= 0 or cur_vol <= 0:
+        return 0, False
+
+    # Абсолютный прирост за 15 минут
+    delta = cur_vol - prev_vol
+
+    # Только положительный прирост имеет смысл
+    if delta <= 0:
+        return 0, False
+
+    # Добавляем в историю
+    volume_deltas[sym].append(delta)
+
+    # Нужно минимум MIN_SCANS_FOR_BASE точек для надёжной базы
+    if len(volume_deltas[sym]) < MIN_SCANS_FOR_BASE:
+        return 0, False
+
+    # Средний прирост за последние 20 сканов (или сколько есть)
+    recent = volume_deltas[sym][-20:]
+    avg_delta = sum(recent) / len(recent)
+
+    if avg_delta <= 0:
+        return 0, False
+
+    # RVOL = текущий прирост / средний прирост
+    rvol = delta / avg_delta
+
+    spike = rvol >= RVOL_THRESHOLD
+    return rvol, spike
+
 def scan():
     global prev_volumes, scan_count, last_status_hour
 
@@ -110,11 +153,13 @@ def scan():
 
     if not is_trading_hours():
         logger.info(f"Outside trading hours. MSK: {msk_time}")
+        # Сброс в начале нового дня
         if msk_hour == START_HOUR:
             prev_volumes.clear()
+            volume_deltas.clear()
             scan_count = 0
             last_status_hour = -1
-            logger.info("New day — reset")
+            logger.info("New day — reset all")
         return
 
     data = get_prices()
@@ -136,16 +181,17 @@ def scan():
     # Статус раз в час
     if msk_hour != last_status_hour:
         btc_arrow = "⬇️" if btc_change_1h < 0 else "⬆️"
+        base_ready = scan_count >= MIN_SCANS_FOR_BASE
         status_msg = (
             f"📡 <b>Статус {msk_time} МСК</b>\n\n"
             f"BTC: {fmt(btc_price)} | 1h: {btc_change_1h:+.2f}% {btc_arrow}\n"
             f"Сканирую: {len(data)-1} пар\n"
-            f"Раскорреляций 1h: {decorr_count}\n\n"
-            f"😴 Жду спайк объёма..."
+            f"Раскорреляций 1h: {decorr_count}\n"
+            f"База RVOL: {'✅ готова' if base_ready else f'⏳ скан {scan_count}/{MIN_SCANS_FOR_BASE}'}\n\n"
+            f"{'😴 Жду спайк объёма...' if base_ready else '⏳ Накапливаю базу...'}"
         )
         send_tg(status_msg)
         last_status_hour = msk_hour
-        logger.info(f"Status sent for hour {msk_hour}")
 
     # Первый скан — только заполняем память объёмов
     if scan_count == 1:
@@ -154,30 +200,33 @@ def scan():
         logger.info("First scan — volume memory filled")
         return
 
+    # Нужно минимум 4 скана для базы
+    if scan_count < MIN_SCANS_FOR_BASE:
+        for sym, info in data.items():
+            get_rvol(sym, info["volume_24h"])
+            prev_volumes[sym] = info["volume_24h"]
+        logger.info(f"Building base... scan {scan_count}/{MIN_SCANS_FOR_BASE}")
+        return
+
     candidates = []
     for sym, info in data.items():
         if sym == "BTC":
             continue
 
         cur_vol = info["volume_24h"]
-        prev_vol = prev_volumes.get(sym, 0)
+        rvol, spike = get_rvol(sym, cur_vol)
 
-        vol_spike = False
-        vol_delta_pct = 0
-
-        if prev_vol > 0 and cur_vol > 0:
-            vol_delta_pct = (cur_vol - prev_vol) / prev_vol * 100
-            vol_spike = vol_delta_pct >= 20
-
+        # Раскорреляция по 1h
         diff_1h = info["change_1h"] - btc_change_1h
 
-        if diff_1h >= 1.5 and vol_spike:
+        # Оба условия: раскорреляция И спайк объёма
+        if diff_1h >= 1.5 and spike:
             candidates.append({
                 "sym": sym,
                 "price": info["price"],
                 "change_1h": info["change_1h"],
                 "diff_1h": diff_1h,
-                "vol_delta_pct": vol_delta_pct
+                "rvol": rvol
             })
 
     # Обновляем память объёмов
@@ -185,10 +234,11 @@ def scan():
         prev_volumes[sym] = info["volume_24h"]
 
     if not candidates:
-        logger.info(f"No signals. Scan #{scan_count}, decorr: {decorr_count}")
+        logger.info(f"No signals. Scan #{scan_count}, decorr: {decorr_count}, rvol_pairs: 0")
         return
 
-    candidates.sort(key=lambda x: x["vol_delta_pct"] * x["diff_1h"], reverse=True)
+    # Сортируем по RVOL * раскорреляция
+    candidates.sort(key=lambda x: x["rvol"] * x["diff_1h"], reverse=True)
     top = candidates[:3]
 
     btc_arrow = "⬇️" if btc_change_1h < 0 else "⬆️"
@@ -205,7 +255,7 @@ def scan():
         tp2 = price * 1.09
 
         msg += f"{medals[i]} <b>{c['sym']}/USDT</b> {sig}\n"
-        msg += f"📈 Объём +{c['vol_delta_pct']:.0f}% за 15 мин\n"
+        msg += f"📊 RVOL: {c['rvol']:.1f}x (объём в {c['rvol']:.1f}x выше нормы)\n"
         msg += f"⚡ 1h: {c['change_1h']:+.2f}% | vs BTC: +{c['diff_1h']:.1f}%\n"
         msg += f"📍 Вход: {fmt(price)}\n"
         msg += f"🛑 Стоп: {fmt(stop)}\n"
@@ -214,18 +264,19 @@ def scan():
     msg += "💡 Входи в 1-2 лучших\nЕсли один против — выходишь, второй держишь"
 
     send_tg(msg)
-    logger.info(f"Signals sent: {[c['sym'] for c in top]}")
+    logger.info(f"Signals: {[(c['sym'], round(c['rvol'],1)) for c in top]}")
 
 def main():
-    logger.info("Bot v3.1 started!")
+    logger.info("Bot v3.2 RVOL started!")
     send_tg(
-        "🤖 <b>Upscale Signal Bot v3.1</b>\n\n"
-        "✅ Скачок объёма за 15 мин (+20%)\n"
+        "🤖 <b>Upscale Signal Bot v3.2</b>\n\n"
+        "✅ RVOL — реальный скачок объёма (2x от нормы)\n"
         "✅ Раскорреляция с BTC по 1h\n"
         "✅ Торговые часы: 04:00-22:00 МСК\n"
         "✅ Статус каждый час\n"
         f"✅ {len(UPSCALE_SYMBOLS)} пар USDT\n\n"
-        "Жду реальный спайк объёма..."
+        "Накапливаю базу объёма (1 час)...\n"
+        "Потом жду реальный спайк!"
     )
     while True:
         try:
