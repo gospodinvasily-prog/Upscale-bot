@@ -27,15 +27,16 @@ MSK = timezone(timedelta(hours=3))
 
 UPSCALE_PAIRS = [
     "ETH","BNB","XRP","SOL","AAVE","ADA","AERO","ALGO","APT","ARB",
-    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BONK","BRETT","CAKE",
-    "CHZ","CRO","CRV","DASH","DOGE","DOT","DYDX","EIGEN","ENA","ENS",
-    "ETC","FET","FIL","FLOKI","GALA","GRAM","GRASS","GRT","HBAR",
-    "HYPE","ICP","IMX","INJ","IOTA","JASMY","JTO","JUP","KAIA","KAS",
-    "LDO","LINK","LTC","MANA","MNT","MORPHO","MOVE","NEAR","ONDO",
-    "OP","ORDI","PENDLE","PENGU","PEPE","PNUT","POL","POPCAT","PYTH",
-    "QNT","RAY","RENDER","RUNE","SAND","SEI","SHIB","SKY","STRK",
-    "STX","SUI","TAO","TIA","TRUMP","TRX","TURBO","UNI","VET",
-    "VIRTUAL","WAL","WIF","WLD","XLM","XMR","XTZ","ZEC","ZRO"
+    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BGB","BONK","BRETT","BSV",
+    "CAKE","CHZ","CRO","CRV","DASH","DATA","DEEP","DEXE","DOGE","DOT",
+    "DYDX","EIGEN","ENA","ENS","ETC","FARTCOIN","FET","FIL","FLOKI",
+    "GALA","GRAM","GRASS","GRT","HBAR","HYPE","ICP","IMX","INJ","IOTA",
+    "JASMY","JTO","JUP","KAIA","KAITO","KAS","LDO","LINEA","LINK","LTC",
+    "MANA","MNT","MORPHO","MOVE","NEAR","ONDO","OP","ORDI","PENDLE",
+    "PENGU","PEPE","PNUT","POL","POPCAT","PUMP","PYTH","QNT","RAY",
+    "RENDER","RUNE","S","SAND","SEI","SHIB","SKY","STRK","STX","SUI",
+    "TAO","TIA","TRUMP","TRX","TURBO","UNI","VET","VIRTUAL","WAL",
+    "WIF","WLD","XLM","XMR","XTZ","ZEC","ZRO","0G"
 ]
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
