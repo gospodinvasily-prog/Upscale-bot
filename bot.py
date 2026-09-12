@@ -13,7 +13,6 @@ CMC_API_KEY = "b2e925cc66dc4dacacb1c3de4af26f35"
 TG_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
-# Все пары из Upscale (проверено по скринам)
 UPSCALE_SYMBOLS = set([
     "ETH","BNB","XRP","SOL",
     "AAVE","ADA","AERO","ALGO","APT","ARB","ASTER","ATOM","AVAX","AXS",
@@ -29,29 +28,23 @@ UPSCALE_SYMBOLS = set([
     "KAIA","KAITO","KAS",
     "LDO","LINEA","LINK","LTC",
     "MANA","MNT","MORPHO","MOVE",
-    "NEAR",
-    "ONDO","OP","ORDI",
+    "NEAR","ONDO","OP","ORDI",
     "PENDLE","PENGU","PEPE","PNUT","POL","POPCAT","PUMP","PYTH",
-    "QNT",
-    "RAY","RENDER","RUNE",
+    "QNT","RAY","RENDER","RUNE",
     "S","SAND","SEI","SHIB","SKY","STRK","STX","SUI",
     "TAO","TIA","TRUMP","TRX","TURBO",
-    "UNI",
-    "VET","VIRTUAL",
+    "UNI","VET","VIRTUAL",
     "WAL","WIF","WLD",
-    "XLM","XMR","XTZ",
-    "ZEC","ZRO",
+    "XLM","XMR","XTZ","ZEC","ZRO",
     "1000BONK","1000PEPE","1000SHIB"
 ])
 
-# Время работы бота (МСК = UTC+3)
-START_HOUR = 4   # 04:00 МСК
-END_HOUR = 22    # 22:00 МСК
+START_HOUR = 4
+END_HOUR = 22
 
-# Память объёмов и базовый объём
 prev_volumes = {}
-base_volumes = {}  # средний объём накопленный с утра
 scan_count = 0
+last_status_hour = -1
 
 def send_tg(text):
     try:
@@ -63,31 +56,28 @@ def send_tg(text):
         if not r.json().get("ok"):
             logger.error(f"TG error: {r.json()}")
         else:
-            logger.info("Message sent OK")
+            logger.info("TG sent OK")
     except Exception as e:
         logger.error(f"TG error: {e}")
 
+def get_msk_time():
+    now = datetime.utcnow()
+    msk_hour = (now.hour + 3) % 24
+    return msk_hour, f"{msk_hour:02d}:{now.minute:02d}"
+
 def is_trading_hours():
-    """Проверяем торговые часы МСК (UTC+3)"""
-    utc_hour = datetime.utcnow().hour
-    msk_hour = (utc_hour + 3) % 24
+    msk_hour, _ = get_msk_time()
     return START_HOUR <= msk_hour < END_HOUR
 
 def get_prices():
     try:
         headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
-        params = {
-            "limit": 500,
-            "convert": "USD",
-            "sort": "market_cap"
-        }
+        params = {"limit": 500, "convert": "USD", "sort": "market_cap"}
         r = requests.get(CMC_URL, headers=headers, params=params, timeout=20)
         data = r.json()
-
         if data.get("status", {}).get("error_code") != 0:
             logger.error(f"CMC error: {data.get('status')}")
             return None
-
         prices = {}
         for coin in data["data"]:
             sym = coin["symbol"]
@@ -97,12 +87,10 @@ def get_prices():
                     prices[sym] = {
                         "price": q["price"],
                         "change_1h": q.get("percent_change_1h", 0) or 0,
-                        "change_24h": q.get("percent_change_24h", 0) or 0,
                         "volume_24h": q.get("volume_24h", 0) or 0,
                     }
                 except:
                     pass
-
         logger.info(f"Got {len(prices)} prices")
         return prices
     except Exception as e:
@@ -115,34 +103,18 @@ def fmt(p):
     if p >= 0.01: return f"${p:.5f}"
     return f"${p:.8f}"
 
-def update_base_volumes(data):
-    """Обновляем базовый средний объём"""
-    global base_volumes, scan_count
-    scan_count += 1
-    for sym, info in data.items():
-        vol = info["volume_24h"]
-        if vol <= 0:
-            continue
-        if sym not in base_volumes:
-            base_volumes[sym] = vol
-        else:
-            # Скользящее среднее
-            base_volumes[sym] = (base_volumes[sym] * (scan_count - 1) + vol) / scan_count
-
 def scan():
-    global prev_volumes, scan_count
+    global prev_volumes, scan_count, last_status_hour
 
-    # Проверяем торговые часы
+    msk_hour, msk_time = get_msk_time()
+
     if not is_trading_hours():
-        utc_hour = datetime.utcnow().hour
-        msk_hour = (utc_hour + 3) % 24
-        logger.info(f"Outside trading hours. MSK: {msk_hour:02d}:xx")
-
-        # Сбрасываем базу в начале нового дня
+        logger.info(f"Outside trading hours. MSK: {msk_time}")
         if msk_hour == START_HOUR:
-            base_volumes.clear()
+            prev_volumes.clear()
             scan_count = 0
-            logger.info("New day — volume base reset")
+            last_status_hour = -1
+            logger.info("New day — reset")
         return
 
     data = get_prices()
@@ -150,17 +122,36 @@ def scan():
         logger.warning("No data")
         return
 
-    # Накапливаем базовый объём
-    update_base_volumes(data)
-
+    scan_count += 1
     btc = data["BTC"]
     btc_change_1h = btc["change_1h"]
     btc_price = btc["price"]
 
-    # Нужно минимум 4 скана (1 час) для надёжной базы
-    if scan_count < 4:
-        msk_hour = (datetime.utcnow().hour + 3) % 24
-        logger.info(f"Building volume base... scan {scan_count}/4. MSK: {msk_hour:02d}:xx")
+    # Считаем раскорреляции для статуса
+    decorr_count = sum(
+        1 for sym, info in data.items()
+        if sym != "BTC" and (info["change_1h"] - btc_change_1h) >= 1.5
+    )
+
+    # Статус раз в час
+    if msk_hour != last_status_hour:
+        btc_arrow = "⬇️" if btc_change_1h < 0 else "⬆️"
+        status_msg = (
+            f"📡 <b>Статус {msk_time} МСК</b>\n\n"
+            f"BTC: {fmt(btc_price)} | 1h: {btc_change_1h:+.2f}% {btc_arrow}\n"
+            f"Сканирую: {len(data)-1} пар\n"
+            f"Раскорреляций 1h: {decorr_count}\n\n"
+            f"😴 Жду спайк объёма..."
+        )
+        send_tg(status_msg)
+        last_status_hour = msk_hour
+        logger.info(f"Status sent for hour {msk_hour}")
+
+    # Первый скан — только заполняем память объёмов
+    if scan_count == 1:
+        for sym, info in data.items():
+            prev_volumes[sym] = info["volume_24h"]
+        logger.info("First scan — volume memory filled")
         return
 
     candidates = []
@@ -168,45 +159,40 @@ def scan():
         if sym == "BTC":
             continue
 
-        # Раскорреляция по 1h
-        diff_1h = info["change_1h"] - btc_change_1h
-        if diff_1h < 1.5:
-            continue
-
-        # Проверяем спайк объёма
         cur_vol = info["volume_24h"]
-        base_vol = base_volumes.get(sym, 0)
+        prev_vol = prev_volumes.get(sym, 0)
 
-        if base_vol <= 0 or cur_vol <= 0:
-            continue
+        vol_spike = False
+        vol_delta_pct = 0
 
-        vol_ratio = cur_vol / base_vol
-        vol_spike = vol_ratio >= 1.5  # объём выше базы на 50%+
+        if prev_vol > 0 and cur_vol > 0:
+            vol_delta_pct = (cur_vol - prev_vol) / prev_vol * 100
+            vol_spike = vol_delta_pct >= 20
 
-        # Без спайка объёма — пропускаем
-        if not vol_spike:
-            continue
+        diff_1h = info["change_1h"] - btc_change_1h
 
-        candidates.append({
-            "sym": sym,
-            "price": info["price"],
-            "change_1h": info["change_1h"],
-            "diff_1h": diff_1h,
-            "vol_ratio": vol_ratio,
-            "vol_pct": (vol_ratio - 1) * 100
-        })
+        if diff_1h >= 1.5 and vol_spike:
+            candidates.append({
+                "sym": sym,
+                "price": info["price"],
+                "change_1h": info["change_1h"],
+                "diff_1h": diff_1h,
+                "vol_delta_pct": vol_delta_pct
+            })
+
+    # Обновляем память объёмов
+    for sym, info in data.items():
+        prev_volumes[sym] = info["volume_24h"]
 
     if not candidates:
-        logger.info("No signals with volume spike")
+        logger.info(f"No signals. Scan #{scan_count}, decorr: {decorr_count}")
         return
 
-    # Сортируем по силе объёма * раскорреляции
-    candidates.sort(key=lambda x: x["vol_ratio"] * x["diff_1h"], reverse=True)
+    candidates.sort(key=lambda x: x["vol_delta_pct"] * x["diff_1h"], reverse=True)
     top = candidates[:3]
 
-    now = datetime.now().strftime("%H:%M")
     btc_arrow = "⬇️" if btc_change_1h < 0 else "⬆️"
-    msg = f"🚨 <b>СИГНАЛ {now} МСК</b>\n\n"
+    msg = f"🚨 <b>СИГНАЛ {msk_time} МСК</b>\n\n"
     msg += f"BTC: {fmt(btc_price)} | 1h: {btc_change_1h:+.2f}% {btc_arrow}\n"
     msg += f"{'─'*22}\n\n"
 
@@ -219,7 +205,7 @@ def scan():
         tp2 = price * 1.09
 
         msg += f"{medals[i]} <b>{c['sym']}/USDT</b> {sig}\n"
-        msg += f"📈 Объём: +{c['vol_pct']:.0f}% от базы\n"
+        msg += f"📈 Объём +{c['vol_delta_pct']:.0f}% за 15 мин\n"
         msg += f"⚡ 1h: {c['change_1h']:+.2f}% | vs BTC: +{c['diff_1h']:.1f}%\n"
         msg += f"📍 Вход: {fmt(price)}\n"
         msg += f"🛑 Стоп: {fmt(stop)}\n"
@@ -231,18 +217,16 @@ def scan():
     logger.info(f"Signals sent: {[c['sym'] for c in top]}")
 
 def main():
-    global scan_count, base_volumes
-    logger.info("Upscale Signal Bot v3.0 started!")
+    logger.info("Bot v3.1 started!")
     send_tg(
-        "🤖 <b>Upscale Signal Bot v3.0</b>\n\n"
-        "✅ Торговые окна: 04:00 - 22:00 МСК\n"
-        "✅ Спайк объёма +50% от базы\n"
-        "✅ Раскорреляция по 1h\n"
+        "🤖 <b>Upscale Signal Bot v3.1</b>\n\n"
+        "✅ Скачок объёма за 15 мин (+20%)\n"
+        "✅ Раскорреляция с BTC по 1h\n"
+        "✅ Торговые часы: 04:00-22:00 МСК\n"
+        "✅ Статус каждый час\n"
         f"✅ {len(UPSCALE_SYMBOLS)} пар USDT\n\n"
-        "Без спайка объёма — молчу.\n"
-        "Накапливаю базу объёма 1 час после 04:00 МСК..."
+        "Жду реальный спайк объёма..."
     )
-
     while True:
         try:
             scan()
