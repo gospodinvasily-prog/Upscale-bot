@@ -9,17 +9,17 @@ CMC_API_KEY    = os.environ.get("CMC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
 
-SCAN_INTERVAL_MIN  = 15          # минут между сканами
-TRADING_START_MSK  = 4           # 04:00 МСК
-TRADING_END_MSK    = 22          # 22:00 МСК
+SCAN_INTERVAL_MIN  = 15
+TRADING_START_MSK  = 4
+TRADING_END_MSK    = 22
 
-BTC_DECORR_THRESHOLD = 1.5       # % — альт опережает BTC минимум на столько за 1h
-RVOL_THRESHOLD       = 1.5       # текущая свеча > EMA-20 в 1.5 раза
-TOP_N_SIGNALS        = 3         # сколько сигналов слать
+BTC_DECORR_THRESHOLD = 1.5   # % раскорреляция vs BTC за 1h
+RVOL_THRESHOLD       = 1.2   # снижено с 1.5 для тестирования Gate.io
+TOP_N_SIGNALS        = 3
 
-STOP_PCT   = -3.0
-TP1_PCT    = +5.0
-TP2_PCT    = +9.0
+STOP_PCT = -3.0
+TP1_PCT  = +5.0
+TP2_PCT  = +9.0
 
 MSK = timezone(timedelta(hours=3))
 
@@ -51,10 +51,7 @@ def send_telegram(text: str):
 
 # ─── CMC: цены и 1h изменения ─────────────────────────────────────────────────
 
-def get_cmc_quotes(symbols: list[str]) -> dict:
-    """
-    Возвращает dict: symbol → {"price": float, "pct_1h": float}
-    """
+def get_cmc_quotes(symbols: list) -> dict:
     url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
     headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
     params  = {"symbol": ",".join(symbols), "convert": "USDT"}
@@ -76,49 +73,73 @@ def get_cmc_quotes(symbols: list[str]) -> dict:
 
 # ─── GATE.IO: реальный объём свечей ───────────────────────────────────────────
 
-def get_gate_rvol(symbol: str) -> float | None:
+def get_gate_rvol(symbol: str):
     """
-    Берёт 21 свечу 15М с Gate.io фьючерсов.
-    Считает EMA-20 по объёму последних 20 свечей.
-    Возвращает RVOL = текущая_свеча / EMA-20.
-    None если данных нет.
+    Берёт 21 свечу 15m с Gate.io фьючерсов.
+    Считает EMA-20 по объёму (поле 'a' — USDT объём, универсальнее чем 'v').
+    Возвращает (rvol, raw_data) или (None, error_str).
     """
     contract = f"{symbol}_USDT"
     url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
     params = {"contract": contract, "interval": "15m", "limit": 21}
     try:
         r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
+
+        # Логируем статус для каждой пары — видно в Render логах
+        print(f"[GATE] {symbol}: HTTP {r.status_code}")
+
+        if r.status_code != 200:
+            print(f"[GATE ERROR] {symbol}: статус {r.status_code}, ответ: {r.text[:200]}")
+            return None, f"HTTP {r.status_code}"
+
         candles = r.json()
-        if not candles or len(candles) < 21:
-            return None
 
-        # Gate.io возвращает список словарей:
-        # {"t": timestamp, "v": volume_contracts, "c": close, "h": high, "l": low, "o": open, "a": amount_usdt}
-        # Берём "v" — объём в контрактах (аналог base volume в TradingView)
-        volumes = [float(c["v"]) for c in candles]
+        if not candles:
+            print(f"[GATE ERROR] {symbol}: пустой ответ")
+            return None, "empty"
 
-        history_vols = volumes[:20]   # первые 20 — история
-        current_vol  = volumes[20]    # последняя (текущая) свеча
+        if len(candles) < 21:
+            print(f"[GATE ERROR] {symbol}: мало свечей ({len(candles)} < 21)")
+            return None, f"only {len(candles)} candles"
 
-        if not history_vols or sum(history_vols) == 0:
-            return None
+        # Логируем первую свечу чтобы видеть формат
+        print(f"[GATE] {symbol} первая свеча: {candles[0]}")
 
-        # EMA-20 по объёму
+        # Берём 'a' — объём в USDT (универсальнее чем 'v' в контрактах)
+        try:
+            volumes = [float(c["a"]) for c in candles]
+        except (KeyError, TypeError) as e:
+            # Fallback на 'v' если 'a' нет
+            print(f"[GATE] {symbol}: поле 'a' недоступно ({e}), пробуем 'v'")
+            try:
+                volumes = [float(c["v"]) for c in candles]
+            except Exception as e2:
+                print(f"[GATE ERROR] {symbol}: ни 'a' ни 'v' не работают: {e2}")
+                return None, "no volume field"
+
+        history_vols = volumes[:20]
+        current_vol  = volumes[20]
+
+        if sum(history_vols) == 0:
+            print(f"[GATE ERROR] {symbol}: нулевой объём в истории")
+            return None, "zero volume"
+
+        # EMA-20
         k = 2 / (20 + 1)
         ema = history_vols[0]
         for v in history_vols[1:]:
             ema = v * k + ema * (1 - k)
 
         if ema == 0:
-            return None
+            return None, "ema zero"
 
-        rvol = current_vol / ema
-        return round(rvol, 2)
+        rvol = round(current_vol / ema, 2)
+        print(f"[GATE] {symbol}: RVOL={rvol}x (cur={current_vol:.0f}, ema={ema:.0f})")
+        return rvol, None
 
     except Exception as e:
         print(f"[GATE ERROR] {symbol}: {e}")
-        return None
+        return None, str(e)
 
 # ─── ВРЕМЯ ────────────────────────────────────────────────────────────────────
 
@@ -129,12 +150,34 @@ def is_trading_hours() -> bool:
 def msk_time_str() -> str:
     return datetime.now(MSK).strftime("%H:%M МСК")
 
+# ─── ПРОВЕРКА ПАР НА GATE.IO ──────────────────────────────────────────────────
+
+def check_gate_pairs() -> list:
+    """При старте проверяет все пары и убирает нерабочие."""
+    bad = []
+    print("[CHECK] Проверяю пары на Gate.io...")
+    for sym in UPSCALE_PAIRS:
+        contract = f"{sym}_USDT"
+        url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+        params = {"contract": contract, "interval": "15m", "limit": 2}
+        try:
+            r = requests.get(url, params=params, timeout=8)
+            if r.status_code != 200 or not r.json():
+                bad.append(sym)
+                print(f"  [CHECK] ❌ {sym} — HTTP {r.status_code}")
+            else:
+                print(f"  [CHECK] ✅ {sym}")
+        except Exception as e:
+            bad.append(sym)
+            print(f"  [CHECK] ❌ {sym} — {e}")
+        time.sleep(0.3)
+    return bad
+
 # ─── ОСНОВНОЙ СКАН ────────────────────────────────────────────────────────────
 
 def run_scan():
-    print(f"[SCAN] Старт скана {msk_time_str()}")
+    print(f"[SCAN] Старт {msk_time_str()}")
 
-    # 1. Получаем котировки CMC для всех пар + BTC
     all_symbols = ["BTC"] + UPSCALE_PAIRS
     quotes = get_cmc_quotes(all_symbols)
 
@@ -145,61 +188,78 @@ def run_scan():
     btc_1h = quotes["BTC"]["pct_1h"]
     print(f"[SCAN] BTC 1h: {btc_1h:+.2f}%")
 
-    # 2. Фильтр раскорреляции
+    # Фильтр раскорреляции
     candidates = []
     for sym in UPSCALE_PAIRS:
         if sym not in quotes:
             continue
         alt_1h = quotes[sym]["pct_1h"]
-        decorr = alt_1h - btc_1h          # насколько альт лучше BTC
+        decorr = alt_1h - btc_1h
         if decorr >= BTC_DECORR_THRESHOLD:
             candidates.append({
-                "symbol":  sym,
-                "price":   quotes[sym]["price"],
-                "alt_1h":  alt_1h,
-                "btc_1h":  btc_1h,
-                "decorr":  decorr,
+                "symbol": sym,
+                "price":  quotes[sym]["price"],
+                "alt_1h": alt_1h,
+                "btc_1h": btc_1h,
+                "decorr": decorr,
             })
 
-    print(f"[SCAN] Раскорреляция >= {BTC_DECORR_THRESHOLD}%: {len(candidates)} пар")
+    print(f"[SCAN] Кандидатов с раскорреляцией >= {BTC_DECORR_THRESHOLD}%: {len(candidates)}")
 
     if not candidates:
         return
 
-    # 3. Gate.io RVOL фильтр
-    signals = []
-    for c in candidates:
-        rvol = get_gate_rvol(c["symbol"])
-        if rvol is None:
-            print(f"  {c['symbol']}: Gate.io нет данных")
-            continue
-        print(f"  {c['symbol']}: RVOL={rvol}x, decorr={c['decorr']:+.2f}%")
-        if rvol >= RVOL_THRESHOLD:
-            c["rvol"] = rvol
-            signals.append(c)
-        time.sleep(0.3)   # не спамим Gate.io
+    # Gate.io RVOL + fallback только CMC
+    signals_rvol = []   # с подтверждением Gate.io
+    signals_cmc  = []   # только CMC (Gate.io не ответил)
 
-    # 4. Сортировка: сначала по RVOL, потом по раскорреляции
-    signals.sort(key=lambda x: (x["rvol"], x["decorr"]), reverse=True)
-    top = signals[:TOP_N_SIGNALS]
+    for c in candidates:
+        rvol, err = get_gate_rvol(c["symbol"])
+
+        if rvol is None:
+            # Fallback — сигнал только по CMC без RVOL
+            c["rvol"] = None
+            c["gate_err"] = err
+            signals_cmc.append(c)
+            print(f"  {c['symbol']}: Gate.io ошибка ({err}) → только CMC")
+        else:
+            if rvol >= RVOL_THRESHOLD:
+                c["rvol"] = rvol
+                signals_rvol.append(c)
+            else:
+                print(f"  {c['symbol']}: RVOL {rvol}x < {RVOL_THRESHOLD} — пропуск")
+        time.sleep(0.3)
+
+    # Сортировка
+    signals_rvol.sort(key=lambda x: (x["rvol"], x["decorr"]), reverse=True)
+    signals_cmc.sort(key=lambda x: x["decorr"], reverse=True)
+
+    # Формируем топ — сначала RVOL сигналы, потом CMC fallback
+    top = (signals_rvol + signals_cmc)[:TOP_N_SIGNALS]
 
     if not top:
-        print("[SCAN] Сигналов нет после RVOL фильтра")
+        print("[SCAN] Нет сигналов")
         return
 
-    # 5. Формируем сообщение
-    lines = [f"📡 <b>СИГНАЛЫ v4.0</b> | {msk_time_str()}\n"
+    lines = [f"📡 <b>СИГНАЛЫ v4.1</b> | {msk_time_str()}\n"
              f"BTC 1h: <b>{btc_1h:+.2f}%</b>\n"]
 
-    for i, s in enumerate(top, 1):
+    medals = ["🥇","🥈","🥉"]
+    for i, s in enumerate(top):
         entry = s["price"]
         stop  = entry * (1 + STOP_PCT / 100)
         tp1   = entry * (1 + TP1_PCT  / 100)
         tp2   = entry * (1 + TP2_PCT  / 100)
+        medal = medals[i] if i < len(medals) else "▪️"
+
+        if s["rvol"] is not None:
+            rvol_line = f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io подтверждён\n"
+        else:
+            rvol_line = f"   ⚡ Только CMC (Gate.io: {s.get('gate_err','?')})\n"
 
         lines.append(
-            f"{'🥇' if i==1 else '🥈' if i==2 else '🥉'} <b>{s['symbol']}/USDT</b>\n"
-            f"   RVOL: <b>{s['rvol']}x</b> (Gate.io 15M свеча vs EMA-20)\n"
+            f"{medal} <b>{s['symbol']}/USDT</b>\n"
+            f"{rvol_line}"
             f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 1h: {s['alt_1h']:+.2f}%\n"
             f"   Вход: <b>{entry:.6g}</b>\n"
             f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
@@ -207,18 +267,19 @@ def run_scan():
             f"   TP2:  {tp2:.6g} ({TP2_PCT:+}%) — 50%\n"
         )
 
-    lines.append("⚠️ Проверь структуру и CVD на графике. Решение за тобой.")
+    lines.append("⚠️ Проверь структуру и CVD. Решение за тобой.")
     send_telegram("\n".join(lines))
-    print(f"[SCAN] Отправлено {len(top)} сигналов")
+    print(f"[SCAN] Отправлено: {len(signals_rvol)} RVOL + {min(len(signals_cmc), TOP_N_SIGNALS - len(signals_rvol))} CMC")
 
 # ─── СТАТУС ───────────────────────────────────────────────────────────────────
 
 def send_status():
     now = datetime.now(MSK)
     status = (
-        f"🤖 <b>Upscale Bot v4.0</b> | {now.strftime('%H:%M МСК')}\n"
-        f"✅ Работает | Gate.io RVOL активен\n"
-        f"Следующий скан через ~{SCAN_INTERVAL_MIN} мин\n"
+        f"🤖 <b>Upscale Bot v4.1</b> | {now.strftime('%H:%M МСК')}\n"
+        f"✅ Работает | Gate.io RVOL + CMC fallback\n"
+        f"RVOL порог: {RVOL_THRESHOLD}x | Раскорр: {BTC_DECORR_THRESHOLD}%\n"
+        f"Пар в скане: {len(UPSCALE_PAIRS)}\n"
         f"Торговые часы: {TRADING_START_MSK}:00 – {TRADING_END_MSK}:00 МСК"
     )
     send_telegram(status)
@@ -227,31 +288,45 @@ def send_status():
 
 def main():
     send_telegram(
-        "🚀 <b>Upscale Bot v4.0 запущен</b>\n"
-        "🔄 CMC раскорреляция + Gate.io RVOL (EMA-20 свечей)\n"
+        "🚀 <b>Upscale Bot v4.1 запущен</b>\n"
+        "🔄 CMC раскорреляция + Gate.io RVOL (EMA-20)\n"
+        f"RVOL порог: {RVOL_THRESHOLD}x | Раскорр: {BTC_DECORR_THRESHOLD}%\n"
         f"Торговые часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК\n"
-        f"Скан каждые {SCAN_INTERVAL_MIN} мин, топ-{TOP_N_SIGNALS} сигнала"
+        "🔍 Проверяю пары на Gate.io..."
     )
 
+    bad_pairs = check_gate_pairs()
+    good_count = len(UPSCALE_PAIRS) - len(bad_pairs)
+
+    if bad_pairs:
+        send_telegram(
+            f"⚠️ <b>Нет на Gate.io ({len(bad_pairs)} шт):</b>\n"
+            f"{', '.join(bad_pairs)}\n\n"
+            f"Сканирую <b>{good_count}</b> рабочих пар."
+        )
+        for sym in bad_pairs:
+            if sym in UPSCALE_PAIRS:
+                UPSCALE_PAIRS.remove(sym)
+    else:
+        send_telegram(f"✅ Все {len(UPSCALE_PAIRS)} пар найдены на Gate.io")
+
     scan_count  = 0
-    status_sent = -1   # час последнего статуса
+    status_sent = -1
 
     while True:
         now_msk  = datetime.now(MSK)
         cur_hour = now_msk.hour
 
-        # Статус раз в час
         if cur_hour != status_sent:
             send_status()
             status_sent = cur_hour
 
-        # Скан только в торговые часы
         if is_trading_hours():
             scan_count += 1
             print(f"\n[LOOP] Скан #{scan_count}")
             run_scan()
         else:
-            print(f"[LOOP] Вне торговых часов ({msk_time_str()}), скан пропущен")
+            print(f"[LOOP] Вне часов ({msk_time_str()}), пропуск")
 
         time.sleep(SCAN_INTERVAL_MIN * 60)
 
