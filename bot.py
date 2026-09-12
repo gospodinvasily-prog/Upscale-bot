@@ -23,20 +23,19 @@ TP2_PCT    = +9.0
 
 MSK = timezone(timedelta(hours=3))
 
-# ─── 106 UPSCALE PAIRS ────────────────────────────────────────────────────────
+# ─── UPSCALE PAIRS ────────────────────────────────────────────────────────────
 
 UPSCALE_PAIRS = [
-    "BTC","ETH","XRP","BNB","SOL","ADA","DOGE","TRX","AVAX","LINK",
-    "DOT","MATIC","LTC","BCH","UNI","ICP","ETC","XLM","NEAR","APT",
-    "FIL","ARB","OP","ATOM","HBAR","VET","MKR","INJ","ALGO","AAVE",
-    "EGLD","SAND","AXS","THETA","XTZ","FLOW","CHZ","ZEC","DASH","EOS",
-    "COMP","CRV","BAT","ZRX","ENJ","1INCH","LRC","SXP","OCEAN","BAND",
-    "KNC","RSR","GRT","IMX","GALA","MANA","YFI","SNX","SUSHI","UMA",
-    "CVC","ANKR","ONT","QTUM","ICX","ZIL","RVN","DGB","IOST","SKL",
-    "DENT","MTL","FTM","ROSE","ONE","KAVA","SC","BTT","WIN","TWT",
-    "CELR","REEF","SLP","ALICE","TLM","BAKE","BURGER","EASY","FOR",
-    "FRONT","FIRO","FIO","PERL","VITE","WING","MDX","AGIX","RNDR",
-    "BLUR","ARK","WAL","STX","WLD","SUI","SEI","TIA"
+    "ETH","BNB","XRP","SOL","AAVE","ADA","AERO","ALGO","APT","ARB",
+    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BONK","BRETT","CAKE",
+    "CHZ","CRO","CRV","DASH","DOGE","DOT","DYDX","EIGEN","ENA","ENS",
+    "ETC","FET","FIL","FLOKI","GALA","GRAM","GRASS","GRT","HBAR",
+    "HYPE","ICP","IMX","INJ","IOTA","JASMY","JTO","JUP","KAIA","KAS",
+    "LDO","LINK","LTC","MANA","MNT","MORPHO","MOVE","NEAR","ONDO",
+    "OP","ORDI","PENDLE","PENGU","PEPE","PNUT","POL","POPCAT","PYTH",
+    "QNT","RAY","RENDER","RUNE","SAND","SEI","SHIB","SKY","STRK",
+    "STX","SUI","TAO","TIA","TRUMP","TRX","TURBO","UNI","VET",
+    "VIRTUAL","WAL","WIF","WLD","XLM","XMR","XTZ","ZEC","ZRO"
 ]
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
