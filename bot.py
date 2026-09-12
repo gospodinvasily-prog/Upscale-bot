@@ -1,289 +1,260 @@
-import logging
-import requests
+import os
 import time
-from datetime import datetime
-from collections import defaultdict
+import requests
+from datetime import datetime, timezone, timedelta
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN = "8751822340:AAH-sKgtw58OUiUPnor5av_VeoIAMyWb5JA"
-CHAT_ID = "426470592"
-CMC_API_KEY = "b2e925cc66dc4dacacb1c3de4af26f35"
+CMC_API_KEY    = os.environ.get("CMC_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID        = "426470592"
 
-TG_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+SCAN_INTERVAL_MIN  = 15          # минут между сканами
+TRADING_START_MSK  = 4           # 04:00 МСК
+TRADING_END_MSK    = 22          # 22:00 МСК
 
-UPSCALE_SYMBOLS = set([
-    "ETH","BNB","XRP","SOL",
-    "AAVE","ADA","AERO","ALGO","APT","ARB","ASTER","ATOM","AVAX","AXS",
-    "BCH","BERA","BGB","BONK","BRETT","BSV",
-    "CAKE","CHZ","CRO","CRV",
-    "DASH","DATA","DEEP","DEXE","DOGE","DOT","DYDX",
-    "EIGEN","ENA","ENS","ETC",
-    "FARTCOIN","FET","FIL","FLOKI",
-    "GALA","GRAM","GRASS","GRT",
-    "HBAR","HYPE",
-    "ICP","IMX","INJ","IOTA",
-    "JASMY","JTO","JUP",
-    "KAIA","KAITO","KAS",
-    "LDO","LINEA","LINK","LTC",
-    "MANA","MNT","MORPHO","MOVE",
-    "NEAR","ONDO","OP","ORDI",
-    "PENDLE","PENGU","PEPE","PNUT","POL","POPCAT","PUMP","PYTH",
-    "QNT","RAY","RENDER","RUNE",
-    "S","SAND","SEI","SHIB","SKY","STRK","STX","SUI",
-    "TAO","TIA","TRUMP","TRX","TURBO",
-    "UNI","VET","VIRTUAL",
-    "WAL","WIF","WLD",
-    "XLM","XMR","XTZ","ZEC","ZRO",
-    "1000BONK","1000PEPE","1000SHIB"
-])
+BTC_DECORR_THRESHOLD = 1.5       # % — альт опережает BTC минимум на столько за 1h
+RVOL_THRESHOLD       = 1.5       # текущая свеча > EMA-20 в 1.5 раза
+TOP_N_SIGNALS        = 3         # сколько сигналов слать
 
-START_HOUR = 4
-END_HOUR = 22
-MIN_SCANS_FOR_BASE = 4   # минимум 4 скана (1 час) для базы
-RVOL_THRESHOLD = 2.0     # спайк = текущий прирост в 2x выше среднего
+STOP_PCT   = -3.0
+TP1_PCT    = +5.0
+TP2_PCT    = +9.0
 
-# Память
-prev_volumes = {}                          # объём предыдущего скана
-volume_deltas = defaultdict(list)          # история приростов за день
-scan_count = 0
-last_status_hour = -1
+MSK = timezone(timedelta(hours=3))
 
-def send_tg(text):
+# ─── 106 UPSCALE PAIRS ────────────────────────────────────────────────────────
+
+UPSCALE_PAIRS = [
+    "BTC","ETH","XRP","BNB","SOL","ADA","DOGE","TRX","AVAX","LINK",
+    "DOT","MATIC","LTC","BCH","UNI","ICP","ETC","XLM","NEAR","APT",
+    "FIL","ARB","OP","ATOM","HBAR","VET","MKR","INJ","ALGO","AAVE",
+    "EGLD","SAND","AXS","THETA","XTZ","FLOW","CHZ","ZEC","DASH","EOS",
+    "COMP","CRV","BAT","ZRX","ENJ","1INCH","LRC","SXP","OCEAN","BAND",
+    "KNC","RSR","GRT","IMX","GALA","MANA","YFI","SNX","SUSHI","UMA",
+    "CVC","ANKR","ONT","QTUM","ICX","ZIL","RVN","DGB","IOST","SKL",
+    "DENT","MTL","FTM","ROSE","ONE","KAVA","SC","BTT","WIN","TWT",
+    "CELR","REEF","SLP","ALICE","TLM","BAKE","BURGER","EASY","FOR",
+    "FRONT","FIRO","FIO","PERL","VITE","WING","MDX","AGIX","RNDR",
+    "BLUR","ARK","WAL","STX","WLD","SUI","SEI","TIA"
+]
+
+# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
+
+def send_telegram(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.post(TG_URL, json={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=10)
-        if not r.json().get("ok"):
-            logger.error(f"TG error: {r.json()}")
-        else:
-            logger.info("TG sent OK")
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
     except Exception as e:
-        logger.error(f"TG error: {e}")
+        print(f"[TG ERROR] {e}")
 
-def get_msk_time():
-    now = datetime.utcnow()
-    msk_hour = (now.hour + 3) % 24
-    return msk_hour, f"{msk_hour:02d}:{now.minute:02d}"
+# ─── CMC: цены и 1h изменения ─────────────────────────────────────────────────
 
-def is_trading_hours():
-    msk_hour, _ = get_msk_time()
-    return START_HOUR <= msk_hour < END_HOUR
-
-def get_prices():
+def get_cmc_quotes(symbols: list[str]) -> dict:
+    """
+    Возвращает dict: symbol → {"price": float, "pct_1h": float}
+    """
+    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+    headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
+    params  = {"symbol": ",".join(symbols), "convert": "USDT"}
     try:
-        headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
-        params = {"limit": 500, "convert": "USD", "sort": "market_cap"}
-        r = requests.get(CMC_URL, headers=headers, params=params, timeout=20)
-        data = r.json()
-        if data.get("status", {}).get("error_code") != 0:
-            logger.error(f"CMC error: {data.get('status')}")
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json().get("data", {})
+        result = {}
+        for sym, info in data.items():
+            q = info.get("quote", {}).get("USDT", {})
+            result[sym] = {
+                "price":  q.get("price", 0),
+                "pct_1h": q.get("percent_change_1h", 0),
+            }
+        return result
+    except Exception as e:
+        print(f"[CMC ERROR] {e}")
+        return {}
+
+# ─── GATE.IO: реальный объём свечей ───────────────────────────────────────────
+
+def get_gate_rvol(symbol: str) -> float | None:
+    """
+    Берёт 21 свечу 15М с Gate.io фьючерсов.
+    Считает EMA-20 по объёму последних 20 свечей.
+    Возвращает RVOL = текущая_свеча / EMA-20.
+    None если данных нет.
+    """
+    contract = f"{symbol}_USDT"
+    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+    params = {"contract": contract, "interval": "15m", "limit": 21}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        candles = r.json()
+        if not candles or len(candles) < 21:
             return None
-        prices = {}
-        for coin in data["data"]:
-            sym = coin["symbol"]
-            if sym == "BTC" or sym in UPSCALE_SYMBOLS:
-                try:
-                    q = coin["quote"]["USD"]
-                    prices[sym] = {
-                        "price": q["price"],
-                        "change_1h": q.get("percent_change_1h", 0) or 0,
-                        "volume_24h": q.get("volume_24h", 0) or 0,
-                    }
-                except:
-                    pass
-        logger.info(f"Got {len(prices)} prices")
-        return prices
+
+        # Gate.io возвращает список словарей:
+        # {"t": timestamp, "v": volume_contracts, "c": close, "h": high, "l": low, "o": open, "a": amount_usdt}
+        # Берём "v" — объём в контрактах (аналог base volume в TradingView)
+        volumes = [float(c["v"]) for c in candles]
+
+        history_vols = volumes[:20]   # первые 20 — история
+        current_vol  = volumes[20]    # последняя (текущая) свеча
+
+        if not history_vols or sum(history_vols) == 0:
+            return None
+
+        # EMA-20 по объёму
+        k = 2 / (20 + 1)
+        ema = history_vols[0]
+        for v in history_vols[1:]:
+            ema = v * k + ema * (1 - k)
+
+        if ema == 0:
+            return None
+
+        rvol = current_vol / ema
+        return round(rvol, 2)
+
     except Exception as e:
-        logger.error(f"CMC error: {e}")
+        print(f"[GATE ERROR] {symbol}: {e}")
         return None
 
-def fmt(p):
-    if p >= 1000: return f"${p:,.0f}"
-    if p >= 1: return f"${p:.3f}"
-    if p >= 0.01: return f"${p:.5f}"
-    return f"${p:.8f}"
+# ─── ВРЕМЯ ────────────────────────────────────────────────────────────────────
 
-def get_rvol(sym, cur_vol):
-    """
-    RVOL логика:
-    1. Считаем прирост объёма за 15 минут (дельта)
-    2. Сравниваем с средним приростом за день
-    3. Если текущий прирост в 2x выше среднего — спайк
-    """
-    prev_vol = prev_volumes.get(sym, 0)
-    if prev_vol <= 0 or cur_vol <= 0:
-        return 0, False
+def is_trading_hours() -> bool:
+    now_msk = datetime.now(MSK)
+    return TRADING_START_MSK <= now_msk.hour < TRADING_END_MSK
 
-    # Абсолютный прирост за 15 минут
-    delta = cur_vol - prev_vol
+def msk_time_str() -> str:
+    return datetime.now(MSK).strftime("%H:%M МСК")
 
-    # Только положительный прирост имеет смысл
-    if delta <= 0:
-        return 0, False
+# ─── ОСНОВНОЙ СКАН ────────────────────────────────────────────────────────────
 
-    # Добавляем в историю
-    volume_deltas[sym].append(delta)
+def run_scan():
+    print(f"[SCAN] Старт скана {msk_time_str()}")
 
-    # Нужно минимум MIN_SCANS_FOR_BASE точек для надёжной базы
-    if len(volume_deltas[sym]) < MIN_SCANS_FOR_BASE:
-        return 0, False
+    # 1. Получаем котировки CMC для всех пар + BTC
+    all_symbols = ["BTC"] + UPSCALE_PAIRS
+    quotes = get_cmc_quotes(all_symbols)
 
-    # Средний прирост за последние 20 сканов (или сколько есть)
-    recent = volume_deltas[sym][-20:]
-    avg_delta = sum(recent) / len(recent)
-
-    if avg_delta <= 0:
-        return 0, False
-
-    # RVOL = текущий прирост / средний прирост
-    rvol = delta / avg_delta
-
-    spike = rvol >= RVOL_THRESHOLD
-    return rvol, spike
-
-def scan():
-    global prev_volumes, scan_count, last_status_hour
-
-    msk_hour, msk_time = get_msk_time()
-
-    if not is_trading_hours():
-        logger.info(f"Outside trading hours. MSK: {msk_time}")
-        # Сброс в начале нового дня
-        if msk_hour == START_HOUR:
-            prev_volumes.clear()
-            volume_deltas.clear()
-            scan_count = 0
-            last_status_hour = -1
-            logger.info("New day — reset all")
+    if "BTC" not in quotes:
+        print("[SCAN] BTC не получен, пропускаем")
         return
 
-    data = get_prices()
-    if not data or "BTC" not in data:
-        logger.warning("No data")
-        return
+    btc_1h = quotes["BTC"]["pct_1h"]
+    print(f"[SCAN] BTC 1h: {btc_1h:+.2f}%")
 
-    scan_count += 1
-    btc = data["BTC"]
-    btc_change_1h = btc["change_1h"]
-    btc_price = btc["price"]
-
-    # Считаем раскорреляции для статуса
-    decorr_count = sum(
-        1 for sym, info in data.items()
-        if sym != "BTC" and (info["change_1h"] - btc_change_1h) >= 1.5
-    )
-
-    # Статус раз в час
-    if msk_hour != last_status_hour:
-        btc_arrow = "⬇️" if btc_change_1h < 0 else "⬆️"
-        base_ready = scan_count >= MIN_SCANS_FOR_BASE
-        status_msg = (
-            f"📡 <b>Статус {msk_time} МСК</b>\n\n"
-            f"BTC: {fmt(btc_price)} | 1h: {btc_change_1h:+.2f}% {btc_arrow}\n"
-            f"Сканирую: {len(data)-1} пар\n"
-            f"Раскорреляций 1h: {decorr_count}\n"
-            f"База RVOL: {'✅ готова' if base_ready else f'⏳ скан {scan_count}/{MIN_SCANS_FOR_BASE}'}\n\n"
-            f"{'😴 Жду спайк объёма...' if base_ready else '⏳ Накапливаю базу...'}"
-        )
-        send_tg(status_msg)
-        last_status_hour = msk_hour
-
-    # Первый скан — только заполняем память объёмов
-    if scan_count == 1:
-        for sym, info in data.items():
-            prev_volumes[sym] = info["volume_24h"]
-        logger.info("First scan — volume memory filled")
-        return
-
-    # Нужно минимум 4 скана для базы
-    if scan_count < MIN_SCANS_FOR_BASE:
-        for sym, info in data.items():
-            get_rvol(sym, info["volume_24h"])
-            prev_volumes[sym] = info["volume_24h"]
-        logger.info(f"Building base... scan {scan_count}/{MIN_SCANS_FOR_BASE}")
-        return
-
+    # 2. Фильтр раскорреляции
     candidates = []
-    for sym, info in data.items():
-        if sym == "BTC":
+    for sym in UPSCALE_PAIRS:
+        if sym not in quotes:
             continue
-
-        cur_vol = info["volume_24h"]
-        rvol, spike = get_rvol(sym, cur_vol)
-
-        # Раскорреляция по 1h
-        diff_1h = info["change_1h"] - btc_change_1h
-
-        # Оба условия: раскорреляция И спайк объёма
-        if diff_1h >= 1.5 and spike:
+        alt_1h = quotes[sym]["pct_1h"]
+        decorr = alt_1h - btc_1h          # насколько альт лучше BTC
+        if decorr >= BTC_DECORR_THRESHOLD:
             candidates.append({
-                "sym": sym,
-                "price": info["price"],
-                "change_1h": info["change_1h"],
-                "diff_1h": diff_1h,
-                "rvol": rvol
+                "symbol":  sym,
+                "price":   quotes[sym]["price"],
+                "alt_1h":  alt_1h,
+                "btc_1h":  btc_1h,
+                "decorr":  decorr,
             })
 
-    # Обновляем память объёмов
-    for sym, info in data.items():
-        prev_volumes[sym] = info["volume_24h"]
+    print(f"[SCAN] Раскорреляция >= {BTC_DECORR_THRESHOLD}%: {len(candidates)} пар")
 
     if not candidates:
-        logger.info(f"No signals. Scan #{scan_count}, decorr: {decorr_count}, rvol_pairs: 0")
         return
 
-    # Сортируем по RVOL * раскорреляция
-    candidates.sort(key=lambda x: x["rvol"] * x["diff_1h"], reverse=True)
-    top = candidates[:3]
+    # 3. Gate.io RVOL фильтр
+    signals = []
+    for c in candidates:
+        rvol = get_gate_rvol(c["symbol"])
+        if rvol is None:
+            print(f"  {c['symbol']}: Gate.io нет данных")
+            continue
+        print(f"  {c['symbol']}: RVOL={rvol}x, decorr={c['decorr']:+.2f}%")
+        if rvol >= RVOL_THRESHOLD:
+            c["rvol"] = rvol
+            signals.append(c)
+        time.sleep(0.3)   # не спамим Gate.io
 
-    btc_arrow = "⬇️" if btc_change_1h < 0 else "⬆️"
-    msg = f"🚨 <b>СИГНАЛ {msk_time} МСК</b>\n\n"
-    msg += f"BTC: {fmt(btc_price)} | 1h: {btc_change_1h:+.2f}% {btc_arrow}\n"
-    msg += f"{'─'*22}\n\n"
+    # 4. Сортировка: сначала по RVOL, потом по раскорреляции
+    signals.sort(key=lambda x: (x["rvol"], x["decorr"]), reverse=True)
+    top = signals[:TOP_N_SIGNALS]
 
-    medals = ["🥇", "🥈", "🥉"]
-    for i, c in enumerate(top):
-        sig = "🔥" if c["diff_1h"] >= 3 else "⚡"
-        price = c["price"]
-        stop = price * 0.97
-        tp1 = price * 1.05
-        tp2 = price * 1.09
+    if not top:
+        print("[SCAN] Сигналов нет после RVOL фильтра")
+        return
 
-        msg += f"{medals[i]} <b>{c['sym']}/USDT</b> {sig}\n"
-        msg += f"📊 RVOL: {c['rvol']:.1f}x (объём в {c['rvol']:.1f}x выше нормы)\n"
-        msg += f"⚡ 1h: {c['change_1h']:+.2f}% | vs BTC: +{c['diff_1h']:.1f}%\n"
-        msg += f"📍 Вход: {fmt(price)}\n"
-        msg += f"🛑 Стоп: {fmt(stop)}\n"
-        msg += f"🎯 TP1: {fmt(tp1)} | TP2: {fmt(tp2)}\n\n"
+    # 5. Формируем сообщение
+    lines = [f"📡 <b>СИГНАЛЫ v4.0</b> | {msk_time_str()}\n"
+             f"BTC 1h: <b>{btc_1h:+.2f}%</b>\n"]
 
-    msg += "💡 Входи в 1-2 лучших\nЕсли один против — выходишь, второй держишь"
+    for i, s in enumerate(top, 1):
+        entry = s["price"]
+        stop  = entry * (1 + STOP_PCT / 100)
+        tp1   = entry * (1 + TP1_PCT  / 100)
+        tp2   = entry * (1 + TP2_PCT  / 100)
 
-    send_tg(msg)
-    logger.info(f"Signals: {[(c['sym'], round(c['rvol'],1)) for c in top]}")
+        lines.append(
+            f"{'🥇' if i==1 else '🥈' if i==2 else '🥉'} <b>{s['symbol']}/USDT</b>\n"
+            f"   RVOL: <b>{s['rvol']}x</b> (Gate.io 15M свеча vs EMA-20)\n"
+            f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 1h: {s['alt_1h']:+.2f}%\n"
+            f"   Вход: <b>{entry:.6g}</b>\n"
+            f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
+            f"   TP1:  {tp1:.6g} ({TP1_PCT:+}%) — 50%\n"
+            f"   TP2:  {tp2:.6g} ({TP2_PCT:+}%) — 50%\n"
+        )
+
+    lines.append("⚠️ Проверь структуру и CVD на графике. Решение за тобой.")
+    send_telegram("\n".join(lines))
+    print(f"[SCAN] Отправлено {len(top)} сигналов")
+
+# ─── СТАТУС ───────────────────────────────────────────────────────────────────
+
+def send_status():
+    now = datetime.now(MSK)
+    status = (
+        f"🤖 <b>Upscale Bot v4.0</b> | {now.strftime('%H:%M МСК')}\n"
+        f"✅ Работает | Gate.io RVOL активен\n"
+        f"Следующий скан через ~{SCAN_INTERVAL_MIN} мин\n"
+        f"Торговые часы: {TRADING_START_MSK}:00 – {TRADING_END_MSK}:00 МСК"
+    )
+    send_telegram(status)
+
+# ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 
 def main():
-    logger.info("Bot v3.2 RVOL started!")
-    send_tg(
-        "🤖 <b>Upscale Signal Bot v3.2</b>\n\n"
-        "✅ RVOL — реальный скачок объёма (2x от нормы)\n"
-        "✅ Раскорреляция с BTC по 1h\n"
-        "✅ Торговые часы: 04:00-22:00 МСК\n"
-        "✅ Статус каждый час\n"
-        f"✅ {len(UPSCALE_SYMBOLS)} пар USDT\n\n"
-        "Накапливаю базу объёма (1 час)...\n"
-        "Потом жду реальный спайк!"
+    send_telegram(
+        "🚀 <b>Upscale Bot v4.0 запущен</b>\n"
+        "🔄 CMC раскорреляция + Gate.io RVOL (EMA-20 свечей)\n"
+        f"Торговые часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК\n"
+        f"Скан каждые {SCAN_INTERVAL_MIN} мин, топ-{TOP_N_SIGNALS} сигнала"
     )
+
+    scan_count  = 0
+    status_sent = -1   # час последнего статуса
+
     while True:
-        try:
-            scan()
-        except Exception as e:
-            logger.error(f"Error: {e}")
-        time.sleep(900)
+        now_msk  = datetime.now(MSK)
+        cur_hour = now_msk.hour
+
+        # Статус раз в час
+        if cur_hour != status_sent:
+            send_status()
+            status_sent = cur_hour
+
+        # Скан только в торговые часы
+        if is_trading_hours():
+            scan_count += 1
+            print(f"\n[LOOP] Скан #{scan_count}")
+            run_scan()
+        else:
+            print(f"[LOOP] Вне торговых часов ({msk_time_str()}), скан пропущен")
+
+        time.sleep(SCAN_INTERVAL_MIN * 60)
 
 if __name__ == "__main__":
     main()
