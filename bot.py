@@ -23,7 +23,7 @@ TP1_PCT   = +5.0
 TP2_PCT   = +9.0
 
 # ── Скан 2: Пробой 1H (каждые 60 минут) ──
-BREAKOUT_SCAN_INTERVAL = 60
+BREAKOUT_SCAN_INTERVAL = 30
 BREAKOUT_PERIOD  = 20       # хай/лой последних 20 закрытых свечей
 BB_PERIOD        = 20       # Bollinger Bands период
 BB_SQUEEZE_RATIO = 0.06     # ширина BB < 6% от цены = сжатие было
@@ -69,28 +69,6 @@ def is_trading_hours() -> bool:
 
 def msk_time_str() -> str:
     return datetime.now(MSK).strftime("%H:%M МСК")
-
-# ─── CMC ──────────────────────────────────────────────────────────────────────
-
-def get_cmc_quotes(symbols: list) -> dict:
-    url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-    headers = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
-    params  = {"symbol": ",".join(symbols), "convert": "USDT"}
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json().get("data", {})
-        result = {}
-        for sym, info in data.items():
-            q = info.get("quote", {}).get("USDT", {})
-            result[sym] = {
-                "price":  q.get("price", 0),
-                "pct_1h": q.get("percent_change_1h", 0),
-            }
-        return result
-    except Exception as e:
-        print(f"[CMC ERROR] {e}")
-        return {}
 
 # ─── GATE.IO: 15M RVOL ────────────────────────────────────────────────────────
 
@@ -205,68 +183,101 @@ def calc_bollinger(closes, period=20, std_mult=2.0):
     width_pct = (upper - lower) / sma  # относительная ширина
     return upper, sma, lower, width_pct
 
-# ─── СКАН 1: РАСКОРРЕЛЯЦИЯ (15М) ─────────────────────────────────────────────
+# ─── СКАН 1: РАСКОРРЕЛЯЦИЯ (Gate.io закрытые свечи) ─────────────────────────
 
 def run_decorr_scan():
     print(f"[DECORR] Старт {msk_time_str()}")
 
-    all_symbols = ["BTC"] + UPSCALE_PAIRS
-    quotes = get_cmc_quotes(all_symbols)
+    # BTC свечи — один раз для всех пар
+    try:
+        r = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+            params={"contract": "BTC_USDT", "interval": "15m", "limit": 25},
+            timeout=10
+        )
+        btc_candles = r.json() if r.status_code == 200 else []
+    except Exception:
+        btc_candles = []
 
-    if "BTC" not in quotes:
-        print("[DECORR] BTC не получен")
+    if not btc_candles or len(btc_candles) < 4:
+        print("[DECORR] BTC свечи не получены")
         return 0, None
 
-    btc_1h = quotes["BTC"]["pct_1h"]
-    print(f"[DECORR] BTC 1h: {btc_1h:+.2f}%")
+    btc_open  = float(btc_candles[-3]["o"])
+    btc_close = float(btc_candles[-2]["c"])
+    btc_chg   = (btc_close - btc_open) / btc_open * 100 if btc_open else 0
+    print(f"[DECORR] BTC 30М: {btc_chg:+.2f}%")
 
     candidates = []
     for sym in UPSCALE_PAIRS:
-        if sym not in quotes:
-            continue
-        alt_1h = quotes[sym]["pct_1h"]
-        decorr = alt_1h - btc_1h
-        if decorr >= BTC_DECORR_THRESHOLD:
+        try:
+            r = requests.get(
+                "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+                params={"contract": f"{sym}_USDT", "interval": "15m", "limit": 25},
+                timeout=8
+            )
+            if r.status_code != 200:
+                time.sleep(0.2)
+                continue
+
+            candles = r.json()
+            if not candles or len(candles) < 4:
+                time.sleep(0.2)
+                continue
+
+            # 2 закрытые свечи: [-3] открытие, [-2] закрытие
+            alt_open  = float(candles[-3]["o"])
+            alt_close = float(candles[-2]["c"])
+            alt_curr  = float(candles[-1]["c"])  # текущая цена входа
+
+            if alt_open == 0:
+                time.sleep(0.2)
+                continue
+
+            alt_chg = (alt_close - alt_open) / alt_open * 100
+            decorr  = alt_chg - btc_chg
+
+            if decorr < BTC_DECORR_THRESHOLD:
+                time.sleep(0.2)
+                continue
+
+            # RVOL на закрытой свече [-2]
+            vol_closed = float(candles[-2]["v"])
+            history_vols = [float(c["v"]) for c in candles[-22:-2]]
+            vol_avg = sum(history_vols) / len(history_vols) if history_vols else 0
+            rvol = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
+
             candidates.append({
-                "symbol": sym,
-                "price":  quotes[sym]["price"],
-                "alt_1h": alt_1h,
-                "btc_1h": btc_1h,
-                "decorr": decorr,
+                "symbol":  sym,
+                "price":   alt_curr,
+                "alt_chg": alt_chg,
+                "btc_chg": btc_chg,
+                "decorr":  decorr,
+                "rvol":    rvol,
             })
+            print(f"  ✅ {sym}: decorr={decorr:+.2f}% rvol={rvol}x")
+
+        except Exception as e:
+            print(f"  [DECORR ERROR] {sym}: {e}")
+
+        time.sleep(0.2)
 
     print(f"[DECORR] Кандидатов: {len(candidates)}")
     if not candidates:
-        return 0, btc_1h
+        return 0, btc_chg
 
-    signals_rvol = []
-    signals_cmc  = []
+    # Фильтр RVOL
+    signals = [c for c in candidates if c["rvol"] >= RVOL_THRESHOLD]
+    signals.sort(key=lambda x: x["decorr"], reverse=True)
 
-    for c in candidates:
-        rvol, err = get_gate_rvol(c["symbol"])
-        if rvol is None:
-            c["rvol"] = None
-            c["gate_err"] = err
-            signals_cmc.append(c)
-        else:
-            if rvol >= RVOL_THRESHOLD:
-                c["rvol"] = rvol
-                signals_rvol.append(c)
-            else:
-                print(f"  {c['symbol']}: RVOL {rvol}x < {RVOL_THRESHOLD} — пропуск")
-        time.sleep(0.3)
+    if not signals:
+        print("[DECORR] Нет сигналов с RVOL")
+        return len(candidates), btc_chg
 
-    # Сортировка по раскорреляции (сегодня убедились что это важнее RVOL)
-    signals_rvol.sort(key=lambda x: x["decorr"], reverse=True)
-    signals_cmc.sort(key=lambda x: x["decorr"], reverse=True)
-
-    top = (signals_rvol + signals_cmc)[:TOP_N_DECORR]
-    if not top:
-        print("[DECORR] Нет сигналов")
-        return len(candidates), btc_1h
+    top = signals[:TOP_N_DECORR]
 
     lines = [f"📡 <b>РАСКОРРЕЛЯЦИЯ</b> | {msk_time_str()}\n"
-             f"BTC 1h: <b>{btc_1h:+.2f}%</b>\n"]
+             f"BTC 30М: <b>{btc_chg:+.2f}%</b>\n"]
 
     medals = ["🥇","🥈","🥉"]
     for i, s in enumerate(top):
@@ -276,15 +287,10 @@ def run_decorr_scan():
         tp2   = entry * (1 + TP2_PCT  / 100)
         medal = medals[i] if i < len(medals) else "▪️"
 
-        if s["rvol"] is not None:
-            rvol_line = f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io\n"
-        else:
-            rvol_line = f"   ⚡ Только CMC\n"
-
         lines.append(
             f"{medal} <b>{s['symbol']}/USDT</b>\n"
-            f"{rvol_line}"
-            f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC\n"
+            f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io (закр. свеча)\n"
+            f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 30М: {s['alt_chg']:+.2f}%\n"
             f"   Вход: <b>{entry:.6g}</b>\n"
             f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
             f"   TP1:  {tp1:.6g} ({TP1_PCT:+}%) — 50%\n"
@@ -293,7 +299,8 @@ def run_decorr_scan():
 
     lines.append("⚠️ Проверь структуру и CVD. Решение за тобой.")
     send_telegram("\n".join(lines))
-    return len(candidates), btc_1h
+    print(f"[DECORR] Отправлено {len(top)} сигналов")
+    return len(candidates), btc_chg
 
 # ─── СКАН 2: ПРОБОЙ 1H ───────────────────────────────────────────────────────
 
@@ -359,6 +366,12 @@ def analyze_breakout(symbol: str):
     bb_squeeze = bb_before and bb_before[3] < BB_SQUEEZE_RATIO
 
     vol_ok = (atr / close_prev) > 0.005
+
+    # Логируем все условия для диагностики
+    print(f"[BREAK] {symbol}: close={close_prev:.4g} high20={high_20:.4g} "
+          f"vol={high_vol}({round(vol_prev/vol_sma,1) if vol_sma else 0}x) "
+          f"ema={'bull' if ef>es else 'bear'} rsi={rsi_val:.0f} adx={adx_val:.0f} "
+          f"bb_sq={bb_squeeze}")
 
     # ── Лонг пробой ──
     if (close_prev > high_20 and
@@ -455,8 +468,8 @@ def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
     btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v5.0</b> | {now.strftime('%H:%M МСК')}\n"
-        f"✅ Раскорреляция 15M + Пробой 1H\n"
+        f"🤖 <b>Upscale Bot v5.1</b> | {now.strftime('%H:%M МСК')}\n"
+        f"✅ Gate.io Раскорреляция + Пробой 1H\n"
         f"{btc_line}"
         f"Раскорреляций: <b>{decorr_count}</b>\n"
         f"{'😴 Жду спайк объёма...' if decorr_count > 0 else '🔍 Раскорреляций нет'}\n"
@@ -468,9 +481,9 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        "🚀 <b>Upscale Bot v5.0 запущен</b>\n"
-        "📡 Раскорреляция каждые 15М\n"
-        "📊 Пробой 1H каждый час\n"
+        f"🚀 <b>Upscale Bot v5.1 запущен</b>\n"
+        "📡 Раскорреляция 30М (Gate.io закр. свечи)\n"
+        "📊 Пробой 1H каждые 30 мин\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
     )
 
