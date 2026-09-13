@@ -288,28 +288,19 @@ def send_status():
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 
 def main():
+    # Пары которых нет на Gate.io — проверено вручную
+    known_bad = ["BGB"]
+    for sym in known_bad:
+        if sym in UPSCALE_PAIRS:
+            UPSCALE_PAIRS.remove(sym)
+
     send_telegram(
-        "🚀 <b>Upscale Bot v4.1 запущен</b>\n"
+        "🚀 <b>Upscale Bot v4.2 запущен</b>\n"
         "🔄 CMC раскорреляция + Gate.io RVOL (EMA-20)\n"
         f"RVOL порог: {RVOL_THRESHOLD}x | Раскорр: {BTC_DECORR_THRESHOLD}%\n"
-        f"Торговые часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК\n"
-        "🔍 Проверяю пары на Gate.io..."
+        f"Пар в скане: {len(UPSCALE_PAIRS)}\n"
+        f"Торговые часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
     )
-
-    bad_pairs = check_gate_pairs()
-    good_count = len(UPSCALE_PAIRS) - len(bad_pairs)
-
-    if bad_pairs:
-        send_telegram(
-            f"⚠️ <b>Нет на Gate.io ({len(bad_pairs)} шт):</b>\n"
-            f"{', '.join(bad_pairs)}\n\n"
-            f"Сканирую <b>{good_count}</b> рабочих пар."
-        )
-        for sym in bad_pairs:
-            if sym in UPSCALE_PAIRS:
-                UPSCALE_PAIRS.remove(sym)
-    else:
-        send_telegram(f"✅ Все {len(UPSCALE_PAIRS)} пар найдены на Gate.io")
 
     scan_count  = 0
     status_sent = -1
