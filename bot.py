@@ -184,7 +184,7 @@ def run_scan():
 
     if "BTC" not in quotes:
         print("[SCAN] BTC не получен, пропускаем")
-        return
+        return 0, None
 
     btc_1h = quotes["BTC"]["pct_1h"]
     print(f"[SCAN] BTC 1h: {btc_1h:+.2f}%")
@@ -208,7 +208,7 @@ def run_scan():
     print(f"[SCAN] Кандидатов с раскорреляцией >= {BTC_DECORR_THRESHOLD}%: {len(candidates)}")
 
     if not candidates:
-        return
+        return 0, btc_1h
 
     # Gate.io RVOL + fallback только CMC
     signals_rvol = []   # с подтверждением Gate.io
@@ -271,17 +271,20 @@ def run_scan():
     lines.append("⚠️ Проверь структуру и CVD. Решение за тобой.")
     send_telegram("\n".join(lines))
     print(f"[SCAN] Отправлено: {len(signals_rvol)} RVOL + {min(len(signals_cmc), TOP_N_SIGNALS - len(signals_rvol))} CMC")
+    return len(candidates), btc_1h
 
 # ─── СТАТУС ───────────────────────────────────────────────────────────────────
 
-def send_status():
+def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
+    btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v4.1</b> | {now.strftime('%H:%M МСК')}\n"
+        f"🤖 <b>Upscale Bot v4.2</b> | {now.strftime('%H:%M МСК')}\n"
         f"✅ Работает | Gate.io RVOL + CMC fallback\n"
-        f"RVOL порог: {RVOL_THRESHOLD}x | Раскорр: {BTC_DECORR_THRESHOLD}%\n"
-        f"Пар в скане: {len(UPSCALE_PAIRS)}\n"
-        f"Торговые часы: {TRADING_START_MSK}:00 – {TRADING_END_MSK}:00 МСК"
+        f"{btc_line}"
+        f"Раскорреляций 1h: <b>{decorr_count}</b>\n"
+        f"{'😴 Жду спайк объёма...' if decorr_count > 0 else '🔍 Раскорреляций нет'}\n"
+        f"Пар в скане: {len(UPSCALE_PAIRS)}"
     )
     send_telegram(status)
 
@@ -304,19 +307,23 @@ def main():
 
     scan_count  = 0
     status_sent = -1
+    last_decorr = 0
+    last_btc    = None
 
     while True:
         now_msk  = datetime.now(MSK)
         cur_hour = now_msk.hour
 
         if cur_hour != status_sent:
-            send_status()
+            send_status(last_decorr, last_btc)
             status_sent = cur_hour
 
         if is_trading_hours():
             scan_count += 1
             print(f"\n[LOOP] Скан #{scan_count}")
-            run_scan()
+            result = run_scan()
+            if result:
+                last_decorr, last_btc = result
         else:
             print(f"[LOOP] Вне часов ({msk_time_str()}), пропуск")
 
