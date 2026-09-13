@@ -27,7 +27,7 @@ MSK = timezone(timedelta(hours=3))
 
 UPSCALE_PAIRS = [
     "ETH","BNB","XRP","SOL","AAVE","ADA","AERO","ALGO","APT","ARB",
-    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BGB","BONK","BRETT","BSV",
+    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BONK","BRETT","BSV",
     "CAKE","CHZ","CRO","CRV","DASH","DATA","DEEP","DEXE","DOGE","DOT",
     "DYDX","EIGEN","ENA","ENS","ETC","FARTCOIN","FET","FIL","FLOKI",
     "GALA","GRAM","GRASS","GRT","HBAR","HYPE","ICP","IMX","INJ","IOTA",
@@ -151,29 +151,6 @@ def is_trading_hours() -> bool:
 def msk_time_str() -> str:
     return datetime.now(MSK).strftime("%H:%M МСК")
 
-# ─── ПРОВЕРКА ПАР НА GATE.IO ──────────────────────────────────────────────────
-
-def check_gate_pairs() -> list:
-    """При старте проверяет все пары и убирает нерабочие."""
-    bad = []
-    print("[CHECK] Проверяю пары на Gate.io...")
-    for sym in UPSCALE_PAIRS:
-        contract = f"{sym}_USDT"
-        url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
-        params = {"contract": contract, "interval": "15m", "limit": 2}
-        try:
-            r = requests.get(url, params=params, timeout=8)
-            if r.status_code != 200 or not r.json():
-                bad.append(sym)
-                print(f"  [CHECK] ❌ {sym} — HTTP {r.status_code}")
-            else:
-                print(f"  [CHECK] ✅ {sym}")
-        except Exception as e:
-            bad.append(sym)
-            print(f"  [CHECK] ❌ {sym} — {e}")
-        time.sleep(0.3)
-    return bad
-
 # ─── ОСНОВНОЙ СКАН ────────────────────────────────────────────────────────────
 
 def run_scan():
@@ -240,9 +217,9 @@ def run_scan():
 
     if not top:
         print("[SCAN] Нет сигналов")
-        return
+        return len(candidates), btc_1h
 
-    lines = [f"📡 <b>СИГНАЛЫ v4.1</b> | {msk_time_str()}\n"
+    lines = [f"📡 <b>СИГНАЛЫ v4.2</b> | {msk_time_str()}\n"
              f"BTC 1h: <b>{btc_1h:+.2f}%</b>\n"]
 
     medals = ["🥇","🥈","🥉"]
@@ -291,12 +268,6 @@ def send_status(decorr_count=0, btc_1h=None):
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 
 def main():
-    # Пары которых нет на Gate.io — проверено вручную
-    known_bad = ["BGB"]
-    for sym in known_bad:
-        if sym in UPSCALE_PAIRS:
-            UPSCALE_PAIRS.remove(sym)
-
     send_telegram(
         "🚀 <b>Upscale Bot v4.2 запущен</b>\n"
         "🔄 CMC раскорреляция + Gate.io RVOL (EMA-20)\n"
