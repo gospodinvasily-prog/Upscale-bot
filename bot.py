@@ -468,8 +468,8 @@ def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
     btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v5.1</b> | {now.strftime('%H:%M МСК')}\n"
-        f"✅ Gate.io Раскорреляция + Пробой 1H\n"
+        f"🤖 <b>Upscale Bot v5.2</b> | {now.strftime('%H:%M МСК')}\n"
+        f"✅ Gate.io Раскорреляция 15М + Пробой 1H\n"
         f"{btc_line}"
         f"Раскорреляций: <b>{decorr_count}</b>\n"
         f"{'😴 Жду спайк объёма...' if decorr_count > 0 else '🔍 Раскорреляций нет'}\n"
@@ -481,8 +481,8 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        f"🚀 <b>Upscale Bot v5.1 запущен</b>\n"
-        "📡 Раскорреляция 30М (Gate.io закр. свечи)\n"
+        f"🚀 <b>Upscale Bot v5.2 запущен</b>\n"
+        "📡 Раскорреляция 15М (Gate.io закр. свеча)\n"
         "📊 Пробой 1H каждые 30 мин\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
     )
