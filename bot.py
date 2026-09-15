@@ -203,10 +203,10 @@ def run_decorr_scan():
         print("[DECORR] BTC свечи не получены")
         return 0, None
 
-    btc_open  = float(btc_candles[-3]["o"])
+    btc_open  = float(btc_candles[-2]["o"])
     btc_close = float(btc_candles[-2]["c"])
     btc_chg   = (btc_close - btc_open) / btc_open * 100 if btc_open else 0
-    print(f"[DECORR] BTC 30М: {btc_chg:+.2f}%")
+    print(f"[DECORR] BTC 15М: {btc_chg:+.2f}%")
 
     candidates = []
     for sym in UPSCALE_PAIRS:
@@ -225,8 +225,8 @@ def run_decorr_scan():
                 time.sleep(0.2)
                 continue
 
-            # 2 закрытые свечи: [-3] открытие, [-2] закрытие
-            alt_open  = float(candles[-3]["o"])
+            # 1 закрытая свеча: [-2] открытие и закрытие
+            alt_open  = float(candles[-2]["o"])
             alt_close = float(candles[-2]["c"])
             alt_curr  = float(candles[-1]["c"])  # текущая цена входа
 
@@ -277,7 +277,7 @@ def run_decorr_scan():
     top = signals[:TOP_N_DECORR]
 
     lines = [f"📡 <b>РАСКОРРЕЛЯЦИЯ</b> | {msk_time_str()}\n"
-             f"BTC 30М: <b>{btc_chg:+.2f}%</b>\n"]
+             f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"]
 
     medals = ["🥇","🥈","🥉"]
     for i, s in enumerate(top):
@@ -290,7 +290,7 @@ def run_decorr_scan():
         lines.append(
             f"{medal} <b>{s['symbol']}/USDT</b>\n"
             f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io (закр. свеча)\n"
-            f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 30М: {s['alt_chg']:+.2f}%\n"
+            f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
             f"   Вход: <b>{entry:.6g}</b>\n"
             f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
             f"   TP1:  {tp1:.6g} ({TP1_PCT:+}%) — 50%\n"
