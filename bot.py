@@ -22,18 +22,8 @@ STOP_PCT  = -3.0
 TP1_PCT   = +5.0
 TP2_PCT   = +9.0
 
-# ── Скан 2: Пробой 1H (каждые 60 минут) ──
+# ── Скан 2: Sweep Reversal 1H (каждые 30 минут) ──
 BREAKOUT_SCAN_INTERVAL = 30
-BREAKOUT_PERIOD  = 20       # хай/лой последних 20 закрытых свечей
-BB_PERIOD        = 20       # Bollinger Bands период
-BB_SQUEEZE_RATIO = 0.06     # ширина BB < 6% от цены = сжатие было
-VOL_MULT_BREAK   = 2.0      # объём > 2x нормы при пробое
-ADX_MIN          = 18
-RSI_LONG_MAX     = 72
-RSI_SHORT_MIN    = 28
-TOP_N_BREAKOUT   = 3
-ATR_TP  = 3.8
-ATR_SL  = 1.6
 
 # ─── UPSCALE PAIRS ────────────────────────────────────────────────────────────
 
@@ -125,13 +115,6 @@ def get_gate_candles_1h(symbol: str, limit: int = 230):
 
 # ─── ИНДИКАТОРЫ ───────────────────────────────────────────────────────────────
 
-def calc_ema(prices: list, period: int) -> list:
-    k = 2 / (period + 1)
-    ema = [prices[0]]
-    for p in prices[1:]:
-        ema.append(p * k + ema[-1] * (1 - k))
-    return ema
-
 def calc_atr(highs, lows, closes, period=14) -> list:
     trs = [max(highs[i]-lows[i],
                abs(highs[i]-closes[i-1]),
@@ -140,48 +123,6 @@ def calc_atr(highs, lows, closes, period=14) -> list:
     for tr in trs[period:]:
         atrs.append((atrs[-1]*(period-1) + tr) / period)
     return atrs
-
-def calc_rsi(closes, period=14) -> list:
-    gains = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
-    ag = sum(gains[:period])/period
-    al = sum(losses[:period])/period
-    rsis = []
-    for i in range(period, len(gains)):
-        ag = (ag*(period-1)+gains[i])/period
-        al = (al*(period-1)+losses[i])/period
-        rs = ag/al if al else 100
-        rsis.append(100 - 100/(1+rs))
-    return rsis
-
-def calc_adx(highs, lows, closes, period=14) -> list:
-    pdms = [max(highs[i]-highs[i-1],0) if highs[i]-highs[i-1]>lows[i-1]-lows[i] else 0 for i in range(1,len(closes))]
-    mdms = [max(lows[i-1]-lows[i],0) if lows[i-1]-lows[i]>highs[i]-highs[i-1] else 0 for i in range(1,len(closes))]
-    trs  = [max(highs[i]-lows[i],abs(highs[i]-closes[i-1]),abs(lows[i]-closes[i-1])) for i in range(1,len(closes))]
-    def smooth(arr, p):
-        s = [sum(arr[:p])]
-        for v in arr[p:]: s.append(s[-1]-s[-1]/p+v)
-        return s
-    str_ = smooth(trs, period)
-    spdm = smooth(pdms, period)
-    smdm = smooth(mdms, period)
-    dxs = [100*abs(100*spdm[i]/str_[i]-100*smdm[i]/str_[i])/(100*spdm[i]/str_[i]+100*smdm[i]/str_[i]+0.001) for i in range(len(str_))]
-    adxs = [sum(dxs[:period])/period]
-    for dx in dxs[period:]: adxs.append((adxs[-1]*(period-1)+dx)/period)
-    return adxs
-
-def calc_bollinger(closes, period=20, std_mult=2.0):
-    """Возвращает (upper, middle, lower, width_pct) для последней свечи."""
-    if len(closes) < period:
-        return None
-    window = closes[-period:]
-    sma = sum(window) / period
-    variance = sum((x - sma) ** 2 for x in window) / period
-    std = variance ** 0.5
-    upper = sma + std_mult * std
-    lower = sma - std_mult * std
-    width_pct = (upper - lower) / sma  # относительная ширина
-    return upper, sma, lower, width_pct
 
 # ─── СКАН 1: РАСКОРРЕЛЯЦИЯ (Gate.io закрытые свечи) ─────────────────────────
 
@@ -302,165 +243,175 @@ def run_decorr_scan():
     print(f"[DECORR] Отправлено {len(top)} сигналов")
     return len(candidates), btc_chg
 
-# ─── СКАН 2: ПРОБОЙ 1H ───────────────────────────────────────────────────────
+# ─── СКАН 2: LIQUIDITY SWEEP REVERSAL (ложный пробой) 1H ────────────────────
 
-def analyze_breakout(symbol: str):
+PIVOT_LOOKBACK   = 12      # свечей для поиска локального хая/лоя
+DISPLACEMENT_MULT = 1.5    # тело displacement свечи > 1.5x среднего тела
+VOL_MULT_SWEEP   = 1.8     # объём displacement > 1.8x среднего
+MSS_LOOKBACK     = 8       # свечей для поиска точки MSS (противоположный экстремум)
+ATR_SL_BUFFER    = 0.5     # буфер стопа сверх фитиля свипа, в ATR
+TOP_N_SWEEP      = 3
+
+def find_pivot_high(highs, end_idx, lookback):
+    """Локальный максимум в окне [end_idx-lookback : end_idx]."""
+    window = highs[end_idx-lookback:end_idx]
+    return max(window) if window else None
+
+def find_pivot_low(lows, end_idx, lookback):
+    """Локальный минимум в окне [end_idx-lookback : end_idx]."""
+    window = lows[end_idx-lookback:end_idx]
+    return min(window) if window else None
+
+def analyze_sweep(symbol: str):
     """
-    Анализирует пробой на 1H:
-    - Закрытая свеча [-2] пробила хай/лой последних 20 закрытых свечей
-    - Объём на свече пробоя > 2x SMA50
-    - BB сжатие было перед пробоем (ширина BB < BB_SQUEEZE_RATIO)
-    - EMA50 > EMA200 (тренд)
-    - RSI не перекуплен
-    - ADX > порога
+    Liquidity Sweep Reversal на 1H:
+    1. Свеча [-3] пробивает фитилём локальный хай/лой (последние PIVOT_LOOKBACK свечей до неё),
+       но закрывается ОБРАТНО внутри диапазона (тело не пробивает уровень) — это свип.
+    2. Свеча [-2] — displacement: тело > DISPLACEMENT_MULT от среднего тела,
+       объём > VOL_MULT_SWEEP от среднего объёма, направлена ПРОТИВ свипа.
+    3. MSS: displacement пробивает ближайший противоположный локальный экстремум
+       за последние MSS_LOOKBACK свечей — подтверждение слома структуры.
+    4. FVG (бонус) — гэп между свечами вокруг displacement в сторону разворота.
     """
-    candles = get_gate_candles_1h(symbol, limit=230)
-    if not candles:
+    candles = get_gate_candles_1h(symbol, limit=60)
+    if not candles or len(candles) < 40:
         return None
 
     closes  = [float(c["c"]) for c in candles]
     highs   = [float(c["h"]) for c in candles]
     lows    = [float(c["l"]) for c in candles]
+    opens   = [float(c["o"]) for c in candles]
     volumes = [float(c["v"]) for c in candles]
 
-    if len(closes) < 220:
+    atrs = calc_atr(highs, lows, closes, 14)
+    if not atrs:
         return None
-
-    # Смотрим на закрытую свечу [-2], не текущую [-1]
-    idx = -2
-
-    close_prev = closes[idx]
-    high_prev  = highs[idx]
-    low_prev   = lows[idx]
-    vol_prev   = volumes[idx]
-
-    # Индикаторы по данным до свечи пробоя
-    ema50  = calc_ema(closes[:idx], 50)
-    ema200 = calc_ema(closes[:idx], 200)
-    atrs   = calc_atr(highs[:idx], lows[:idx], closes[:idx], 14)
-    rsis   = calc_rsi(closes[:idx], 14)
-    adxs   = calc_adx(highs[:idx], lows[:idx], closes[:idx], 14)
-
-    if not all([ema50, ema200, atrs, rsis, adxs]):
-        return None
-
-    ef  = ema50[-1]
-    es  = ema200[-1]
     atr = atrs[-1]
-    rsi_val = rsis[-1]
-    adx_val = adxs[-1]
 
-    # Объём SMA50 из предыдущих 50 свечей
-    vol_window = volumes[idx-51:idx-1]
-    vol_sma = sum(vol_window) / len(vol_window) if vol_window else 0
-    high_vol = vol_prev > VOL_MULT_BREAK * vol_sma if vol_sma > 0 else False
+    # Индексы: -3 свип-свеча, -2 displacement-свеча, -1 текущая (для входа)
+    sweep_idx = -3
+    disp_idx  = -2
 
-    # Пробой: хай/лой последних 20 закрытых свечей (до свечи пробоя)
-    window_20_h = highs[idx-21:idx-1]
-    window_20_l = lows[idx-21:idx-1]
-    high_20 = max(window_20_h) if window_20_h else 0
-    low_20  = min(window_20_l) if window_20_l else 99999
+    # Средние значения для сравнения (за 20 свечей до свип-свечи)
+    body_window = [abs(closes[i]-opens[i]) for i in range(sweep_idx-20, sweep_idx)]
+    avg_body = sum(body_window)/len(body_window) if body_window else 0
+    vol_window = volumes[sweep_idx-20:sweep_idx]
+    avg_vol = sum(vol_window)/len(vol_window) if vol_window else 0
 
-    # BB сжатие: смотрим ширину BB за 5 свечей ДО пробоя
-    bb_before = calc_bollinger(closes[idx-25:idx-1], BB_PERIOD)
-    bb_squeeze = bb_before and bb_before[3] < BB_SQUEEZE_RATIO
+    if avg_body == 0 or avg_vol == 0:
+        return None
 
-    vol_ok = (atr / close_prev) > 0.005
+    # Пивоты ДО свип-свечи
+    pivot_high = find_pivot_high(highs, sweep_idx, PIVOT_LOOKBACK)
+    pivot_low  = find_pivot_low(lows, sweep_idx, PIVOT_LOOKBACK)
 
-    # Логируем все условия для диагностики
-    print(f"[BREAK] {symbol}: close={close_prev:.4g} high20={high_20:.4g} "
-          f"vol={high_vol}({round(vol_prev/vol_sma,1) if vol_sma else 0}x) "
-          f"ema={'bull' if ef>es else 'bear'} rsi={rsi_val:.0f} adx={adx_val:.0f} "
-          f"bb_sq={bb_squeeze}")
+    sweep_high = highs[sweep_idx]
+    sweep_low  = lows[sweep_idx]
+    sweep_close= closes[sweep_idx]
+    sweep_open = opens[sweep_idx]
 
-    # ── Лонг пробой ──
-    if (close_prev > high_20 and
-        high_vol and
-        ef > es and
-        rsi_val < RSI_LONG_MAX and
-        adx_val > ADX_MIN and
-        vol_ok):
-        return {
-            "symbol":    symbol,
-            "direction": "ЛОНГ",
-            "entry":     closes[-1],   # текущая цена для входа
-            "stop":      closes[-1] - ATR_SL * atr,
-            "tp":        closes[-1] + ATR_TP * atr,
-            "atr":       atr,
-            "rsi":       rsi_val,
-            "adx":       adx_val,
-            "rvol":      round(vol_prev / vol_sma, 1) if vol_sma else 0,
-            "bb_squeeze": bb_squeeze,
-            "close_candle": close_prev,
-            "high_20":   high_20,
-        }
+    disp_open  = opens[disp_idx]
+    disp_close = closes[disp_idx]
+    disp_high  = highs[disp_idx]
+    disp_low   = lows[disp_idx]
+    disp_body  = abs(disp_close - disp_open)
+    disp_vol   = volumes[disp_idx]
 
-    # ── Шорт пробой ──
-    if (close_prev < low_20 and
-        high_vol and
-        ef < es and
-        rsi_val > RSI_SHORT_MIN and
-        adx_val > ADX_MIN and
-        vol_ok):
-        return {
-            "symbol":    symbol,
-            "direction": "ШОРТ",
-            "entry":     closes[-1],
-            "stop":      closes[-1] + 1.4 * atr,
-            "tp":        closes[-1] - 2.5 * atr,
-            "atr":       atr,
-            "rsi":       rsi_val,
-            "adx":       adx_val,
-            "rvol":      round(vol_prev / vol_sma, 1) if vol_sma else 0,
-            "bb_squeeze": bb_squeeze,
-            "close_candle": close_prev,
-            "low_20":    low_20,
-        }
+    entry_price = closes[-1]
+
+    is_displacement = disp_body > DISPLACEMENT_MULT * avg_body
+    is_high_vol = disp_vol > VOL_MULT_SWEEP * avg_vol
+
+    print(f"[SWEEP] {symbol}: sweepH={sweep_high:.4g} sweepL={sweep_low:.4g} "
+          f"pivH={pivot_high:.4g} pivL={pivot_low:.4g} "
+          f"disp_body={disp_body:.4g}(avg={avg_body:.4g}) disp_vol={round(disp_vol/avg_vol,1)}x")
+
+    # ── БЫЧИЙ SWEEP: пробили лоу фитилём, закрылись внутри, потом displacement вверх ──
+    swept_low = (sweep_low < pivot_low and sweep_close > pivot_low) if pivot_low else False
+    if swept_low and is_displacement and is_high_vol and disp_close > disp_open:
+        # MSS: displacement должен пробить ближайший противоположный хай
+        mss_level = find_pivot_high(highs, disp_idx, MSS_LOOKBACK)
+        mss_confirmed = mss_level and disp_close > mss_level
+
+        # Проверяем FVG между свечами sweep и текущей — гэп в сторону разворота
+        fvg_bull = highs[sweep_idx] < lows[-1] if len(closes) >= abs(sweep_idx) else False
+
+        if mss_confirmed:
+            stop = sweep_low - ATR_SL_BUFFER * atr
+            risk = entry_price - stop
+            target = entry_price + risk * 2.5
+            return {
+                "symbol": symbol, "direction": "ЛОНГ (свип лоя)",
+                "entry": entry_price, "stop": stop, "tp": target,
+                "atr": atr, "disp_vol_x": round(disp_vol/avg_vol,1),
+                "disp_body_x": round(disp_body/avg_body,1),
+                "fvg": fvg_bull, "sweep_level": pivot_low,
+            }
+
+    # ── МЕДВЕЖИЙ SWEEP: пробили хай фитилём, закрылись внутри, потом displacement вниз ──
+    swept_high = (sweep_high > pivot_high and sweep_close < pivot_high) if pivot_high else False
+    if swept_high and is_displacement and is_high_vol and disp_close < disp_open:
+        mss_level = find_pivot_low(lows, disp_idx, MSS_LOOKBACK)
+        mss_confirmed = mss_level and disp_close < mss_level
+
+        fvg_bear = lows[sweep_idx] > highs[-1] if len(closes) >= abs(sweep_idx) else False
+
+        if mss_confirmed:
+            stop = sweep_high + ATR_SL_BUFFER * atr
+            risk = stop - entry_price
+            target = entry_price - risk * 2.5
+            return {
+                "symbol": symbol, "direction": "ШОРТ (свип хая)",
+                "entry": entry_price, "stop": stop, "tp": target,
+                "atr": atr, "disp_vol_x": round(disp_vol/avg_vol,1),
+                "disp_body_x": round(disp_body/avg_body,1),
+                "fvg": fvg_bear, "sweep_level": pivot_high,
+            }
 
     return None
 
-def run_breakout_scan():
-    print(f"[BREAK] Старт {msk_time_str()}")
+def run_sweep_scan():
+    print(f"[SWEEP] Старт {msk_time_str()}")
     signals = []
 
     for sym in UPSCALE_PAIRS:
-        result = analyze_breakout(sym)
+        result = analyze_sweep(sym)
         if result:
             signals.append(result)
-            print(f"  ✅ {sym}: {result['direction']} | Vol {result['rvol']}x | ADX {result['adx']:.0f} | BB сжатие: {result['bb_squeeze']}")
+            print(f"  ✅ {sym}: {result['direction']} | disp_vol {result['disp_vol_x']}x | disp_body {result['disp_body_x']}x")
         time.sleep(0.4)
 
     if not signals:
-        print("[BREAK] Пробоев нет")
+        print("[SWEEP] Свипов нет")
         return
 
-    signals.sort(key=lambda x: x["adx"], reverse=True)
-    top = signals[:TOP_N_BREAKOUT]
+    signals.sort(key=lambda x: x["disp_vol_x"], reverse=True)
+    top = signals[:TOP_N_SWEEP]
 
     medals = ["🥇","🥈","🥉"]
-    lines = [f"📊 <b>ПРОБОЙ 1H</b> | {msk_time_str()}\n"]
+    lines = [f"🎯 <b>SWEEP REVERSAL 1H</b> | {msk_time_str()}\n"]
 
     for i, s in enumerate(top):
         medal = medals[i] if i < len(medals) else "▪️"
-        emoji = "🟢" if s["direction"] == "ЛОНГ" else "🔴"
+        emoji = "🟢" if "ЛОНГ" in s["direction"] else "🔴"
         entry = s["entry"]
         stop  = s["stop"]
         tp    = s["tp"]
         rr    = abs(tp-entry) / abs(entry-stop) if abs(entry-stop) > 0 else 0
-        squeeze_mark = "🔥 BB сжатие было" if s["bb_squeeze"] else ""
+        fvg_mark = "🔥 FVG в сторону разворота" if s["fvg"] else ""
 
         lines.append(
             f"{medal} {emoji} <b>{s['symbol']}/USDT — {s['direction']}</b>\n"
-            f"   Закр. свеча: {s['close_candle']:.6g} | Vol: {s['rvol']}x {squeeze_mark}\n"
-            f"   ADX: {s['adx']:.0f} | RSI: {s['rsi']:.0f}\n"
+            f"   Уровень свипа: {s['sweep_level']:.6g} {fvg_mark}\n"
+            f"   Displacement: тело {s['disp_body_x']}x | объём {s['disp_vol_x']}x\n"
             f"   Вход: <b>{entry:.6g}</b>\n"
-            f"   Стоп: {stop:.6g} (ATR×{ATR_SL})\n"
-            f"   TP:   {tp:.6g} (ATR×{ATR_TP}) | RR 1:{rr:.2f}\n"
+            f"   Стоп: {stop:.6g} (за фитилём +{ATR_SL_BUFFER} ATR)\n"
+            f"   TP:   {tp:.6g} | RR 1:{rr:.2f}\n"
         )
 
-    lines.append("⚠️ Проверь структуру. Решение за тобой.")
+    lines.append("⚠️ Проверь график — см. инструкцию. Решение за тобой.")
     send_telegram("\n".join(lines))
-    print(f"[BREAK] Отправлено {len(top)} сигналов")
+    print(f"[SWEEP] Отправлено {len(top)} сигналов")
 
 # ─── СТАТУС ───────────────────────────────────────────────────────────────────
 
@@ -468,8 +419,8 @@ def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
     btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v5.2</b> | {now.strftime('%H:%M МСК')}\n"
-        f"✅ Gate.io Раскорреляция 15М + Пробой 1H\n"
+        f"🤖 <b>Upscale Bot v6.0</b> | {now.strftime('%H:%M МСК')}\n"
+        f"✅ Gate.io Раскорреляция 15М + Sweep Reversal 1H\n"
         f"{btc_line}"
         f"Раскорреляций: <b>{decorr_count}</b>\n"
         f"{'😴 Жду спайк объёма...' if decorr_count > 0 else '🔍 Раскорреляций нет'}\n"
@@ -481,9 +432,9 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        f"🚀 <b>Upscale Bot v5.2 запущен</b>\n"
+        f"🚀 <b>Upscale Bot v6.0 запущен</b>\n"
         "📡 Раскорреляция 15М (Gate.io закр. свеча)\n"
-        "📊 Пробой 1H каждые 30 мин\n"
+        "🎯 Sweep Reversal 1H каждые 30 мин (свип + displacement + MSS)\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
     )
 
@@ -513,7 +464,7 @@ def main():
 
             # Скан пробоя каждые 60 минут
             if now_ts - last_break_scan >= BREAKOUT_SCAN_INTERVAL * 60:
-                run_breakout_scan()
+                run_sweep_scan()
                 last_break_scan = now_ts
         else:
             print(f"[LOOP] Вне часов ({msk_time_str()})")
