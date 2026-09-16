@@ -113,6 +113,45 @@ def get_gate_candles_1h(symbol: str, limit: int = 230):
         print(f"[GATE 1H ERROR] {symbol}: {e}")
         return None
 
+# ─── GATE.IO: Funding Rate + Open Interest (все пары одним запросом) ────────
+
+FUNDING_EXTREME = 0.05   # % — порог "экстремального" фандинга
+
+def get_gate_tickers():
+    """
+    Один запрос — funding_rate и OI по ВСЕМ парам сразу.
+    Возвращает dict: symbol -> {"funding": float%, "oi": float}
+    """
+    url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            print(f"[TICKERS ERROR] HTTP {r.status_code}")
+            return {}
+        data = r.json()
+        if data:
+            # Диагностика — смотрим реальные поля один раз, как с RVOL раньше
+            print(f"[TICKERS] Пример первого тикера: {data[0]}")
+        result = {}
+        for t in data:
+            contract = t.get("contract", "")
+            if not contract.endswith("_USDT"):
+                continue
+            sym = contract.replace("_USDT", "")
+            try:
+                funding = float(t.get("funding_rate", 0)) * 100  # в %
+                oi_raw = (t.get("total_size") or t.get("open_interest") or
+                          t.get("position_size") or 0)
+                oi = float(oi_raw)
+            except (ValueError, TypeError):
+                continue
+            result[sym] = {"funding": funding, "oi": oi}
+        print(f"[TICKERS] Загружено {len(result)} пар")
+        return result
+    except Exception as e:
+        print(f"[TICKERS ERROR] {e}")
+        return {}
+
 # ─── ИНДИКАТОРЫ ───────────────────────────────────────────────────────────────
 
 def calc_atr(highs, lows, closes, period=14) -> list:
@@ -125,6 +164,12 @@ def calc_atr(highs, lows, closes, period=14) -> list:
     return atrs
 
 # ─── СКАН 1: РАСКОРРЕЛЯЦИЯ (Gate.io закрытые свечи) ─────────────────────────
+
+CLOSE_POS_THRESHOLD = 0.6   # свеча должна закрыться в верхних 40% диапазона (для лонга)
+FUNDING_MAX_ALIGNED = 0.06  # % — если фандинг уже выше этого, рынок перегружен лонгами
+ROOM_LOOKBACK        = 20   # свечей — ищем локальный хай для проверки "комнаты" над входом
+ROOM_MIN_ATR         = 0.5  # минимальное расстояние до хая, в ATR-эквиваленте (примерно)
+RVOL_HOT_THRESHOLD   = 8.0  # RVOL выше этого — сильный сетап, двойная метка
 
 def run_decorr_scan():
     print(f"[DECORR] Старт {msk_time_str()}")
@@ -149,6 +194,9 @@ def run_decorr_scan():
     btc_chg   = (btc_close - btc_open) / btc_open * 100 if btc_open else 0
     print(f"[DECORR] BTC 15М: {btc_chg:+.2f}%")
 
+    # Funding rate по всем парам — один запрос
+    ticker_data = get_gate_tickers()
+
     candidates = []
     for sym in UPSCALE_PAIRS:
         try:
@@ -162,13 +210,15 @@ def run_decorr_scan():
                 continue
 
             candles = r.json()
-            if not candles or len(candles) < 4:
+            if not candles or len(candles) < ROOM_LOOKBACK + 3:
                 time.sleep(0.2)
                 continue
 
-            # 1 закрытая свеча: [-2] открытие и закрытие
+            # 1 закрытая свеча: [-2] открытие/закрытие/хай/лоу
             alt_open  = float(candles[-2]["o"])
             alt_close = float(candles[-2]["c"])
+            alt_high  = float(candles[-2]["h"])
+            alt_low   = float(candles[-2]["l"])
             alt_curr  = float(candles[-1]["c"])  # текущая цена входа
 
             if alt_open == 0:
@@ -182,11 +232,57 @@ def run_decorr_scan():
                 time.sleep(0.2)
                 continue
 
+            # ── Фильтр 1: сила закрытия свечи ──
+            # Свеча должна закрыться в верхней части диапазона — реальный импульс,
+            # а не спайк который уже отвергли (твой "рядом ликвидность, отскок")
+            candle_range = alt_high - alt_low
+            close_position = (alt_close - alt_low) / candle_range if candle_range > 0 else 0.5
+
+            if close_position < CLOSE_POS_THRESHOLD:
+                print(f"  {sym}: close_pos {close_position:.2f} < {CLOSE_POS_THRESHOLD} — отвергнутый спайк, пропуск")
+                time.sleep(0.2)
+                continue
+
             # RVOL на закрытой свече [-2]
             vol_closed = float(candles[-2]["v"])
             history_vols = [float(c["v"]) for c in candles[-22:-2]]
             vol_avg = sum(history_vols) / len(history_vols) if history_vols else 0
             rvol = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
+
+            # ── Фильтр 2: funding rate ──
+            # Если фандинг уже сильно положительный — рынок перегружен лонгами,
+            # топлива для продолжения меньше
+            funding = ticker_data.get(sym, {}).get("funding", 0)
+            funding_overloaded = funding > FUNDING_MAX_ALIGNED
+
+            # ── Фильтр 3: комната до локального хая ──
+            # Не покупаем прямо в стену сопротивления
+            highs_window = [float(c["h"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
+            local_high = max(highs_window) if highs_window else alt_curr
+            room_pct = (local_high - alt_curr) / alt_curr * 100 if alt_curr > 0 else 0
+            near_wall = alt_curr >= local_high * 0.995  # уже практически у хая
+
+            print(f"  {sym}: decorr={decorr:+.2f}% rvol={rvol}x close_pos={close_position:.2f} "
+                  f"funding={funding:+.3f}% room={room_pct:.2f}% near_wall={near_wall}")
+
+            # Мягкие фильтры — не блокируем сигнал полностью, а помечаем и понижаем приоритет
+            quality_score = 0
+            warn_marks = ""
+
+            if rvol >= RVOL_HOT_THRESHOLD:
+                quality_score += 2
+                warn_marks += "🔥🔥"
+            elif rvol >= RVOL_THRESHOLD * 2:
+                quality_score += 1
+                warn_marks += "🔥"
+
+            if funding_overloaded:
+                quality_score -= 1
+                warn_marks += "⚠️фандинг"
+
+            if near_wall:
+                quality_score -= 1
+                warn_marks += "🧱стена"
 
             candidates.append({
                 "symbol":  sym,
@@ -195,21 +291,27 @@ def run_decorr_scan():
                 "btc_chg": btc_chg,
                 "decorr":  decorr,
                 "rvol":    rvol,
+                "close_position": close_position,
+                "funding": funding,
+                "room_pct": room_pct,
+                "near_wall": near_wall,
+                "quality_score": quality_score,
+                "warn_marks": warn_marks,
             })
-            print(f"  ✅ {sym}: decorr={decorr:+.2f}% rvol={rvol}x")
 
         except Exception as e:
             print(f"  [DECORR ERROR] {sym}: {e}")
 
         time.sleep(0.2)
 
-    print(f"[DECORR] Кандидатов: {len(candidates)}")
+    print(f"[DECORR] Кандидатов после фильтров: {len(candidates)}")
     if not candidates:
         return 0, btc_chg
 
     # Фильтр RVOL
     signals = [c for c in candidates if c["rvol"] >= RVOL_THRESHOLD]
-    signals.sort(key=lambda x: x["decorr"], reverse=True)
+    # Сортировка: сначала по качеству (RVOL-бонус минус штрафы), потом по раскорреляции
+    signals.sort(key=lambda x: (x["quality_score"], x["decorr"]), reverse=True)
 
     if not signals:
         print("[DECORR] Нет сигналов с RVOL")
@@ -227,11 +329,14 @@ def run_decorr_scan():
         tp1   = entry * (1 + TP1_PCT  / 100)
         tp2   = entry * (1 + TP2_PCT  / 100)
         medal = medals[i] if i < len(medals) else "▪️"
+        marks = f" {s['warn_marks']}" if s['warn_marks'] else ""
 
         lines.append(
-            f"{medal} <b>{s['symbol']}/USDT</b>\n"
+            f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
             f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io (закр. свеча)\n"
             f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
+            f"   Закрытие свечи: {s['close_position']*100:.0f}% диапазона | Фандинг: {s['funding']:+.3f}%\n"
+            f"   Комната до хая: {s['room_pct']:.2f}%\n"
             f"   Вход: <b>{entry:.6g}</b>\n"
             f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
             f"   TP1:  {tp1:.6g} ({TP1_PCT:+}%) — 50%\n"
@@ -251,6 +356,10 @@ VOL_MULT_SWEEP   = 1.8     # объём displacement > 1.8x среднего
 MSS_LOOKBACK     = 8       # свечей для поиска точки MSS (противоположный экстремум)
 ATR_SL_BUFFER    = 0.5     # буфер стопа сверх фитиля свипа, в ATR
 TOP_N_SWEEP      = 3
+OI_DROP_THRESHOLD = -3.0   # % падения OI между сканами = подтверждение ликвидаций
+
+# Храним OI с прошлого скана чтобы видеть изменение между сканами
+prev_oi_snapshot = {}
 
 def find_pivot_high(highs, end_idx, lookback):
     """Локальный максимум в окне [end_idx-lookback : end_idx]."""
@@ -262,7 +371,7 @@ def find_pivot_low(lows, end_idx, lookback):
     window = lows[end_idx-lookback:end_idx]
     return min(window) if window else None
 
-def analyze_sweep(symbol: str):
+def analyze_sweep(symbol: str, ticker_data: dict):
     """
     Liquidity Sweep Reversal на 1H:
     1. Свеча [-3] пробивает фитилём локальный хай/лой (последние PIVOT_LOOKBACK свечей до неё),
@@ -272,6 +381,7 @@ def analyze_sweep(symbol: str):
     3. MSS: displacement пробивает ближайший противоположный локальный экстремум
        за последние MSS_LOOKBACK свечей — подтверждение слома структуры.
     4. FVG (бонус) — гэп между свечами вокруг displacement в сторону разворота.
+    5. Funding + OI (бонус) — подтверждение перегруженности рынка в сторону свипа.
     """
     candles = get_gate_candles_1h(symbol, limit=60)
     if not candles or len(candles) < 40:
@@ -326,6 +436,38 @@ def analyze_sweep(symbol: str):
           f"pivH={pivot_high:.4g} pivL={pivot_low:.4g} "
           f"disp_body={disp_body:.4g}(avg={avg_body:.4g}) disp_vol={round(disp_vol/avg_vol,1)}x")
 
+    # Funding + OI из тикера (может отсутствовать — не блокируем сигнал)
+    tick = ticker_data.get(symbol, {})
+    funding = tick.get("funding", 0)
+    oi_now  = tick.get("oi", 0)
+    oi_prev = prev_oi_snapshot.get(symbol)
+    oi_change_pct = None
+    if oi_prev and oi_prev > 0 and oi_now > 0:
+        oi_change_pct = (oi_now - oi_prev) / oi_prev * 100
+    if oi_now > 0:
+        prev_oi_snapshot[symbol] = oi_now
+
+    def funding_oi_score(is_long: bool) -> tuple:
+        """
+        Возвращает (bonus_mark, score_boost).
+        Для лонга (свип лоя) — ищем отрицательный фандинг (шорты перегружены).
+        Для шорта (свип хая) — ищем положительный фандинг (лонги перегружены).
+        """
+        mark = ""
+        boost = 0
+        funding_aligned = (funding < -FUNDING_EXTREME) if is_long else (funding > FUNDING_EXTREME)
+        funding_against  = (funding > FUNDING_EXTREME) if is_long else (funding < -FUNDING_EXTREME)
+        if funding_aligned:
+            mark += "🔥"
+            boost += 1
+        elif funding_against:
+            mark += "⚠️"
+            boost -= 1
+        if oi_change_pct is not None and oi_change_pct < OI_DROP_THRESHOLD:
+            mark += "📉"
+            boost += 1
+        return mark, boost
+
     # ── БЫЧИЙ SWEEP: пробили лоу фитилём, закрылись внутри, потом displacement вверх ──
     swept_low = (sweep_low < pivot_low and sweep_close > pivot_low) if pivot_low else False
     if swept_low and is_displacement and is_high_vol and disp_close > disp_open:
@@ -340,12 +482,15 @@ def analyze_sweep(symbol: str):
             stop = sweep_low - ATR_SL_BUFFER * atr
             risk = entry_price - stop
             target = entry_price + risk * 2.5
+            fo_mark, fo_boost = funding_oi_score(is_long=True)
             return {
                 "symbol": symbol, "direction": "ЛОНГ (свип лоя)",
                 "entry": entry_price, "stop": stop, "tp": target,
                 "atr": atr, "disp_vol_x": round(disp_vol/avg_vol,1),
                 "disp_body_x": round(disp_body/avg_body,1),
                 "fvg": fvg_bull, "sweep_level": pivot_low,
+                "funding": funding, "oi_change": oi_change_pct,
+                "fo_mark": fo_mark, "fo_boost": fo_boost,
             }
 
     # ── МЕДВЕЖИЙ SWEEP: пробили хай фитилём, закрылись внутри, потом displacement вниз ──
@@ -360,32 +505,41 @@ def analyze_sweep(symbol: str):
             stop = sweep_high + ATR_SL_BUFFER * atr
             risk = stop - entry_price
             target = entry_price - risk * 2.5
+            fo_mark, fo_boost = funding_oi_score(is_long=False)
             return {
                 "symbol": symbol, "direction": "ШОРТ (свип хая)",
                 "entry": entry_price, "stop": stop, "tp": target,
                 "atr": atr, "disp_vol_x": round(disp_vol/avg_vol,1),
                 "disp_body_x": round(disp_body/avg_body,1),
                 "fvg": fvg_bear, "sweep_level": pivot_high,
+                "funding": funding, "oi_change": oi_change_pct,
+                "fo_mark": fo_mark, "fo_boost": fo_boost,
             }
 
     return None
 
 def run_sweep_scan():
     print(f"[SWEEP] Старт {msk_time_str()}")
-    signals = []
 
+    # Один запрос funding+OI на ВСЕ пары сразу
+    ticker_data = get_gate_tickers()
+
+    signals = []
     for sym in UPSCALE_PAIRS:
-        result = analyze_sweep(sym)
+        result = analyze_sweep(sym, ticker_data)
         if result:
             signals.append(result)
-            print(f"  ✅ {sym}: {result['direction']} | disp_vol {result['disp_vol_x']}x | disp_body {result['disp_body_x']}x")
+            print(f"  ✅ {sym}: {result['direction']} | disp_vol {result['disp_vol_x']}x | "
+                  f"disp_body {result['disp_body_x']}x | funding {result['funding']:+.3f}% | "
+                  f"fo_mark {result['fo_mark']}")
         time.sleep(0.4)
 
     if not signals:
         print("[SWEEP] Свипов нет")
         return
 
-    signals.sort(key=lambda x: x["disp_vol_x"], reverse=True)
+    # Сортировка: сначала по funding/OI подтверждению, потом по объёму displacement
+    signals.sort(key=lambda x: (x["fo_boost"], x["disp_vol_x"]), reverse=True)
     top = signals[:TOP_N_SWEEP]
 
     medals = ["🥇","🥈","🥉"]
@@ -398,12 +552,16 @@ def run_sweep_scan():
         stop  = s["stop"]
         tp    = s["tp"]
         rr    = abs(tp-entry) / abs(entry-stop) if abs(entry-stop) > 0 else 0
-        fvg_mark = "🔥 FVG в сторону разворота" if s["fvg"] else ""
+        fvg_mark = "🔥 FVG" if s["fvg"] else ""
+
+        oi_line = f" | OI: {s['oi_change']:+.1f}%" if s["oi_change"] is not None else ""
+        fo_text = f"{s['fo_mark']} " if s["fo_mark"] else ""
 
         lines.append(
             f"{medal} {emoji} <b>{s['symbol']}/USDT — {s['direction']}</b>\n"
             f"   Уровень свипа: {s['sweep_level']:.6g} {fvg_mark}\n"
             f"   Displacement: тело {s['disp_body_x']}x | объём {s['disp_vol_x']}x\n"
+            f"   {fo_text}Фандинг: {s['funding']:+.3f}%{oi_line}\n"
             f"   Вход: <b>{entry:.6g}</b>\n"
             f"   Стоп: {stop:.6g} (за фитилём +{ATR_SL_BUFFER} ATR)\n"
             f"   TP:   {tp:.6g} | RR 1:{rr:.2f}\n"
@@ -419,7 +577,7 @@ def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
     btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v6.0</b> | {now.strftime('%H:%M МСК')}\n"
+        f"🤖 <b>Upscale Bot v6.2</b> | {now.strftime('%H:%M МСК')}\n"
         f"✅ Gate.io Раскорреляция 15М + Sweep Reversal 1H\n"
         f"{btc_line}"
         f"Раскорреляций: <b>{decorr_count}</b>\n"
@@ -432,9 +590,9 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        f"🚀 <b>Upscale Bot v6.0 запущен</b>\n"
-        "📡 Раскорреляция 15М (Gate.io закр. свеча)\n"
-        "🎯 Sweep Reversal 1H каждые 30 мин (свип + displacement + MSS)\n"
+        f"🚀 <b>Upscale Bot v6.2 запущен</b>\n"
+        "📡 Раскорреляция 15М + фильтры качества (закрытие/фандинг/стена)\n"
+        "🎯 Sweep Reversal 1H каждые 30 мин (свип + displacement + MSS + funding/OI)\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
     )
 
