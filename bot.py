@@ -5,7 +5,6 @@ from datetime import datetime, timezone, timedelta
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-CMC_API_KEY    = os.environ.get("CMC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
 
@@ -13,17 +12,21 @@ TRADING_START_MSK = 4
 TRADING_END_MSK   = 22
 MSK = timezone(timedelta(hours=3))
 
-# ── Скан 1: Раскорреляция (каждые 15 минут) ──
-DECORR_SCAN_INTERVAL = 15
-BTC_DECORR_THRESHOLD = 1.5
-RVOL_THRESHOLD       = 1.2
-TOP_N_DECORR         = 3
-STOP_PCT  = -3.0
-TP1_PCT   = +5.0
-TP2_PCT   = +9.0
-
-# ── Скан 2: Sweep Reversal 1H (каждые 30 минут) ──
-BREAKOUT_SCAN_INTERVAL = 30
+# ── RS Momentum параметры ──
+SCAN_INTERVAL        = 15      # минут
+BTC_DECORR_THRESHOLD = 1.5     # % раскорреляция для лонга
+BTC_DECORR_SHORT     = -1.5    # % раскорреляция для шорта (альт падает сильнее)
+RVOL_THRESHOLD       = 1.2     # минимальный объём
+RVOL_HOT_THRESHOLD   = 8.0     # горячий объём 🔥🔥
+CLOSE_POS_THRESHOLD  = 0.6     # закрытие в верхних 40% для лонга
+CLOSE_POS_SHORT      = 0.4     # закрытие в нижних 40% для шорта
+FUNDING_MAX_LONG     = 0.06    # % — перегруз лонгами (предупреждение для лонга)
+FUNDING_MIN_SHORT    = -0.06   # % — перегруз шортами (предупреждение для шорта)
+FUNDING_EXTREME      = 0.05    # для sweep
+ROOM_LOOKBACK        = 20      # свечей для комнаты до хая/лоя
+STOP_PCT             = -3.0    # % стоп
+ATR_TP2_MULT         = 2.0     # ATR множитель для TP2
+TOP_N                = 3       # топ сигналов
 
 # ─── UPSCALE PAIRS ────────────────────────────────────────────────────────────
 
@@ -45,14 +48,11 @@ UPSCALE_PAIRS = [
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
         r.raise_for_status()
     except Exception as e:
         print(f"[TG ERROR] {e}")
-
-# ─── ВРЕМЯ ────────────────────────────────────────────────────────────────────
 
 def is_trading_hours() -> bool:
     return TRADING_START_MSK <= datetime.now(MSK).hour < TRADING_END_MSK
@@ -60,246 +60,17 @@ def is_trading_hours() -> bool:
 def msk_time_str() -> str:
     return datetime.now(MSK).strftime("%H:%M МСК")
 
-# ─── GATE.IO: 15M RVOL ────────────────────────────────────────────────────────
+# ─── GATE.IO: тикеры (funding + OI) ──────────────────────────────────────────
 
-def get_gate_rvol(symbol: str):
-    contract = f"{symbol}_USDT"
-    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
-    params = {"contract": contract, "interval": "15m", "limit": 21}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        print(f"[GATE] {symbol}: HTTP {r.status_code}")
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
-        candles = r.json()
-        if not candles or len(candles) < 21:
-            return None, "not enough candles"
-        try:
-            volumes = [float(c["v"]) for c in candles]
-        except Exception:
-            return None, "no volume field"
-        history_vols = volumes[:20]
-        current_vol  = volumes[20]
-        if sum(history_vols) == 0:
-            return None, "zero volume"
-        k = 2 / (20 + 1)
-        ema = history_vols[0]
-        for v in history_vols[1:]:
-            ema = v * k + ema * (1 - k)
-        if ema == 0:
-            return None, "ema zero"
-        rvol = round(current_vol / ema, 2)
-        print(f"[GATE] {symbol}: RVOL={rvol}x")
-        return rvol, None
-    except Exception as e:
-        print(f"[GATE ERROR] {symbol}: {e}")
-        return None, str(e)
-
-# ─── GATE.IO: 1H свечи для пробоя ────────────────────────────────────────────
-
-def get_gate_candles_1h(symbol: str, limit: int = 230):
-    contract = f"{symbol}_USDT"
-    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
-    params = {"contract": contract, "interval": "1h", "limit": limit}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        candles = r.json()
-        if not candles or len(candles) < limit:
-            return None
-        return candles
-    except Exception as e:
-        print(f"[GATE 1H ERROR] {symbol}: {e}")
-        return None
-
-# ─── КОНТЕКСТ РЫНКА: BTC 1D + 4H ─────────────────────────────────────────────
-
-# Кэш — обновляем раз в час, не при каждом скане
-_market_context_cache = {"text": "", "updated_at": 0}
-
-def calc_ema_simple(prices: list, period: int) -> float:
-    """EMA за последние period свечей."""
-    if len(prices) < period:
-        return prices[-1] if prices else 0
-    k = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
-    for p in prices[period:]:
-        ema = p * k + ema * (1 - k)
-    return ema
-
-def get_market_context() -> str:
-    """
-    Возвращает строку контекста рынка на основе BTC 1D, 4H + EQH/EQL ликвидность.
-    Кэшируется на 1 час.
-    """
-    global _market_context_cache
-    now_ts = time.time()
-
-    if now_ts - _market_context_cache["updated_at"] < 3600 and _market_context_cache["text"]:
-        return _market_context_cache["text"]
-
-    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
-
-    try:
-        # BTC 1D — 210 свечей для EMA200
-        r1d = requests.get(url, params={"contract": "BTC_USDT", "interval": "1d", "limit": 210}, timeout=10)
-        candles_1d = r1d.json() if r1d.status_code == 200 else []
-
-        # BTC 4H — 100 свечей для тренда + EQH/EQL
-        r4h = requests.get(url, params={"contract": "BTC_USDT", "interval": "4h", "limit": 100}, timeout=10)
-        candles_4h = r4h.json() if r4h.status_code == 200 else []
-
-        # ── 1D анализ ──
-        if candles_1d and len(candles_1d) >= 60:
-            closes_1d = [float(c["c"]) for c in candles_1d]
-            price_now  = closes_1d[-1]
-            ema50_1d   = calc_ema_simple(closes_1d, 50)
-            ema200_1d  = calc_ema_simple(closes_1d, 200) if len(closes_1d) >= 200 else None
-
-            if ema200_1d and price_now > ema200_1d and price_now > ema50_1d:
-                daily_bias = "🐂 Бычий"
-            elif ema200_1d and price_now < ema200_1d and price_now < ema50_1d:
-                daily_bias = "🐻 Медвежий"
-            elif price_now > ema50_1d:
-                daily_bias = "📈 Выше EMA50"
-            else:
-                daily_bias = "📉 Ниже EMA50"
-        else:
-            daily_bias = "❓"
-            price_now  = 0
-
-        # ── 4H анализ + EQH/EQL ──
-        liq_line = ""
-        if candles_4h and len(candles_4h) >= 20:
-            closes_4h = [float(c["c"]) for c in candles_4h]
-            highs_4h  = [float(c["h"]) for c in candles_4h]
-            lows_4h   = [float(c["l"]) for c in candles_4h]
-            price_4h  = closes_4h[-1]
-            ema20_4h  = calc_ema_simple(closes_4h, 20)
-
-            # Структура 4H
-            recent_highs = [max(highs_4h[i-3:i]) for i in range(3, len(highs_4h))]
-            recent_lows  = [min(lows_4h[i-3:i])  for i in range(3, len(lows_4h))]
-            hh = recent_highs[-1] > recent_highs[-4] if len(recent_highs) >= 4 else None
-            hl = recent_lows[-1]  > recent_lows[-4]  if len(recent_lows)  >= 4 else None
-            lh = recent_highs[-1] < recent_highs[-4] if len(recent_highs) >= 4 else None
-            ll = recent_lows[-1]  < recent_lows[-4]  if len(recent_lows)  >= 4 else None
-
-            if hh and hl:   h4_bias = "📈 Восходящий"
-            elif lh and ll: h4_bias = "📉 Нисходящий"
-            elif price_4h > ema20_4h: h4_bias = "↗️ Выше EMA20"
-            else:           h4_bias = "↘️ Ниже EMA20"
-
-            # ── EQH/EQL: ищем равные хаи и лои на 4H ──
-            # Свинг-хай: свеча выше обеих соседних
-            # Свинг-лой: свеча ниже обеих соседних
-            EQ_TOLERANCE = 0.15  # % — насколько близко считаем "равными"
-
-            swing_highs = []
-            swing_lows  = []
-            for i in range(2, len(highs_4h) - 2):
-                # Свинг хай — выше 2 свечей с каждой стороны
-                if (highs_4h[i] > highs_4h[i-1] and highs_4h[i] > highs_4h[i-2] and
-                    highs_4h[i] > highs_4h[i+1] and highs_4h[i] > highs_4h[i+2]):
-                    swing_highs.append(highs_4h[i])
-                # Свинг лой — ниже 2 свечей с каждой стороны
-                if (lows_4h[i] < lows_4h[i-1] and lows_4h[i] < lows_4h[i-2] and
-                    lows_4h[i] < lows_4h[i+1] and lows_4h[i] < lows_4h[i+2]):
-                    swing_lows.append(lows_4h[i])
-
-            def find_eq_levels(levels: list, price: float, above: bool) -> list:
-                """
-                Группирует свинг-уровни по близости (EQ_TOLERANCE%).
-                Возвращает список (уровень, количество) только с той стороны от цены.
-                """
-                if not levels:
-                    return []
-                filtered = [l for l in levels if (l > price if above else l < price)]
-                if not filtered:
-                    return []
-                # Сортируем по близости к цене
-                filtered.sort(key=lambda x: abs(x - price))
-                groups = []
-                used = set()
-                for i, level in enumerate(filtered):
-                    if i in used:
-                        continue
-                    group = [level]
-                    for j, other in enumerate(filtered):
-                        if j != i and j not in used:
-                            if abs(other - level) / level * 100 <= EQ_TOLERANCE:
-                                group.append(other)
-                                used.add(j)
-                    if len(group) >= 2:  # минимум 2 одинаковых = EQH/EQL
-                        avg_level = sum(group) / len(group)
-                        groups.append((avg_level, len(group)))
-                    used.add(i)
-                # Сортируем по близости к цене
-                groups.sort(key=lambda x: abs(x[0] - price))
-                return groups[:2]  # топ-2 ближайших
-
-            eq_highs = find_eq_levels(swing_highs, price_4h, above=True)
-            eq_lows  = find_eq_levels(swing_lows,  price_4h, above=False)
-
-            # Формируем строку ликвидности
-            liq_parts = []
-            if eq_highs:
-                lvl, cnt = eq_highs[0]
-                pct = (lvl - price_4h) / price_4h * 100
-                stars = "⭐" * min(cnt, 3)
-                liq_parts.append(f"   ⬆️ EQH: {lvl:,.0f} ({pct:+.1f}%) {stars}")
-            if eq_lows:
-                lvl, cnt = eq_lows[0]
-                pct = (lvl - price_4h) / price_4h * 100
-                stars = "⭐" * min(cnt, 3)
-                liq_parts.append(f"   ⬇️ EQL: {lvl:,.0f} ({pct:.1f}%) {stars}")
-
-            # Какая ближе — туда скорее пойдёт
-            if eq_highs and eq_lows:
-                dist_up   = abs(eq_highs[0][0] - price_4h)
-                dist_down = abs(eq_lows[0][0]  - price_4h)
-                nearest = "⬆️ вверх (EQH)" if dist_up < dist_down else "⬇️ вниз (EQL)"
-                liq_parts.append(f"   🎯 Ближайшая: {nearest}")
-            elif eq_highs:
-                liq_parts.append(f"   🎯 Ближайшая: ⬆️ вверх (EQH)")
-            elif eq_lows:
-                liq_parts.append(f"   🎯 Ближайшая: ⬇️ вниз (EQL)")
-
-            if liq_parts:
-                liq_line = "\n💧 BTC ликвидность 4H:\n" + "\n".join(liq_parts)
-
-        else:
-            h4_bias = "❓"
-
-        context = f"📊 BTC: {daily_bias} (1D) | {h4_bias} (4H){liq_line}"
-        _market_context_cache = {"text": context, "updated_at": now_ts}
-        print(f"[MARKET] {context}")
-        return context
-
-    except Exception as e:
-        print(f"[MARKET ERROR] {e}")
-        return ""
-
-# ─── GATE.IO: Funding Rate + Open Interest (все пары одним запросом) ────────
-
-FUNDING_EXTREME = 0.05   # % — порог "экстремального" фандинга
-
-def get_gate_tickers():
-    """
-    Один запрос — funding_rate и OI по ВСЕМ парам сразу.
-    Возвращает dict: symbol -> {"funding": float%, "oi": float}
-    """
+def get_gate_tickers() -> dict:
     url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
     try:
         r = requests.get(url, timeout=10)
         if r.status_code != 200:
-            print(f"[TICKERS ERROR] HTTP {r.status_code}")
             return {}
         data = r.json()
         if data:
-            # Диагностика — смотрим реальные поля один раз, как с RVOL раньше
-            print(f"[TICKERS] Пример первого тикера: {data[0]}")
+            print(f"[TICKERS] Пример: {data[0]}")
         result = {}
         for t in data:
             contract = t.get("contract", "")
@@ -307,10 +78,9 @@ def get_gate_tickers():
                 continue
             sym = contract.replace("_USDT", "")
             try:
-                funding = float(t.get("funding_rate", 0)) * 100  # в %
-                oi_raw = (t.get("total_size") or t.get("open_interest") or
-                          t.get("position_size") or 0)
-                oi = float(oi_raw)
+                funding = float(t.get("funding_rate", 0)) * 100
+                oi_raw  = t.get("total_size") or t.get("open_interest") or t.get("position_size") or 0
+                oi      = float(oi_raw)
             except (ValueError, TypeError):
                 continue
             result[sym] = {"funding": funding, "oi": oi}
@@ -320,563 +90,258 @@ def get_gate_tickers():
         print(f"[TICKERS ERROR] {e}")
         return {}
 
+# ─── GATE.IO: 1H свечи ────────────────────────────────────────────────────────
+
+def get_gate_candles_1h(symbol: str, limit: int = 60) -> list:
+    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+    try:
+        r = requests.get(url, params={"contract": f"{symbol}_USDT", "interval": "1h", "limit": limit}, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"[1H ERROR] {symbol}: {e}")
+        return []
+
 # ─── ИНДИКАТОРЫ ───────────────────────────────────────────────────────────────
 
+def calc_ema_simple(prices: list, period: int) -> float:
+    if len(prices) < period:
+        return prices[-1] if prices else 0
+    k = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for p in prices[period:]:
+        ema = p * k + ema * (1 - k)
+    return ema
+
 def calc_atr(highs, lows, closes, period=14) -> list:
-    trs = [max(highs[i]-lows[i],
-               abs(highs[i]-closes[i-1]),
-               abs(lows[i]-closes[i-1])) for i in range(1, len(closes))]
+    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+           for i in range(1, len(closes))]
+    if len(trs) < period:
+        return [sum(trs)/len(trs)] if trs else [0]
     atrs = [sum(trs[:period])/period]
     for tr in trs[period:]:
         atrs.append((atrs[-1]*(period-1) + tr) / period)
     return atrs
 
-# ─── СКАН 1: РАСКОРРЕЛЯЦИЯ (Gate.io закрытые свечи) ─────────────────────────
+# ─── КОНТЕКСТ РЫНКА: BTC 1D + 4H + 1H + EQH/EQL ─────────────────────────────
 
-CLOSE_POS_THRESHOLD = 0.6   # свеча должна закрыться в верхних 40% диапазона (для лонга)
-FUNDING_MAX_ALIGNED = 0.06  # % — если фандинг уже выше этого, рынок перегружен лонгами
-ROOM_LOOKBACK        = 20   # свечей — ищем локальный хай для проверки "комнаты" над входом
-ROOM_MIN_ATR         = 0.5  # минимальное расстояние до хая, в ATR-эквиваленте (примерно)
-RVOL_HOT_THRESHOLD   = 8.0  # RVOL выше этого — сильный сетап, двойная метка
+_market_cache = {"text": "", "updated_at": 0}
 
-def run_decorr_scan():
-    print(f"[DECORR] Старт {msk_time_str()}")
+def find_eq_levels(levels: list, price: float, above: bool, tolerance: float = 0.15) -> list:
+    filtered = [l for l in levels if (l > price if above else l < price)]
+    if not filtered:
+        return []
+    filtered.sort(key=lambda x: abs(x - price))
+    groups = []
+    used = set()
+    for i, level in enumerate(filtered):
+        if i in used:
+            continue
+        group = [level]
+        for j, other in enumerate(filtered):
+            if j != i and j not in used:
+                if abs(other - level) / level * 100 <= tolerance:
+                    group.append(other)
+                    used.add(j)
+        if len(group) >= 2:
+            groups.append((sum(group)/len(group), len(group)))
+        used.add(i)
+    groups.sort(key=lambda x: abs(x[0] - price))
+    return groups[:2]
 
-    # BTC свечи — один раз для всех пар
+def get_swing_levels(highs: list, lows: list) -> tuple:
+    swing_highs, swing_lows = [], []
+    for i in range(2, len(highs) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+            swing_highs.append(highs[i])
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            swing_lows.append(lows[i])
+    return swing_highs, swing_lows
+
+def format_liq_line(eq_highs, eq_lows, price, tf_label):
+    parts = []
+    if eq_highs:
+        lvl, cnt = eq_highs[0]
+        pct = (lvl - price) / price * 100
+        stars = "⭐" * min(cnt, 3)
+        parts.append(f"⬆️ EQH: {lvl:,.0f} ({pct:+.1f}%) {stars}")
+    if eq_lows:
+        lvl, cnt = eq_lows[0]
+        pct = (lvl - price) / price * 100
+        stars = "⭐" * min(cnt, 3)
+        parts.append(f"⬇️ EQL: {lvl:,.0f} ({pct:+.1f}%) {stars}")
+    if eq_highs and eq_lows:
+        dist_up   = abs(eq_highs[0][0] - price)
+        dist_down = abs(eq_lows[0][0]  - price)
+        nearest = "⬆️ вверх" if dist_up < dist_down else "⬇️ вниз"
+        parts.append(f"🎯 {nearest}")
+    elif eq_highs:
+        parts.append("🎯 ⬆️ вверх")
+    elif eq_lows:
+        parts.append("🎯 ⬇️ вниз")
+    if parts:
+        return f"   {tf_label}: " + " | ".join(parts)
+    return ""
+
+def get_market_context() -> str:
+    global _market_cache
+    now_ts = time.time()
+    if now_ts - _market_cache["updated_at"] < 3600 and _market_cache["text"]:
+        return _market_cache["text"]
+
+    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
     try:
-        r = requests.get(
-            "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
-            params={"contract": "BTC_USDT", "interval": "15m", "limit": 25},
-            timeout=10
-        )
+        # 1D
+        r1d = requests.get(url, params={"contract": "BTC_USDT", "interval": "1d", "limit": 210}, timeout=10)
+        c1d = r1d.json() if r1d.status_code == 200 else []
+
+        # 4H
+        r4h = requests.get(url, params={"contract": "BTC_USDT", "interval": "4h", "limit": 100}, timeout=10)
+        c4h = r4h.json() if r4h.status_code == 200 else []
+
+        # 1H
+        r1h = requests.get(url, params={"contract": "BTC_USDT", "interval": "1h", "limit": 50}, timeout=10)
+        c1h = r1h.json() if r1h.status_code == 200 else []
+
+        # ── 1D bias ──
+        if c1d and len(c1d) >= 60:
+            closes_1d = [float(c["c"]) for c in c1d]
+            price     = closes_1d[-1]
+            ema50     = calc_ema_simple(closes_1d, 50)
+            ema200    = calc_ema_simple(closes_1d, 200) if len(closes_1d) >= 200 else None
+            if ema200 and price > ema200 and price > ema50:
+                d_bias = "🐂 Бычий"
+            elif ema200 and price < ema200 and price < ema50:
+                d_bias = "🐻 Медвежий"
+            elif price > ema50:
+                d_bias = "📈 Выше EMA50"
+            else:
+                d_bias = "📉 Ниже EMA50"
+        else:
+            d_bias = "❓"
+            price  = 0
+
+        # ── 4H bias + EQH/EQL ──
+        h4_liq = ""
+        if c4h and len(c4h) >= 20:
+            cl4 = [float(c["c"]) for c in c4h]
+            hi4 = [float(c["h"]) for c in c4h]
+            lo4 = [float(c["l"]) for c in c4h]
+            p4  = cl4[-1]
+            if len(price := p4 or price): pass  # noqa keep price updated
+            price = p4
+
+            ema20 = calc_ema_simple(cl4, 20)
+            rh = [max(hi4[i-3:i]) for i in range(3, len(hi4))]
+            rl = [min(lo4[i-3:i]) for i in range(3, len(lo4))]
+            hh = rh[-1] > rh[-4] if len(rh) >= 4 else None
+            hl = rl[-1] > rl[-4] if len(rl) >= 4 else None
+            lh = rh[-1] < rh[-4] if len(rh) >= 4 else None
+            ll = rl[-1] < rl[-4] if len(rl) >= 4 else None
+
+            if hh and hl:     h4_bias = "📈 Восходящий"
+            elif lh and ll:   h4_bias = "📉 Нисходящий"
+            elif p4 > ema20:  h4_bias = "↗️ Выше EMA20"
+            else:             h4_bias = "↘️ Ниже EMA20"
+
+            sh4, sl4 = get_swing_levels(hi4, lo4)
+            eq_h4 = find_eq_levels(sh4, p4, above=True)
+            eq_l4 = find_eq_levels(sl4, p4, above=False)
+            h4_liq = format_liq_line(eq_h4, eq_l4, p4, "4H")
+        else:
+            h4_bias = "❓"
+
+        # ── 1H bias + EQH/EQL + направление ──
+        h1_bias = "❓"
+        h1_liq  = ""
+        h1_dir  = ""
+        btc_price_str = ""
+        if c1h and len(c1h) >= 20:
+            cl1 = [float(c["c"]) for c in c1h]
+            hi1 = [float(c["h"]) for c in c1h]
+            lo1 = [float(c["l"]) for c in c1h]
+            p1  = cl1[-1]
+            price = p1
+            btc_price_str = f"{p1:,.0f} USDT"
+
+            # 1H изменение за последнюю закрытую свечу
+            h1_chg = (cl1[-2] - cl1[-3]) / cl1[-3] * 100 if len(cl1) >= 3 else 0
+
+            ema20_1h = calc_ema_simple(cl1, 20)
+            if p1 > ema20_1h and h1_chg > 0:
+                h1_dir  = "⬆️ Лонг"
+                h1_bias = "⬆️ Лонг"
+            elif p1 < ema20_1h and h1_chg < 0:
+                h1_dir  = "⬇️ Шорт"
+                h1_bias = "⬇️ Шорт"
+            elif p1 > ema20_1h:
+                h1_dir  = "↗️ Лонг тенденция"
+                h1_bias = "↗️"
+            else:
+                h1_dir  = "↘️ Шорт тенденция"
+                h1_bias = "↘️"
+
+            sh1, sl1 = get_swing_levels(hi1, lo1)
+            eq_h1 = find_eq_levels(sh1, p1, above=True)
+            eq_l1 = find_eq_levels(sl1, p1, above=False)
+            h1_liq = format_liq_line(eq_h1, eq_l1, p1, "1H")
+
+        lines = [
+            f"📊 BTC: {btc_price_str} | 1H: {h1_dir}",
+            f"   1D: {d_bias}",
+            f"   4H: {h4_bias}",
+        ]
+        liq_parts = []
+        if h4_liq: liq_parts.append(h4_liq)
+        if h1_liq: liq_parts.append(h1_liq)
+        if liq_parts:
+            lines.append("💧 BTC ликвидность:")
+            lines.extend(liq_parts)
+
+        context = "\n".join(lines)
+        _market_cache = {"text": context, "updated_at": now_ts}
+        print(f"[MARKET] обновлён")
+        return context
+
+    except Exception as e:
+        print(f"[MARKET ERROR] {e}")
+        return "📊 BTC: данные недоступны"
+
+# ─── RS MOMENTUM СКАН (лонг + шорт) ─────────────────────────────────────────
+
+def run_rs_momentum_scan():
+    print(f"[RS] Старт {msk_time_str()}")
+
+    # BTC 15М свечи
+    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+    try:
+        r = requests.get(url, params={"contract": "BTC_USDT", "interval": "15m", "limit": 30}, timeout=10)
         btc_candles = r.json() if r.status_code == 200 else []
     except Exception:
         btc_candles = []
 
     if not btc_candles or len(btc_candles) < 4:
-        print("[DECORR] BTC свечи не получены")
+        print("[RS] BTC свечи не получены")
         return 0, None
 
     btc_open  = float(btc_candles[-2]["o"])
     btc_close = float(btc_candles[-2]["c"])
     btc_chg   = (btc_close - btc_open) / btc_open * 100 if btc_open else 0
-    print(f"[DECORR] BTC 15М: {btc_chg:+.2f}%")
+    print(f"[RS] BTC 15М: {btc_chg:+.2f}%")
 
-    # Funding rate по всем парам — один запрос
+    # Тикеры (funding)
     ticker_data = get_gate_tickers()
 
-    candidates = []
-    for sym in UPSCALE_PAIRS:
-        try:
-            r = requests.get(
-                "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
-                params={"contract": f"{sym}_USDT", "interval": "15m", "limit": 25},
-                timeout=8
-            )
-            if r.status_code != 200:
-                time.sleep(0.2)
-                continue
-
-            candles = r.json()
-            if not candles or len(candles) < ROOM_LOOKBACK + 3:
-                time.sleep(0.2)
-                continue
-
-            # 1 закрытая свеча: [-2] открытие/закрытие/хай/лоу
-            alt_open  = float(candles[-2]["o"])
-            alt_close = float(candles[-2]["c"])
-            alt_high  = float(candles[-2]["h"])
-            alt_low   = float(candles[-2]["l"])
-            alt_curr  = float(candles[-1]["c"])  # текущая цена входа
-
-            if alt_open == 0:
-                time.sleep(0.2)
-                continue
-
-            alt_chg = (alt_close - alt_open) / alt_open * 100
-            decorr  = alt_chg - btc_chg
-
-            if decorr < BTC_DECORR_THRESHOLD:
-                time.sleep(0.2)
-                continue
-
-            # ── Фильтр 1: сила закрытия свечи ──
-            # Свеча должна закрыться в верхней части диапазона — реальный импульс,
-            # а не спайк который уже отвергли (твой "рядом ликвидность, отскок")
-            candle_range = alt_high - alt_low
-            close_position = (alt_close - alt_low) / candle_range if candle_range > 0 else 0.5
-
-            if close_position < CLOSE_POS_THRESHOLD:
-                print(f"  {sym}: close_pos {close_position:.2f} < {CLOSE_POS_THRESHOLD} — отвергнутый спайк, пропуск")
-                time.sleep(0.2)
-                continue
-
-            # RVOL на закрытой свече [-2]
-            vol_closed = float(candles[-2]["v"])
-            history_vols = [float(c["v"]) for c in candles[-22:-2]]
-            vol_avg = sum(history_vols) / len(history_vols) if history_vols else 0
-            rvol = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
-
-            # ── Фильтр 2: funding rate ──
-            # Если фандинг уже сильно положительный — рынок перегружен лонгами,
-            # топлива для продолжения меньше
-            funding = ticker_data.get(sym, {}).get("funding", 0)
-            funding_overloaded = funding > FUNDING_MAX_ALIGNED
-
-            # ── Фильтр 3: комната до локального хая ──
-            # Не покупаем прямо в стену сопротивления
-            highs_window = [float(c["h"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
-            local_high = max(highs_window) if highs_window else alt_curr
-            room_pct = (local_high - alt_curr) / alt_curr * 100 if alt_curr > 0 else 0
-            near_wall = alt_curr >= local_high * 0.995  # уже практически у хая
-
-            print(f"  {sym}: decorr={decorr:+.2f}% rvol={rvol}x close_pos={close_position:.2f} "
-                  f"funding={funding:+.3f}% room={room_pct:.2f}% near_wall={near_wall}")
-
-            # Мягкие фильтры — не блокируем сигнал полностью, а помечаем и понижаем приоритет
-            quality_score = 0
-            warn_marks = ""
-
-            if rvol >= RVOL_HOT_THRESHOLD:
-                quality_score += 2
-                warn_marks += "🔥🔥"
-            elif rvol >= RVOL_THRESHOLD * 2:
-                quality_score += 1
-                warn_marks += "🔥"
-
-            if funding_overloaded:
-                quality_score -= 1
-                warn_marks += "⚠️фандинг"
-
-            if near_wall:
-                quality_score -= 1
-                warn_marks += "🧱стена"
-
-            candidates.append({
-                "symbol":  sym,
-                "price":   alt_curr,
-                "alt_chg": alt_chg,
-                "btc_chg": btc_chg,
-                "decorr":  decorr,
-                "rvol":    rvol,
-                "close_position": close_position,
-                "funding": funding,
-                "room_pct": room_pct,
-                "near_wall": near_wall,
-                "quality_score": quality_score,
-                "warn_marks": warn_marks,
-            })
-
-        except Exception as e:
-            print(f"  [DECORR ERROR] {sym}: {e}")
-
-        time.sleep(0.2)
-
-    print(f"[DECORR] Кандидатов после фильтров: {len(candidates)}")
-    if not candidates:
-        return 0, btc_chg
-
-    # Фильтр RVOL
-    signals = [c for c in candidates if c["rvol"] >= RVOL_THRESHOLD]
-    # Сортировка: сначала по качеству (RVOL-бонус минус штрафы), потом по раскорреляции
-    signals.sort(key=lambda x: (x["quality_score"], x["decorr"]), reverse=True)
-
-    if not signals:
-        print("[DECORR] Нет сигналов с RVOL")
-        return len(candidates), btc_chg
-
-    top = signals[:TOP_N_DECORR]
-
-    lines = [f"📡 <b>РАСКОРРЕЛЯЦИЯ</b> | {msk_time_str()}\n"
-             f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"]
-
-    medals = ["🥇","🥈","🥉"]
-    for i, s in enumerate(top):
-        entry = s["price"]
-        stop  = entry * (1 + STOP_PCT / 100)
-        tp1   = entry * (1 + TP1_PCT  / 100)
-        tp2   = entry * (1 + TP2_PCT  / 100)
-        medal = medals[i] if i < len(medals) else "▪️"
-        marks = f" {s['warn_marks']}" if s['warn_marks'] else ""
-
-        lines.append(
-            f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
-            f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io (закр. свеча)\n"
-            f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
-            f"   Закрытие свечи: {s['close_position']*100:.0f}% диапазона | Фандинг: {s['funding']:+.3f}%\n"
-            f"   Комната до хая: {s['room_pct']:.2f}%\n"
-            f"   Вход: <b>{entry:.6g}</b>\n"
-            f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
-            f"   TP1:  {tp1:.6g} ({TP1_PCT:+}%) — 50%\n"
-            f"   TP2:  {tp2:.6g} ({TP2_PCT:+}%) — 50%\n"
-        )
-
-    lines.append("⚠️ Проверь структуру и CVD. Решение за тобой.")
-    send_telegram("\n".join(lines))
-    print(f"[DECORR] Отправлено {len(top)} сигналов")
-    return len(candidates), btc_chg
-
-# ─── СКАН 2: LIQUIDITY SWEEP REVERSAL (ложный пробой) 1H ────────────────────
-
-PIVOT_LOOKBACK    = 10     # свечей для поиска локального хая/лоя
-DISPLACEMENT_MULT = 1.2    # тело displacement > 1.2x среднего (было 1.5)
-VOL_MULT_SWEEP    = 1.4    # объём displacement > 1.4x среднего (было 1.8)
-MSS_LOOKBACK      = 6      # свечей для поиска MSS
-ATR_SL_BUFFER     = 0.5    # буфер стопа за фитилём свипа, в ATR
-TOP_N_SWEEP       = 3
-OI_DROP_THRESHOLD = -3.0   # % падения OI между сканами
-SWEEP_SEARCH_BACK = 6      # сколько закрытых свечей назад ищем свип
-DISP_AFTER_SWEEP  = 3      # сколько свечей после свипа ищем displacement
-
-# Храним OI с прошлого скана
-prev_oi_snapshot = {}
-
-def find_pivot_high(highs, end_idx, lookback):
-    window = highs[max(0, end_idx-lookback):end_idx]
-    return max(window) if window else None
-
-def find_pivot_low(lows, end_idx, lookback):
-    window = lows[max(0, end_idx-lookback):end_idx]
-    return min(window) if window else None
-
-def analyze_sweep(symbol: str, ticker_data: dict):
-    """
-    Liquidity Sweep Reversal 1H — гибкое окно поиска:
-    1. Ищем свип в SWEEP_SEARCH_BACK закрытых свечах:
-       фитиль пробил пивот, тело закрылось обратно внутри.
-    2. После свипа ищем displacement в DISP_AFTER_SWEEP свечах:
-       тело > DISPLACEMENT_MULT, объём > VOL_MULT_SWEEP, направление против свипа.
-    3. MSS: displacement пробивает противоположный локальный экстремум.
-    4. FVG и Funding/OI — бонусные метки.
-    """
-    candles = get_gate_candles_1h(symbol, limit=60)
-    if not candles or len(candles) < 40:
-        return None
-
-    closes  = [float(c["c"]) for c in candles]
-    highs   = [float(c["h"]) for c in candles]
-    lows    = [float(c["l"]) for c in candles]
-    opens   = [float(c["o"]) for c in candles]
-    volumes = [float(c["v"]) for c in candles]
-
-    n = len(closes)
-    atrs = calc_atr(highs, lows, closes, 14)
-    if not atrs:
-        return None
-    atr = atrs[-1]
-    entry_price = closes[-1]
-
-    # Средние тело и объём за последние 20 закрытых свечей
-    avg_body = sum(abs(closes[i]-opens[i]) for i in range(n-21, n-1)) / 20
-    avg_vol  = sum(volumes[n-21:n-1]) / 20
-    if avg_body == 0 or avg_vol == 0:
-        return None
-
-    # Funding + OI
-    tick    = ticker_data.get(symbol, {})
-    funding = tick.get("funding", 0)
-    oi_now  = tick.get("oi", 0)
-    oi_prev = prev_oi_snapshot.get(symbol)
-    oi_change_pct = None
-    if oi_prev and oi_prev > 0 and oi_now > 0:
-        oi_change_pct = (oi_now - oi_prev) / oi_now * 100
-    if oi_now > 0:
-        prev_oi_snapshot[symbol] = oi_now
-
-    def funding_oi_score(is_long: bool) -> tuple:
-        mark = ""; boost = 0
-        aligned = (funding < -FUNDING_EXTREME) if is_long else (funding > FUNDING_EXTREME)
-        against = (funding > FUNDING_EXTREME) if is_long else (funding < -FUNDING_EXTREME)
-        if aligned:  mark += "🔥"; boost += 1
-        elif against: mark += "⚠️"; boost -= 1
-        if oi_change_pct is not None and oi_change_pct < OI_DROP_THRESHOLD:
-            mark += "📉"; boost += 1
-        return mark, boost
-
-    # ── Ищем свип в окне последних SWEEP_SEARCH_BACK закрытых свечей ──
-    # Диапазон: от (n - SWEEP_SEARCH_BACK - DISP_AFTER_SWEEP - 1) до (n - DISP_AFTER_SWEEP - 1)
-    search_start = n - SWEEP_SEARCH_BACK - DISP_AFTER_SWEEP - 1
-    search_end   = n - DISP_AFTER_SWEEP - 1
-
-    best_signal = None
-
-    for sweep_i in range(max(search_start, PIVOT_LOOKBACK + 1), search_end):
-        p_high = find_pivot_high(highs, sweep_i, PIVOT_LOOKBACK)
-        p_low  = find_pivot_low(lows,  sweep_i, PIVOT_LOOKBACK)
-
-        sh = highs[sweep_i]; sl = lows[sweep_i]; sc = closes[sweep_i]
-
-        bull_sweep = p_low  and sl < p_low  and sc > p_low   # фитиль вниз, закрылись выше
-        bear_sweep = p_high and sh > p_high and sc < p_high  # фитиль вверх, закрылись ниже
-
-        if not bull_sweep and not bear_sweep:
-            continue
-
-        # ── Ищем displacement в следующих DISP_AFTER_SWEEP свечах ──
-        for disp_i in range(sweep_i + 1, min(sweep_i + DISP_AFTER_SWEEP + 1, n - 1)):
-            d_open  = opens[disp_i];  d_close = closes[disp_i]
-            d_body  = abs(d_close - d_open)
-            d_vol   = volumes[disp_i]
-
-            if d_body <= DISPLACEMENT_MULT * avg_body: continue
-            if d_vol  <= VOL_MULT_SWEEP  * avg_vol:   continue
-
-            # Бычий свип → displacement вверх
-            if bull_sweep and d_close > d_open:
-                mss = find_pivot_high(highs, disp_i, MSS_LOOKBACK)
-                if not mss or d_close <= mss: continue
-                fvg  = highs[sweep_i] < lows[min(disp_i+1, n-1)]
-                stop = sl - ATR_SL_BUFFER * atr
-                risk = entry_price - stop
-                if risk <= 0: continue
-                fo_mark, fo_boost = funding_oi_score(is_long=True)
-                sig = {
-                    "symbol": symbol, "direction": "ЛОНГ (свип лоя)",
-                    "entry": entry_price, "stop": stop, "tp": entry_price + risk * 2.5,
-                    "atr": atr, "disp_vol_x": round(d_vol/avg_vol,1),
-                    "disp_body_x": round(d_body/avg_body,1),
-                    "fvg": fvg, "sweep_level": p_low,
-                    "funding": funding, "oi_change": oi_change_pct,
-                    "fo_mark": fo_mark, "fo_boost": fo_boost,
-                    "sweep_age": n - 1 - sweep_i,
-                }
-                if best_signal is None or sig["disp_vol_x"] > best_signal["disp_vol_x"]:
-                    best_signal = sig
-
-            # Медвежий свип → displacement вниз
-            elif bear_sweep and d_close < d_open:
-                mss = find_pivot_low(lows, disp_i, MSS_LOOKBACK)
-                if not mss or d_close >= mss: continue
-                fvg  = lows[sweep_i] > highs[min(disp_i+1, n-1)]
-                stop = sh + ATR_SL_BUFFER * atr
-                risk = stop - entry_price
-                if risk <= 0: continue
-                fo_mark, fo_boost = funding_oi_score(is_long=False)
-                sig = {
-                    "symbol": symbol, "direction": "ШОРТ (свип хая)",
-                    "entry": entry_price, "stop": stop, "tp": entry_price - risk * 2.5,
-                    "atr": atr, "disp_vol_x": round(d_vol/avg_vol,1),
-                    "disp_body_x": round(d_body/avg_body,1),
-                    "fvg": fvg, "sweep_level": p_high,
-                    "funding": funding, "oi_change": oi_change_pct,
-                    "fo_mark": fo_mark, "fo_boost": fo_boost,
-                    "sweep_age": n - 1 - sweep_i,
-                }
-                if best_signal is None or sig["disp_vol_x"] > best_signal["disp_vol_x"]:
-                    best_signal = sig
-
-    if best_signal:
-        print(f"  ✅ {symbol}: {best_signal['direction']} | "
-              f"vol {best_signal['disp_vol_x']}x | body {best_signal['disp_body_x']}x | "
-              f"свип {best_signal['sweep_age']} св. назад")
-    return best_signal
-
-
-def run_sweep_scan():
-    print(f"[SWEEP] Старт {msk_time_str()}")
-
-    # Один запрос funding+OI на ВСЕ пары сразу
-    ticker_data = get_gate_tickers()
-
-    signals = []
-    for sym in UPSCALE_PAIRS:
-        result = analyze_sweep(sym, ticker_data)
-        if result:
-            signals.append(result)
-            print(f"  ✅ {sym}: {result['direction']} | disp_vol {result['disp_vol_x']}x | "
-                  f"disp_body {result['disp_body_x']}x | funding {result['funding']:+.3f}% | "
-                  f"fo_mark {result['fo_mark']}")
-        time.sleep(0.4)
-
-    if not signals:
-        print("[SWEEP] Свипов нет")
-        return
-
-    # Сортировка: сначала по funding/OI подтверждению, потом по объёму displacement
-    signals.sort(key=lambda x: (x["fo_boost"], x["disp_vol_x"]), reverse=True)
-    top = signals[:TOP_N_SWEEP]
-
+    # Контекст рынка
     market_ctx = get_market_context()
-    medals = ["🥇","🥈","🥉"]
-    lines = [f"🎯 <b>SWEEP REVERSAL 1H</b> | {msk_time_str()}\n"
-             f"{market_ctx}\n"]
 
-    for i, s in enumerate(top):
-        medal = medals[i] if i < len(medals) else "▪️"
-        emoji = "🟢" if "ЛОНГ" in s["direction"] else "🔴"
-        entry = s["entry"]
-        stop  = s["stop"]
-        tp    = s["tp"]
-        rr    = abs(tp-entry) / abs(entry-stop) if abs(entry-stop) > 0 else 0
-        fvg_mark = "🔥 FVG" if s["fvg"] else ""
-
-        oi_line = f" | OI: {s['oi_change']:+.1f}%" if s["oi_change"] is not None else ""
-        fo_text = f"{s['fo_mark']} " if s["fo_mark"] else ""
-
-        lines.append(
-            f"{medal} {emoji} <b>{s['symbol']}/USDT — {s['direction']}</b>\n"
-            f"   Уровень свипа: {s['sweep_level']:.6g} {fvg_mark}\n"
-            f"   Displacement: тело {s['disp_body_x']}x | объём {s['disp_vol_x']}x\n"
-            f"   {fo_text}Фандинг: {s['funding']:+.3f}%{oi_line}\n"
-            f"   Вход: <b>{entry:.6g}</b>\n"
-            f"   Стоп: {stop:.6g} (за фитилём +{ATR_SL_BUFFER} ATR)\n"
-            f"   TP:   {tp:.6g} | RR 1:{rr:.2f}\n"
-        )
-
-    lines.append("⚠️ Проверь график — см. инструкцию. Решение за тобой.")
-    send_telegram("\n".join(lines))
-    print(f"[SWEEP] Отправлено {len(top)} сигналов")
-
-# ─── СКАН 3: 15М SWEEP REVERSAL (быстрый разворот) ──────────────────────────
-
-# Параметры для 15М — чуть мягче чем 1H
-SWEEP_15M_PIVOT     = 8    # свечей для пивота на 15М
-SWEEP_15M_DISP_MULT = 1.2  # тело displacement
-SWEEP_15M_VOL_MULT  = 1.4  # объём displacement
-SWEEP_15M_SEARCH    = 5    # свечей назад ищем свип
-SWEEP_15M_AFTER     = 2    # свечей после свипа ищем displacement
-SWEEP_15M_ATR_BUF   = 0.3  # буфер стопа (меньше чем на 1H)
-TOP_N_SWEEP_15M     = 2    # максимум 2 сигнала — 15М активнее
-
-def analyze_sweep_15m(symbol: str, ticker_data: dict, candles_15m: list):
-    """
-    Быстрый 15М Sweep Reversal.
-    Использует уже загруженные 15М свечи из раскорреляционного скана.
-    Логика та же что analyze_sweep но на 15М данных.
-    """
-    if not candles_15m or len(candles_15m) < 30:
-        return None
-
-    closes  = [float(c["c"]) for c in candles_15m]
-    highs   = [float(c["h"]) for c in candles_15m]
-    lows    = [float(c["l"]) for c in candles_15m]
-    opens   = [float(c["o"]) for c in candles_15m]
-    volumes = [float(c["v"]) for c in candles_15m]
-
-    n = len(closes)
-    atrs = calc_atr(highs, lows, closes, 14)
-    if not atrs:
-        return None
-    atr = atrs[-1]
-    entry_price = closes[-1]
-
-    avg_body = sum(abs(closes[i]-opens[i]) for i in range(n-21, n-1)) / 20
-    avg_vol  = sum(volumes[n-21:n-1]) / 20
-    if avg_body == 0 or avg_vol == 0:
-        return None
-
-    tick    = ticker_data.get(symbol, {})
-    funding = tick.get("funding", 0)
-
-    def fo_score(is_long: bool) -> tuple:
-        mark = ""; boost = 0
-        if is_long and funding < -FUNDING_EXTREME:   mark += "🔥"; boost += 1
-        elif is_long and funding > FUNDING_EXTREME:  mark += "⚠️"; boost -= 1
-        if not is_long and funding > FUNDING_EXTREME: mark += "🔥"; boost += 1
-        elif not is_long and funding < -FUNDING_EXTREME: mark += "⚠️"; boost -= 1
-        return mark, boost
-
-    search_start = n - SWEEP_15M_SEARCH - SWEEP_15M_AFTER - 1
-    search_end   = n - SWEEP_15M_AFTER - 1
-    best = None
-
-    for si in range(max(search_start, SWEEP_15M_PIVOT + 1), search_end):
-        ph = find_pivot_high(highs, si, SWEEP_15M_PIVOT)
-        pl = find_pivot_low(lows,  si, SWEEP_15M_PIVOT)
-
-        sh = highs[si]; sl = lows[si]; sc = closes[si]
-
-        bull_sweep = pl and sl < pl and sc > pl
-        bear_sweep = ph and sh > ph and sc < ph
-
-        if not bull_sweep and not bear_sweep:
-            continue
-
-        for di in range(si + 1, min(si + SWEEP_15M_AFTER + 1, n - 1)):
-            d_open  = opens[di]; d_close = closes[di]
-            d_body  = abs(d_close - d_open)
-            d_vol   = volumes[di]
-
-            if d_body <= SWEEP_15M_DISP_MULT * avg_body: continue
-            if d_vol  <= SWEEP_15M_VOL_MULT  * avg_vol:  continue
-
-            if bull_sweep and d_close > d_open:
-                stop = sl - SWEEP_15M_ATR_BUF * atr
-                risk = entry_price - stop
-                if risk <= 0: continue
-                fo_mark, fo_boost = fo_score(is_long=True)
-                sig = {
-                    "symbol": symbol, "direction": "ЛОНГ 15М (свип лоя)",
-                    "entry": entry_price, "stop": stop, "tp": entry_price + risk * 2.5,
-                    "disp_vol_x": round(d_vol/avg_vol,1),
-                    "disp_body_x": round(d_body/avg_body,1),
-                    "sweep_level": pl, "funding": funding,
-                    "fo_mark": fo_mark, "fo_boost": fo_boost,
-                    "sweep_age": n - 1 - si,
-                }
-                if best is None or sig["disp_vol_x"] > best["disp_vol_x"]:
-                    best = sig
-
-            elif bear_sweep and d_close < d_open:
-                stop = sh + SWEEP_15M_ATR_BUF * atr
-                risk = stop - entry_price
-                if risk <= 0: continue
-                fo_mark, fo_boost = fo_score(is_long=False)
-                sig = {
-                    "symbol": symbol, "direction": "ШОРТ 15М (свип хая)",
-                    "entry": entry_price, "stop": stop, "tp": entry_price - risk * 2.5,
-                    "disp_vol_x": round(d_vol/avg_vol,1),
-                    "disp_body_x": round(d_body/avg_body,1),
-                    "sweep_level": ph, "funding": funding,
-                    "fo_mark": fo_mark, "fo_boost": fo_boost,
-                    "sweep_age": n - 1 - si,
-                }
-                if best is None or sig["disp_vol_x"] > best["disp_vol_x"]:
-                    best = sig
-
-    return best
-
-def run_decorr_and_sweep15m_scan():
-    """
-    Объединённый скан: раскорреляция + 15М sweep.
-    Один проход по всем парам — загружаем 15М свечи один раз,
-    используем и для раскорреляции и для sweep.
-    """
-    print(f"[SCAN] Старт {msk_time_str()}")
-
-    # BTC свечи
-    try:
-        r = requests.get(
-            "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
-            params={"contract": "BTC_USDT", "interval": "15m", "limit": 30},
-            timeout=10
-        )
-        btc_candles = r.json() if r.status_code == 200 else []
-    except Exception:
-        btc_candles = []
-
-    if not btc_candles or len(btc_candles) < 4:
-        print("[SCAN] BTC свечи не получены")
-        return 0, None
-
-    btc_open = float(btc_candles[-2]["o"])
-    btc_close = float(btc_candles[-2]["c"])
-    btc_chg  = (btc_close - btc_open) / btc_open * 100 if btc_open else 0
-    print(f"[SCAN] BTC 15М: {btc_chg:+.2f}%")
-
-    # Один запрос тикеров для всех пар
-    ticker_data = get_gate_tickers()
-
-    decorr_candidates = []
-    sweep15_signals   = []
+    longs  = []
+    shorts = []
 
     for sym in UPSCALE_PAIRS:
         try:
-            r = requests.get(
-                "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+            r = requests.get(url,
                 params={"contract": f"{sym}_USDT", "interval": "15m", "limit": 30},
-                timeout=8
-            )
+                timeout=8)
             if r.status_code != 200:
                 time.sleep(0.2); continue
 
@@ -884,7 +349,7 @@ def run_decorr_and_sweep15m_scan():
             if not candles or len(candles) < ROOM_LOOKBACK + 3:
                 time.sleep(0.2); continue
 
-            # ── Раскорреляция ──
+            # Закрытая свеча [-2]
             alt_open  = float(candles[-2]["o"])
             alt_close = float(candles[-2]["c"])
             alt_high  = float(candles[-2]["h"])
@@ -897,119 +362,164 @@ def run_decorr_and_sweep15m_scan():
             alt_chg = (alt_close - alt_open) / alt_open * 100
             decorr  = alt_chg - btc_chg
 
+            # RVOL
+            vol_closed   = float(candles[-2]["v"])
+            history_vols = [float(c["v"]) for c in candles[-22:-2]]
+            vol_avg      = sum(history_vols) / len(history_vols) if history_vols else 0
+            rvol         = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
+
+            if rvol < RVOL_THRESHOLD:
+                time.sleep(0.2); continue
+
+            # Размер свечи
             candle_range   = alt_high - alt_low
             close_position = (alt_close - alt_low) / candle_range if candle_range > 0 else 0.5
-            vol_closed     = float(candles[-2]["v"])
-            history_vols   = [float(c["v"]) for c in candles[-22:-2]]
-            vol_avg        = sum(history_vols) / len(history_vols) if history_vols else 0
-            rvol           = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
-            funding        = ticker_data.get(sym, {}).get("funding", 0)
 
-            highs_window = [float(c["h"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
-            local_high   = max(highs_window) if highs_window else alt_curr
-            room_pct     = (local_high - alt_curr) / alt_curr * 100 if alt_curr > 0 else 0
-            near_wall    = alt_curr >= local_high * 0.995
+            # Funding
+            funding = ticker_data.get(sym, {}).get("funding", 0)
 
-            # Декорр сигнал
+            # ATR для TP2
+            all_highs  = [float(c["h"]) for c in candles]
+            all_lows   = [float(c["l"]) for c in candles]
+            all_closes = [float(c["c"]) for c in candles]
+            atrs = calc_atr(all_highs, all_lows, all_closes, 14)
+            atr  = atrs[-1] if atrs else 0
+
+            # ── ЛОНГ ──
             if decorr >= BTC_DECORR_THRESHOLD and close_position >= CLOSE_POS_THRESHOLD:
-                quality_score = 0
-                warn_marks = ""
-                if rvol >= RVOL_HOT_THRESHOLD:   quality_score += 2; warn_marks += "🔥🔥"
-                elif rvol >= RVOL_THRESHOLD * 2: quality_score += 1; warn_marks += "🔥"
-                if funding > FUNDING_MAX_ALIGNED: quality_score -= 1; warn_marks += "⚠️фандинг"
-                if near_wall:                    quality_score -= 1; warn_marks += "🧱стена"
+                # Локальный хай (TP1)
+                highs_window = [float(c["h"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
+                local_high   = max(highs_window) if highs_window else alt_curr
+                room_pct     = (local_high - alt_curr) / alt_curr * 100
+                near_wall    = alt_curr >= local_high * 0.995
 
-                if rvol >= RVOL_THRESHOLD:
-                    decorr_candidates.append({
-                        "symbol": sym, "price": alt_curr,
-                        "alt_chg": alt_chg, "btc_chg": btc_chg, "decorr": decorr,
-                        "rvol": rvol, "close_position": close_position,
-                        "funding": funding, "room_pct": room_pct, "near_wall": near_wall,
-                        "quality_score": quality_score, "warn_marks": warn_marks,
-                    })
+                tp1_price = local_high
+                tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
+                tp2_price = alt_curr + ATR_TP2_MULT * atr
+                tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100
+                stop      = alt_curr * (1 + STOP_PCT / 100)
 
-            # ── 15М Sweep ──
-            sweep_result = analyze_sweep_15m(sym, ticker_data, candles)
-            if sweep_result:
-                sweep15_signals.append(sweep_result)
-                print(f"  🎯 SWEEP15 {sym}: {sweep_result['direction']} | "
-                      f"vol {sweep_result['disp_vol_x']}x | {sweep_result['sweep_age']} св. назад")
+                # Метки качества
+                quality = 0; marks = ""
+                if rvol >= RVOL_HOT_THRESHOLD:       quality += 2; marks += "🔥🔥"
+                elif rvol >= RVOL_THRESHOLD * 2:     quality += 1; marks += "🔥"
+                if funding > FUNDING_MAX_LONG:        quality -= 1; marks += "⚠️фандинг"
+                if near_wall:                        quality -= 1; marks += "🧱стена"
+
+                longs.append({
+                    "symbol": sym, "price": alt_curr, "decorr": decorr,
+                    "alt_chg": alt_chg, "rvol": rvol,
+                    "close_position": close_position, "funding": funding,
+                    "room_pct": room_pct, "near_wall": near_wall,
+                    "tp1_price": tp1_price, "tp1_pct": tp1_pct,
+                    "tp2_price": tp2_price, "tp2_pct": tp2_pct,
+                    "stop": stop, "quality": quality, "marks": marks,
+                })
+
+            # ── ШОРТ ──
+            elif decorr <= BTC_DECORR_SHORT and close_position <= CLOSE_POS_SHORT:
+                # Локальный лой (TP1 для шорта)
+                lows_window = [float(c["l"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
+                local_low   = min(lows_window) if lows_window else alt_curr
+                room_pct    = (alt_curr - local_low) / alt_curr * 100  # расстояние до лоя
+                near_floor  = alt_curr <= local_low * 1.005
+
+                tp1_price = local_low
+                tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100  # отрицательный
+                tp2_price = alt_curr - ATR_TP2_MULT * atr
+                tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100  # отрицательный
+                stop      = alt_curr * (1 - STOP_PCT / 100)  # стоп выше для шорта
+
+                quality = 0; marks = ""
+                if rvol >= RVOL_HOT_THRESHOLD:       quality += 2; marks += "🔥🔥"
+                elif rvol >= RVOL_THRESHOLD * 2:     quality += 1; marks += "🔥"
+                if funding < FUNDING_MIN_SHORT:       quality -= 1; marks += "⚠️фандинг"
+                if near_floor:                       quality -= 1; marks += "🧱пол"
+
+                shorts.append({
+                    "symbol": sym, "price": alt_curr, "decorr": decorr,
+                    "alt_chg": alt_chg, "rvol": rvol,
+                    "close_position": close_position, "funding": funding,
+                    "room_pct": room_pct, "near_floor": near_floor,
+                    "tp1_price": tp1_price, "tp1_pct": tp1_pct,
+                    "tp2_price": tp2_price, "tp2_pct": tp2_pct,
+                    "stop": stop, "quality": quality, "marks": marks,
+                })
 
         except Exception as e:
             print(f"  [ERROR] {sym}: {e}")
-
         time.sleep(0.2)
 
-    # ── Получаем контекст рынка (кэш, обновляется раз в час) ──
-    market_ctx = get_market_context()
+    print(f"[RS] Лонгов: {len(longs)} | Шортов: {len(shorts)}")
 
-    # ── Отправка раскорреляции ──
-    decorr_count = len(decorr_candidates)
-    if decorr_candidates:
-        decorr_candidates.sort(key=lambda x: (x["quality_score"], x["decorr"]), reverse=True)
-        top = decorr_candidates[:TOP_N_DECORR]
-        medals = ["🥇","🥈","🥉"]
-        lines = [f"📡 <b>РАСКОРРЕЛЯЦИЯ</b> | {msk_time_str()}\n"
-                 f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"
-                 f"{market_ctx}\n"]
+    medals = ["🥇","🥈","🥉"]
+
+    # ── Отправка лонгов ──
+    if longs:
+        longs.sort(key=lambda x: (x["quality"], x["decorr"]), reverse=True)
+        top = longs[:TOP_N]
+        lines = [
+            f"📡 <b>RS MOMENTUM — ЛОНГ</b> | {msk_time_str()}\n"
+            f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"
+            f"{market_ctx}\n"
+        ]
         for i, s in enumerate(top):
-            entry = s["price"]
-            stop  = entry * (1 + STOP_PCT / 100)
-            tp1   = entry * (1 + TP1_PCT  / 100)
-            tp2   = entry * (1 + TP2_PCT  / 100)
             medal = medals[i] if i < len(medals) else "▪️"
-            marks = f" {s['warn_marks']}" if s['warn_marks'] else ""
+            marks = f" {s['marks']}" if s['marks'] else ""
             lines.append(
                 f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
-                f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io (закр. свеча)\n"
+                f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io\n"
                 f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
                 f"   Закрытие свечи: {s['close_position']*100:.0f}% | Фандинг: {s['funding']:+.3f}%\n"
                 f"   Комната до хая: {s['room_pct']:.2f}%\n"
-                f"   Вход: <b>{entry:.6g}</b>\n"
-                f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
-                f"   TP1:  {tp1:.6g} ({TP1_PCT:+}%) — 50%\n"
-                f"   TP2:  {tp2:.6g} ({TP2_PCT:+}%) — 50%\n"
+                f"   Вход: <b>{s['price']:.6g}</b>\n"
+                f"   Стоп: {s['stop']:.6g} ({STOP_PCT}%)\n"
+                f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — локальный хай — 50%\n"
+                f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — ATR×{ATR_TP2_MULT} — 50%\n"
             )
-        lines.append("⚠️ Проверь структуру и CVD. Решение за тобой.")
+        lines.append("⚠️ Проверь CVD. Решение за тобой.")
         send_telegram("\n".join(lines))
 
-    # ── Отправка 15М sweep ──
-    if sweep15_signals:
-        sweep15_signals.sort(key=lambda x: (x["fo_boost"], x["disp_vol_x"]), reverse=True)
-        top15 = sweep15_signals[:TOP_N_SWEEP_15M]
-        medals = ["🥇","🥈","🥉"]
-        lines = [f"⚡ <b>SWEEP 15М</b> | {msk_time_str()}\n"
-                 f"{market_ctx}\n"]
-        for i, s in enumerate(top15):
+    # ── Отправка шортов ──
+    if shorts:
+        shorts.sort(key=lambda x: (x["quality"], abs(x["decorr"])), reverse=True)
+        top = shorts[:TOP_N]
+        lines = [
+            f"📡 <b>RS MOMENTUM — ШОРТ</b> | {msk_time_str()}\n"
+            f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"
+            f"{market_ctx}\n"
+        ]
+        for i, s in enumerate(top):
             medal = medals[i] if i < len(medals) else "▪️"
-            emoji = "🟢" if "ЛОНГ" in s["direction"] else "🔴"
-            entry = s["entry"]; stop = s["stop"]; tp = s["tp"]
-            rr = abs(tp-entry) / abs(entry-stop) if abs(entry-stop) > 0 else 0
-            fo_text = f"{s['fo_mark']} " if s["fo_mark"] else ""
+            marks = f" {s['marks']}" if s['marks'] else ""
             lines.append(
-                f"{medal} {emoji} <b>{s['symbol']}/USDT — {s['direction']}</b>\n"
-                f"   Свип {s['sweep_age']} св. назад | Уровень: {s['sweep_level']:.6g}\n"
-                f"   Displacement: тело {s['disp_body_x']}x | объём {s['disp_vol_x']}x\n"
-                f"   {fo_text}Фандинг: {s['funding']:+.3f}%\n"
-                f"   Вход: <b>{entry:.6g}</b>\n"
-                f"   Стоп: {stop:.6g} | TP: {tp:.6g} | RR 1:{rr:.2f}\n"
+                f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
+                f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io\n"
+                f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
+                f"   Закрытие свечи: {s['close_position']*100:.0f}% | Фандинг: {s['funding']:+.3f}%\n"
+                f"   Комната до лоя: {s['room_pct']:.2f}%\n"
+                f"   Вход: <b>{s['price']:.6g}</b>\n"
+                f"   Стоп: {s['stop']:.6g} (+{abs(STOP_PCT):.0f}%)\n"
+                f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — локальный лой — 50%\n"
+                f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — ATR×{ATR_TP2_MULT} — 50%\n"
             )
-        lines.append("⚡ Быстрый разворот 15М — проверь график немедленно!")
+        lines.append("⚠️ Проверь CVD. Решение за тобой.")
         send_telegram("\n".join(lines))
-        print(f"[SWEEP15] Отправлено {len(top15)} сигналов")
 
-    print(f"[SCAN] Декорр: {decorr_count} | Sweep15: {len(sweep15_signals)}")
-    return decorr_count, btc_chg
+    return len(longs) + len(shorts), btc_chg
 
-def send_status(decorr_count=0, btc_1h=None):
+# ─── СТАТУС ───────────────────────────────────────────────────────────────────
+
+def send_status(signal_count=0, btc_chg=None):
     now = datetime.now(MSK)
-    btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
+    ctx = get_market_context()
+    btc_line = f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n" if btc_chg is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v6.5</b> | {now.strftime('%H:%M МСК')}\n"
-        f"✅ Раскорреляция 15М + Sweep 15М + Sweep 1H\n"
+        f"🤖 <b>Upscale Bot v7.0</b> | {now.strftime('%H:%M МСК')}\n"
+        f"✅ RS Momentum 15М (Лонг + Шорт)\n"
         f"{btc_line}"
-        f"Раскорреляций: <b>{decorr_count}</b>\n"
-        f"{'😴 Жду спайк объёма...' if decorr_count > 0 else '🔍 Раскорреляций нет'}\n"
+        f"{ctx}\n"
+        f"Сигналов: <b>{signal_count}</b>\n"
         f"Пар в скане: {len(UPSCALE_PAIRS)}"
     )
     send_telegram(status)
@@ -1018,18 +528,16 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        f"🚀 <b>Upscale Bot v6.5 запущен</b>\n"
-        "📡 Раскорреляция 15М + фильтры качества\n"
-        "⚡ Sweep Reversal 15М (быстрый разворот)\n"
-        "🎯 Sweep Reversal 1H каждые 30 мин\n"
+        "🚀 <b>Upscale Bot v7.0 запущен</b>\n"
+        "📡 RS Momentum 15М — Лонг + Шорт\n"
+        "📊 BTC контекст: 1D + 4H + 1H + EQH/EQL ликвидность\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
     )
 
-    last_decorr      = 0
-    last_btc         = None
-    status_sent_hour = -1
-    last_decorr_scan = 0
-    last_break_scan  = 0
+    last_signal_count = 0
+    last_btc          = None
+    status_sent_hour  = -1
+    last_scan         = 0
 
     while True:
         now_msk  = datetime.now(MSK)
@@ -1037,21 +545,15 @@ def main():
         now_ts   = time.time()
 
         if cur_hour != status_sent_hour:
-            send_status(last_decorr, last_btc)
+            send_status(last_signal_count, last_btc)
             status_sent_hour = cur_hour
 
         if is_trading_hours():
-            # Раскорреляция + 15М sweep каждые 15 минут (один проход по парам)
-            if now_ts - last_decorr_scan >= DECORR_SCAN_INTERVAL * 60:
-                result = run_decorr_and_sweep15m_scan()
+            if now_ts - last_scan >= SCAN_INTERVAL * 60:
+                result = run_rs_momentum_scan()
                 if result:
-                    last_decorr, last_btc = result
-                last_decorr_scan = now_ts
-
-            # 1H sweep каждые 30 минут
-            if now_ts - last_break_scan >= BREAKOUT_SCAN_INTERVAL * 60:
-                run_sweep_scan()
-                last_break_scan = now_ts
+                    last_signal_count, last_btc = result
+                last_scan = now_ts
         else:
             print(f"[LOOP] Вне часов ({msk_time_str()})")
 
