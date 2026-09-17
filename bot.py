@@ -113,6 +113,100 @@ def get_gate_candles_1h(symbol: str, limit: int = 230):
         print(f"[GATE 1H ERROR] {symbol}: {e}")
         return None
 
+# ─── КОНТЕКСТ РЫНКА: BTC 1D + 4H ─────────────────────────────────────────────
+
+# Кэш — обновляем раз в час, не при каждом скане
+_market_context_cache = {"text": "", "updated_at": 0}
+
+def calc_ema_simple(prices: list, period: int) -> float:
+    """EMA за последние period свечей."""
+    if len(prices) < period:
+        return prices[-1] if prices else 0
+    k = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for p in prices[period:]:
+        ema = p * k + ema * (1 - k)
+    return ema
+
+def get_market_context() -> str:
+    """
+    Возвращает строку контекста рынка на основе BTC 1D и 4H.
+    Кэшируется на 1 час чтобы не нагружать API при каждом скане.
+    """
+    global _market_context_cache
+    now_ts = time.time()
+
+    # Обновляем не чаще раза в час
+    if now_ts - _market_context_cache["updated_at"] < 3600 and _market_context_cache["text"]:
+        return _market_context_cache["text"]
+
+    url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+
+    try:
+        # BTC 1D — 210 свечей для EMA200
+        r1d = requests.get(url, params={"contract": "BTC_USDT", "interval": "1d", "limit": 210}, timeout=10)
+        candles_1d = r1d.json() if r1d.status_code == 200 else []
+
+        # BTC 4H — 60 свечей для тренда
+        r4h = requests.get(url, params={"contract": "BTC_USDT", "interval": "4h", "limit": 60}, timeout=10)
+        candles_4h = r4h.json() if r4h.status_code == 200 else []
+
+        # ── 1D анализ ──
+        if candles_1d and len(candles_1d) >= 60:
+            closes_1d = [float(c["c"]) for c in candles_1d]
+            price_now  = closes_1d[-1]
+            ema50_1d   = calc_ema_simple(closes_1d, 50)
+            ema200_1d  = calc_ema_simple(closes_1d, 200) if len(closes_1d) >= 200 else None
+
+            if ema200_1d and price_now > ema200_1d and price_now > ema50_1d:
+                daily_bias = "🐂 Бычий"
+            elif ema200_1d and price_now < ema200_1d and price_now < ema50_1d:
+                daily_bias = "🐻 Медвежий"
+            elif price_now > ema50_1d:
+                daily_bias = "📈 Выше EMA50"
+            else:
+                daily_bias = "📉 Ниже EMA50"
+        else:
+            daily_bias = "❓"
+
+        # ── 4H анализ ──
+        if candles_4h and len(candles_4h) >= 20:
+            closes_4h = [float(c["c"]) for c in candles_4h]
+            highs_4h  = [float(c["h"]) for c in candles_4h]
+            lows_4h   = [float(c["l"]) for c in candles_4h]
+
+            ema20_4h = calc_ema_simple(closes_4h, 20)
+            price_4h = closes_4h[-1]
+
+            # Структура: последние 3 хая и лоя
+            recent_highs = [max(highs_4h[i-3:i]) for i in range(3, len(highs_4h))]
+            recent_lows  = [min(lows_4h[i-3:i])  for i in range(3, len(lows_4h))]
+
+            hh = recent_highs[-1] > recent_highs[-4] if len(recent_highs) >= 4 else None
+            hl = recent_lows[-1]  > recent_lows[-4]  if len(recent_lows)  >= 4 else None
+            lh = recent_highs[-1] < recent_highs[-4] if len(recent_highs) >= 4 else None
+            ll = recent_lows[-1]  < recent_lows[-4]  if len(recent_lows)  >= 4 else None
+
+            if hh and hl:
+                h4_bias = "📈 Восходящий"
+            elif lh and ll:
+                h4_bias = "📉 Нисходящий"
+            elif price_4h > ema20_4h:
+                h4_bias = "↗️ Выше EMA20"
+            else:
+                h4_bias = "↘️ Ниже EMA20"
+        else:
+            h4_bias = "❓"
+
+        context = f"📊 BTC: {daily_bias} (1D) | {h4_bias} (4H)"
+        _market_context_cache = {"text": context, "updated_at": now_ts}
+        print(f"[MARKET] {context}")
+        return context
+
+    except Exception as e:
+        print(f"[MARKET ERROR] {e}")
+        return ""
+
 # ─── GATE.IO: Funding Rate + Open Interest (все пары одним запросом) ────────
 
 FUNDING_EXTREME = 0.05   # % — порог "экстремального" фандинга
@@ -528,8 +622,10 @@ def run_sweep_scan():
     signals.sort(key=lambda x: (x["fo_boost"], x["disp_vol_x"]), reverse=True)
     top = signals[:TOP_N_SWEEP]
 
+    market_ctx = get_market_context()
     medals = ["🥇","🥈","🥉"]
-    lines = [f"🎯 <b>SWEEP REVERSAL 1H</b> | {msk_time_str()}\n"]
+    lines = [f"🎯 <b>SWEEP REVERSAL 1H</b> | {msk_time_str()}\n"
+             f"{market_ctx}\n"]
 
     for i, s in enumerate(top):
         medal = medals[i] if i < len(medals) else "▪️"
@@ -770,13 +866,18 @@ def run_decorr_and_sweep15m_scan():
 
         time.sleep(0.2)
 
+    # ── Получаем контекст рынка (кэш, обновляется раз в час) ──
+    market_ctx = get_market_context()
+
     # ── Отправка раскорреляции ──
     decorr_count = len(decorr_candidates)
     if decorr_candidates:
         decorr_candidates.sort(key=lambda x: (x["quality_score"], x["decorr"]), reverse=True)
         top = decorr_candidates[:TOP_N_DECORR]
         medals = ["🥇","🥈","🥉"]
-        lines = [f"📡 <b>РАСКОРРЕЛЯЦИЯ</b> | {msk_time_str()}\nBTC 15М: <b>{btc_chg:+.2f}%</b>\n"]
+        lines = [f"📡 <b>РАСКОРРЕЛЯЦИЯ</b> | {msk_time_str()}\n"
+                 f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"
+                 f"{market_ctx}\n"]
         for i, s in enumerate(top):
             entry = s["price"]
             stop  = entry * (1 + STOP_PCT / 100)
@@ -803,7 +904,8 @@ def run_decorr_and_sweep15m_scan():
         sweep15_signals.sort(key=lambda x: (x["fo_boost"], x["disp_vol_x"]), reverse=True)
         top15 = sweep15_signals[:TOP_N_SWEEP_15M]
         medals = ["🥇","🥈","🥉"]
-        lines = [f"⚡ <b>SWEEP 15М</b> | {msk_time_str()}\n"]
+        lines = [f"⚡ <b>SWEEP 15М</b> | {msk_time_str()}\n"
+                 f"{market_ctx}\n"]
         for i, s in enumerate(top15):
             medal = medals[i] if i < len(medals) else "▪️"
             emoji = "🟢" if "ЛОНГ" in s["direction"] else "🔴"
@@ -829,7 +931,7 @@ def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
     btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v6.3</b> | {now.strftime('%H:%M МСК')}\n"
+        f"🤖 <b>Upscale Bot v6.4</b> | {now.strftime('%H:%M МСК')}\n"
         f"✅ Раскорреляция 15М + Sweep 15М + Sweep 1H\n"
         f"{btc_line}"
         f"Раскорреляций: <b>{decorr_count}</b>\n"
@@ -842,7 +944,7 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        f"🚀 <b>Upscale Bot v6.3 запущен</b>\n"
+        f"🚀 <b>Upscale Bot v6.4 запущен</b>\n"
         "📡 Раскорреляция 15М + фильтры качества\n"
         "⚡ Sweep Reversal 15М (быстрый разворот)\n"
         "🎯 Sweep Reversal 1H каждые 30 мин\n"
