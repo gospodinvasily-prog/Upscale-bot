@@ -130,13 +130,12 @@ def calc_ema_simple(prices: list, period: int) -> float:
 
 def get_market_context() -> str:
     """
-    Возвращает строку контекста рынка на основе BTC 1D и 4H.
-    Кэшируется на 1 час чтобы не нагружать API при каждом скане.
+    Возвращает строку контекста рынка на основе BTC 1D, 4H + EQH/EQL ликвидность.
+    Кэшируется на 1 час.
     """
     global _market_context_cache
     now_ts = time.time()
 
-    # Обновляем не чаще раза в час
     if now_ts - _market_context_cache["updated_at"] < 3600 and _market_context_cache["text"]:
         return _market_context_cache["text"]
 
@@ -147,8 +146,8 @@ def get_market_context() -> str:
         r1d = requests.get(url, params={"contract": "BTC_USDT", "interval": "1d", "limit": 210}, timeout=10)
         candles_1d = r1d.json() if r1d.status_code == 200 else []
 
-        # BTC 4H — 60 свечей для тренда
-        r4h = requests.get(url, params={"contract": "BTC_USDT", "interval": "4h", "limit": 60}, timeout=10)
+        # BTC 4H — 100 свечей для тренда + EQH/EQL
+        r4h = requests.get(url, params={"contract": "BTC_USDT", "interval": "4h", "limit": 100}, timeout=10)
         candles_4h = r4h.json() if r4h.status_code == 200 else []
 
         # ── 1D анализ ──
@@ -168,37 +167,112 @@ def get_market_context() -> str:
                 daily_bias = "📉 Ниже EMA50"
         else:
             daily_bias = "❓"
+            price_now  = 0
 
-        # ── 4H анализ ──
+        # ── 4H анализ + EQH/EQL ──
+        liq_line = ""
         if candles_4h and len(candles_4h) >= 20:
             closes_4h = [float(c["c"]) for c in candles_4h]
             highs_4h  = [float(c["h"]) for c in candles_4h]
             lows_4h   = [float(c["l"]) for c in candles_4h]
+            price_4h  = closes_4h[-1]
+            ema20_4h  = calc_ema_simple(closes_4h, 20)
 
-            ema20_4h = calc_ema_simple(closes_4h, 20)
-            price_4h = closes_4h[-1]
-
-            # Структура: последние 3 хая и лоя
+            # Структура 4H
             recent_highs = [max(highs_4h[i-3:i]) for i in range(3, len(highs_4h))]
             recent_lows  = [min(lows_4h[i-3:i])  for i in range(3, len(lows_4h))]
-
             hh = recent_highs[-1] > recent_highs[-4] if len(recent_highs) >= 4 else None
             hl = recent_lows[-1]  > recent_lows[-4]  if len(recent_lows)  >= 4 else None
             lh = recent_highs[-1] < recent_highs[-4] if len(recent_highs) >= 4 else None
             ll = recent_lows[-1]  < recent_lows[-4]  if len(recent_lows)  >= 4 else None
 
-            if hh and hl:
-                h4_bias = "📈 Восходящий"
-            elif lh and ll:
-                h4_bias = "📉 Нисходящий"
-            elif price_4h > ema20_4h:
-                h4_bias = "↗️ Выше EMA20"
-            else:
-                h4_bias = "↘️ Ниже EMA20"
+            if hh and hl:   h4_bias = "📈 Восходящий"
+            elif lh and ll: h4_bias = "📉 Нисходящий"
+            elif price_4h > ema20_4h: h4_bias = "↗️ Выше EMA20"
+            else:           h4_bias = "↘️ Ниже EMA20"
+
+            # ── EQH/EQL: ищем равные хаи и лои на 4H ──
+            # Свинг-хай: свеча выше обеих соседних
+            # Свинг-лой: свеча ниже обеих соседних
+            EQ_TOLERANCE = 0.15  # % — насколько близко считаем "равными"
+
+            swing_highs = []
+            swing_lows  = []
+            for i in range(2, len(highs_4h) - 2):
+                # Свинг хай — выше 2 свечей с каждой стороны
+                if (highs_4h[i] > highs_4h[i-1] and highs_4h[i] > highs_4h[i-2] and
+                    highs_4h[i] > highs_4h[i+1] and highs_4h[i] > highs_4h[i+2]):
+                    swing_highs.append(highs_4h[i])
+                # Свинг лой — ниже 2 свечей с каждой стороны
+                if (lows_4h[i] < lows_4h[i-1] and lows_4h[i] < lows_4h[i-2] and
+                    lows_4h[i] < lows_4h[i+1] and lows_4h[i] < lows_4h[i+2]):
+                    swing_lows.append(lows_4h[i])
+
+            def find_eq_levels(levels: list, price: float, above: bool) -> list:
+                """
+                Группирует свинг-уровни по близости (EQ_TOLERANCE%).
+                Возвращает список (уровень, количество) только с той стороны от цены.
+                """
+                if not levels:
+                    return []
+                filtered = [l for l in levels if (l > price if above else l < price)]
+                if not filtered:
+                    return []
+                # Сортируем по близости к цене
+                filtered.sort(key=lambda x: abs(x - price))
+                groups = []
+                used = set()
+                for i, level in enumerate(filtered):
+                    if i in used:
+                        continue
+                    group = [level]
+                    for j, other in enumerate(filtered):
+                        if j != i and j not in used:
+                            if abs(other - level) / level * 100 <= EQ_TOLERANCE:
+                                group.append(other)
+                                used.add(j)
+                    if len(group) >= 2:  # минимум 2 одинаковых = EQH/EQL
+                        avg_level = sum(group) / len(group)
+                        groups.append((avg_level, len(group)))
+                    used.add(i)
+                # Сортируем по близости к цене
+                groups.sort(key=lambda x: abs(x[0] - price))
+                return groups[:2]  # топ-2 ближайших
+
+            eq_highs = find_eq_levels(swing_highs, price_4h, above=True)
+            eq_lows  = find_eq_levels(swing_lows,  price_4h, above=False)
+
+            # Формируем строку ликвидности
+            liq_parts = []
+            if eq_highs:
+                lvl, cnt = eq_highs[0]
+                pct = (lvl - price_4h) / price_4h * 100
+                stars = "⭐" * min(cnt, 3)
+                liq_parts.append(f"   ⬆️ EQH: {lvl:,.0f} ({pct:+.1f}%) {stars}")
+            if eq_lows:
+                lvl, cnt = eq_lows[0]
+                pct = (lvl - price_4h) / price_4h * 100
+                stars = "⭐" * min(cnt, 3)
+                liq_parts.append(f"   ⬇️ EQL: {lvl:,.0f} ({pct:.1f}%) {stars}")
+
+            # Какая ближе — туда скорее пойдёт
+            if eq_highs and eq_lows:
+                dist_up   = abs(eq_highs[0][0] - price_4h)
+                dist_down = abs(eq_lows[0][0]  - price_4h)
+                nearest = "⬆️ вверх (EQH)" if dist_up < dist_down else "⬇️ вниз (EQL)"
+                liq_parts.append(f"   🎯 Ближайшая: {nearest}")
+            elif eq_highs:
+                liq_parts.append(f"   🎯 Ближайшая: ⬆️ вверх (EQH)")
+            elif eq_lows:
+                liq_parts.append(f"   🎯 Ближайшая: ⬇️ вниз (EQL)")
+
+            if liq_parts:
+                liq_line = "\n💧 BTC ликвидность 4H:\n" + "\n".join(liq_parts)
+
         else:
             h4_bias = "❓"
 
-        context = f"📊 BTC: {daily_bias} (1D) | {h4_bias} (4H)"
+        context = f"📊 BTC: {daily_bias} (1D) | {h4_bias} (4H){liq_line}"
         _market_context_cache = {"text": context, "updated_at": now_ts}
         print(f"[MARKET] {context}")
         return context
@@ -931,7 +1005,7 @@ def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
     btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v6.4</b> | {now.strftime('%H:%M МСК')}\n"
+        f"🤖 <b>Upscale Bot v6.5</b> | {now.strftime('%H:%M МСК')}\n"
         f"✅ Раскорреляция 15М + Sweep 15М + Sweep 1H\n"
         f"{btc_line}"
         f"Раскорреляций: <b>{decorr_count}</b>\n"
@@ -944,7 +1018,7 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        f"🚀 <b>Upscale Bot v6.4 запущен</b>\n"
+        f"🚀 <b>Upscale Bot v6.5 запущен</b>\n"
         "📡 Раскорреляция 15М + фильтры качества\n"
         "⚡ Sweep Reversal 15М (быстрый разворот)\n"
         "🎯 Sweep Reversal 1H каждые 30 мин\n"
