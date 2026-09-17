@@ -350,38 +350,36 @@ def run_decorr_scan():
 
 # ─── СКАН 2: LIQUIDITY SWEEP REVERSAL (ложный пробой) 1H ────────────────────
 
-PIVOT_LOOKBACK   = 12      # свечей для поиска локального хая/лоя
-DISPLACEMENT_MULT = 1.5    # тело displacement свечи > 1.5x среднего тела
-VOL_MULT_SWEEP   = 1.8     # объём displacement > 1.8x среднего
-MSS_LOOKBACK     = 8       # свечей для поиска точки MSS (противоположный экстремум)
-ATR_SL_BUFFER    = 0.5     # буфер стопа сверх фитиля свипа, в ATR
-TOP_N_SWEEP      = 3
-OI_DROP_THRESHOLD = -3.0   # % падения OI между сканами = подтверждение ликвидаций
+PIVOT_LOOKBACK    = 10     # свечей для поиска локального хая/лоя
+DISPLACEMENT_MULT = 1.2    # тело displacement > 1.2x среднего (было 1.5)
+VOL_MULT_SWEEP    = 1.4    # объём displacement > 1.4x среднего (было 1.8)
+MSS_LOOKBACK      = 6      # свечей для поиска MSS
+ATR_SL_BUFFER     = 0.5    # буфер стопа за фитилём свипа, в ATR
+TOP_N_SWEEP       = 3
+OI_DROP_THRESHOLD = -3.0   # % падения OI между сканами
+SWEEP_SEARCH_BACK = 6      # сколько закрытых свечей назад ищем свип
+DISP_AFTER_SWEEP  = 3      # сколько свечей после свипа ищем displacement
 
-# Храним OI с прошлого скана чтобы видеть изменение между сканами
+# Храним OI с прошлого скана
 prev_oi_snapshot = {}
 
 def find_pivot_high(highs, end_idx, lookback):
-    """Локальный максимум в окне [end_idx-lookback : end_idx]."""
-    window = highs[end_idx-lookback:end_idx]
+    window = highs[max(0, end_idx-lookback):end_idx]
     return max(window) if window else None
 
 def find_pivot_low(lows, end_idx, lookback):
-    """Локальный минимум в окне [end_idx-lookback : end_idx]."""
-    window = lows[end_idx-lookback:end_idx]
+    window = lows[max(0, end_idx-lookback):end_idx]
     return min(window) if window else None
 
 def analyze_sweep(symbol: str, ticker_data: dict):
     """
-    Liquidity Sweep Reversal на 1H:
-    1. Свеча [-3] пробивает фитилём локальный хай/лой (последние PIVOT_LOOKBACK свечей до неё),
-       но закрывается ОБРАТНО внутри диапазона (тело не пробивает уровень) — это свип.
-    2. Свеча [-2] — displacement: тело > DISPLACEMENT_MULT от среднего тела,
-       объём > VOL_MULT_SWEEP от среднего объёма, направлена ПРОТИВ свипа.
-    3. MSS: displacement пробивает ближайший противоположный локальный экстремум
-       за последние MSS_LOOKBACK свечей — подтверждение слома структуры.
-    4. FVG (бонус) — гэп между свечами вокруг displacement в сторону разворота.
-    5. Funding + OI (бонус) — подтверждение перегруженности рынка в сторону свипа.
+    Liquidity Sweep Reversal 1H — гибкое окно поиска:
+    1. Ищем свип в SWEEP_SEARCH_BACK закрытых свечах:
+       фитиль пробил пивот, тело закрылось обратно внутри.
+    2. После свипа ищем displacement в DISP_AFTER_SWEEP свечах:
+       тело > DISPLACEMENT_MULT, объём > VOL_MULT_SWEEP, направление против свипа.
+    3. MSS: displacement пробивает противоположный локальный экстремум.
+    4. FVG и Funding/OI — бонусные метки.
     """
     candles = get_gate_candles_1h(symbol, limit=60)
     if not candles or len(candles) < 40:
@@ -393,130 +391,118 @@ def analyze_sweep(symbol: str, ticker_data: dict):
     opens   = [float(c["o"]) for c in candles]
     volumes = [float(c["v"]) for c in candles]
 
+    n = len(closes)
     atrs = calc_atr(highs, lows, closes, 14)
     if not atrs:
         return None
     atr = atrs[-1]
+    entry_price = closes[-1]
 
-    # Индексы: -3 свип-свеча, -2 displacement-свеча, -1 текущая (для входа)
-    sweep_idx = -3
-    disp_idx  = -2
-
-    # Средние значения для сравнения (за 20 свечей до свип-свечи)
-    body_window = [abs(closes[i]-opens[i]) for i in range(sweep_idx-20, sweep_idx)]
-    avg_body = sum(body_window)/len(body_window) if body_window else 0
-    vol_window = volumes[sweep_idx-20:sweep_idx]
-    avg_vol = sum(vol_window)/len(vol_window) if vol_window else 0
-
+    # Средние тело и объём за последние 20 закрытых свечей
+    avg_body = sum(abs(closes[i]-opens[i]) for i in range(n-21, n-1)) / 20
+    avg_vol  = sum(volumes[n-21:n-1]) / 20
     if avg_body == 0 or avg_vol == 0:
         return None
 
-    # Пивоты ДО свип-свечи
-    pivot_high = find_pivot_high(highs, sweep_idx, PIVOT_LOOKBACK)
-    pivot_low  = find_pivot_low(lows, sweep_idx, PIVOT_LOOKBACK)
-
-    sweep_high = highs[sweep_idx]
-    sweep_low  = lows[sweep_idx]
-    sweep_close= closes[sweep_idx]
-    sweep_open = opens[sweep_idx]
-
-    disp_open  = opens[disp_idx]
-    disp_close = closes[disp_idx]
-    disp_high  = highs[disp_idx]
-    disp_low   = lows[disp_idx]
-    disp_body  = abs(disp_close - disp_open)
-    disp_vol   = volumes[disp_idx]
-
-    entry_price = closes[-1]
-
-    is_displacement = disp_body > DISPLACEMENT_MULT * avg_body
-    is_high_vol = disp_vol > VOL_MULT_SWEEP * avg_vol
-
-    print(f"[SWEEP] {symbol}: sweepH={sweep_high:.4g} sweepL={sweep_low:.4g} "
-          f"pivH={pivot_high:.4g} pivL={pivot_low:.4g} "
-          f"disp_body={disp_body:.4g}(avg={avg_body:.4g}) disp_vol={round(disp_vol/avg_vol,1)}x")
-
-    # Funding + OI из тикера (может отсутствовать — не блокируем сигнал)
-    tick = ticker_data.get(symbol, {})
+    # Funding + OI
+    tick    = ticker_data.get(symbol, {})
     funding = tick.get("funding", 0)
     oi_now  = tick.get("oi", 0)
     oi_prev = prev_oi_snapshot.get(symbol)
     oi_change_pct = None
     if oi_prev and oi_prev > 0 and oi_now > 0:
-        oi_change_pct = (oi_now - oi_prev) / oi_prev * 100
+        oi_change_pct = (oi_now - oi_prev) / oi_now * 100
     if oi_now > 0:
         prev_oi_snapshot[symbol] = oi_now
 
     def funding_oi_score(is_long: bool) -> tuple:
-        """
-        Возвращает (bonus_mark, score_boost).
-        Для лонга (свип лоя) — ищем отрицательный фандинг (шорты перегружены).
-        Для шорта (свип хая) — ищем положительный фандинг (лонги перегружены).
-        """
-        mark = ""
-        boost = 0
-        funding_aligned = (funding < -FUNDING_EXTREME) if is_long else (funding > FUNDING_EXTREME)
-        funding_against  = (funding > FUNDING_EXTREME) if is_long else (funding < -FUNDING_EXTREME)
-        if funding_aligned:
-            mark += "🔥"
-            boost += 1
-        elif funding_against:
-            mark += "⚠️"
-            boost -= 1
+        mark = ""; boost = 0
+        aligned = (funding < -FUNDING_EXTREME) if is_long else (funding > FUNDING_EXTREME)
+        against = (funding > FUNDING_EXTREME) if is_long else (funding < -FUNDING_EXTREME)
+        if aligned:  mark += "🔥"; boost += 1
+        elif against: mark += "⚠️"; boost -= 1
         if oi_change_pct is not None and oi_change_pct < OI_DROP_THRESHOLD:
-            mark += "📉"
-            boost += 1
+            mark += "📉"; boost += 1
         return mark, boost
 
-    # ── БЫЧИЙ SWEEP: пробили лоу фитилём, закрылись внутри, потом displacement вверх ──
-    swept_low = (sweep_low < pivot_low and sweep_close > pivot_low) if pivot_low else False
-    if swept_low and is_displacement and is_high_vol and disp_close > disp_open:
-        # MSS: displacement должен пробить ближайший противоположный хай
-        mss_level = find_pivot_high(highs, disp_idx, MSS_LOOKBACK)
-        mss_confirmed = mss_level and disp_close > mss_level
+    # ── Ищем свип в окне последних SWEEP_SEARCH_BACK закрытых свечей ──
+    # Диапазон: от (n - SWEEP_SEARCH_BACK - DISP_AFTER_SWEEP - 1) до (n - DISP_AFTER_SWEEP - 1)
+    search_start = n - SWEEP_SEARCH_BACK - DISP_AFTER_SWEEP - 1
+    search_end   = n - DISP_AFTER_SWEEP - 1
 
-        # Проверяем FVG между свечами sweep и текущей — гэп в сторону разворота
-        fvg_bull = highs[sweep_idx] < lows[-1] if len(closes) >= abs(sweep_idx) else False
+    best_signal = None
 
-        if mss_confirmed:
-            stop = sweep_low - ATR_SL_BUFFER * atr
-            risk = entry_price - stop
-            target = entry_price + risk * 2.5
-            fo_mark, fo_boost = funding_oi_score(is_long=True)
-            return {
-                "symbol": symbol, "direction": "ЛОНГ (свип лоя)",
-                "entry": entry_price, "stop": stop, "tp": target,
-                "atr": atr, "disp_vol_x": round(disp_vol/avg_vol,1),
-                "disp_body_x": round(disp_body/avg_body,1),
-                "fvg": fvg_bull, "sweep_level": pivot_low,
-                "funding": funding, "oi_change": oi_change_pct,
-                "fo_mark": fo_mark, "fo_boost": fo_boost,
-            }
+    for sweep_i in range(max(search_start, PIVOT_LOOKBACK + 1), search_end):
+        p_high = find_pivot_high(highs, sweep_i, PIVOT_LOOKBACK)
+        p_low  = find_pivot_low(lows,  sweep_i, PIVOT_LOOKBACK)
 
-    # ── МЕДВЕЖИЙ SWEEP: пробили хай фитилём, закрылись внутри, потом displacement вниз ──
-    swept_high = (sweep_high > pivot_high and sweep_close < pivot_high) if pivot_high else False
-    if swept_high and is_displacement and is_high_vol and disp_close < disp_open:
-        mss_level = find_pivot_low(lows, disp_idx, MSS_LOOKBACK)
-        mss_confirmed = mss_level and disp_close < mss_level
+        sh = highs[sweep_i]; sl = lows[sweep_i]; sc = closes[sweep_i]
 
-        fvg_bear = lows[sweep_idx] > highs[-1] if len(closes) >= abs(sweep_idx) else False
+        bull_sweep = p_low  and sl < p_low  and sc > p_low   # фитиль вниз, закрылись выше
+        bear_sweep = p_high and sh > p_high and sc < p_high  # фитиль вверх, закрылись ниже
 
-        if mss_confirmed:
-            stop = sweep_high + ATR_SL_BUFFER * atr
-            risk = stop - entry_price
-            target = entry_price - risk * 2.5
-            fo_mark, fo_boost = funding_oi_score(is_long=False)
-            return {
-                "symbol": symbol, "direction": "ШОРТ (свип хая)",
-                "entry": entry_price, "stop": stop, "tp": target,
-                "atr": atr, "disp_vol_x": round(disp_vol/avg_vol,1),
-                "disp_body_x": round(disp_body/avg_body,1),
-                "fvg": fvg_bear, "sweep_level": pivot_high,
-                "funding": funding, "oi_change": oi_change_pct,
-                "fo_mark": fo_mark, "fo_boost": fo_boost,
-            }
+        if not bull_sweep and not bear_sweep:
+            continue
 
-    return None
+        # ── Ищем displacement в следующих DISP_AFTER_SWEEP свечах ──
+        for disp_i in range(sweep_i + 1, min(sweep_i + DISP_AFTER_SWEEP + 1, n - 1)):
+            d_open  = opens[disp_i];  d_close = closes[disp_i]
+            d_body  = abs(d_close - d_open)
+            d_vol   = volumes[disp_i]
+
+            if d_body <= DISPLACEMENT_MULT * avg_body: continue
+            if d_vol  <= VOL_MULT_SWEEP  * avg_vol:   continue
+
+            # Бычий свип → displacement вверх
+            if bull_sweep and d_close > d_open:
+                mss = find_pivot_high(highs, disp_i, MSS_LOOKBACK)
+                if not mss or d_close <= mss: continue
+                fvg  = highs[sweep_i] < lows[min(disp_i+1, n-1)]
+                stop = sl - ATR_SL_BUFFER * atr
+                risk = entry_price - stop
+                if risk <= 0: continue
+                fo_mark, fo_boost = funding_oi_score(is_long=True)
+                sig = {
+                    "symbol": symbol, "direction": "ЛОНГ (свип лоя)",
+                    "entry": entry_price, "stop": stop, "tp": entry_price + risk * 2.5,
+                    "atr": atr, "disp_vol_x": round(d_vol/avg_vol,1),
+                    "disp_body_x": round(d_body/avg_body,1),
+                    "fvg": fvg, "sweep_level": p_low,
+                    "funding": funding, "oi_change": oi_change_pct,
+                    "fo_mark": fo_mark, "fo_boost": fo_boost,
+                    "sweep_age": n - 1 - sweep_i,
+                }
+                if best_signal is None or sig["disp_vol_x"] > best_signal["disp_vol_x"]:
+                    best_signal = sig
+
+            # Медвежий свип → displacement вниз
+            elif bear_sweep and d_close < d_open:
+                mss = find_pivot_low(lows, disp_i, MSS_LOOKBACK)
+                if not mss or d_close >= mss: continue
+                fvg  = lows[sweep_i] > highs[min(disp_i+1, n-1)]
+                stop = sh + ATR_SL_BUFFER * atr
+                risk = stop - entry_price
+                if risk <= 0: continue
+                fo_mark, fo_boost = funding_oi_score(is_long=False)
+                sig = {
+                    "symbol": symbol, "direction": "ШОРТ (свип хая)",
+                    "entry": entry_price, "stop": stop, "tp": entry_price - risk * 2.5,
+                    "atr": atr, "disp_vol_x": round(d_vol/avg_vol,1),
+                    "disp_body_x": round(d_body/avg_body,1),
+                    "fvg": fvg, "sweep_level": p_high,
+                    "funding": funding, "oi_change": oi_change_pct,
+                    "fo_mark": fo_mark, "fo_boost": fo_boost,
+                    "sweep_age": n - 1 - sweep_i,
+                }
+                if best_signal is None or sig["disp_vol_x"] > best_signal["disp_vol_x"]:
+                    best_signal = sig
+
+    if best_signal:
+        print(f"  ✅ {symbol}: {best_signal['direction']} | "
+              f"vol {best_signal['disp_vol_x']}x | body {best_signal['disp_body_x']}x | "
+              f"свип {best_signal['sweep_age']} св. назад")
+    return best_signal
+
 
 def run_sweep_scan():
     print(f"[SWEEP] Старт {msk_time_str()}")
