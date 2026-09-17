@@ -364,17 +364,44 @@ def run_rs_momentum_scan():
 
             # ── ЛОНГ ──
             if decorr >= BTC_DECORR_THRESHOLD and close_position >= CLOSE_POS_THRESHOLD:
-                # Локальный хай (TP1)
+                # Свинг-хаи из всех доступных свечей
+                swing_highs_sym = []
+                for i in range(2, len(all_highs) - 1):
+                    if all_highs[i] > all_highs[i-1] and all_highs[i] > all_highs[i-2] and \
+                       all_highs[i] > all_highs[i+1]:
+                        swing_highs_sym.append(all_highs[i])
+
+                # Все хаи выше текущей цены, сортируем по близости
+                highs_above = sorted([h for h in swing_highs_sym if h > alt_curr * 1.001])
+
+                # Локальный хай для комнаты (последние ROOM_LOOKBACK свечей)
                 highs_window = [float(c["h"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
                 local_high   = max(highs_window) if highs_window else alt_curr
                 room_pct     = (local_high - alt_curr) / alt_curr * 100
                 near_wall    = alt_curr >= local_high * 0.995
 
-                tp1_price = local_high
-                tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
-                tp2_price = alt_curr + ATR_TP2_MULT * atr
-                tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100
-                stop      = alt_curr * (1 + STOP_PCT / 100)
+                stop = alt_curr * (1 + STOP_PCT / 100)
+
+                # TP1 = ближайший свинг-хай выше цены
+                if highs_above:
+                    tp1_price = highs_above[0]
+                    tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
+                    tp1_label = "следующий хай"
+                else:
+                    tp1_price = alt_curr + atr
+                    tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
+                    tp1_label = "ATR×1.0"
+
+                # TP2 = следующий свинг-хай после TP1 или ATR×2.0
+                highs_above_tp2 = [h for h in highs_above if h > tp1_price * 1.001]
+                if highs_above_tp2:
+                    tp2_price = highs_above_tp2[0]
+                    tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100
+                    tp2_label = "следующий хай"
+                else:
+                    tp2_price = alt_curr + ATR_TP2_MULT * atr
+                    tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100
+                    tp2_label = f"ATR×{ATR_TP2_MULT}"
 
                 # Метки качества
                 quality = 0; marks = ""
@@ -388,24 +415,51 @@ def run_rs_momentum_scan():
                     "alt_chg": alt_chg, "rvol": rvol,
                     "close_position": close_position, "funding": funding,
                     "room_pct": room_pct, "near_wall": near_wall,
-                    "tp1_price": tp1_price, "tp1_pct": tp1_pct,
-                    "tp2_price": tp2_price, "tp2_pct": tp2_pct,
+                    "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
+                    "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
                     "stop": stop, "quality": quality, "marks": marks,
                 })
 
             # ── ШОРТ ──
             elif decorr <= BTC_DECORR_SHORT and close_position <= CLOSE_POS_SHORT:
-                # Локальный лой (TP1 для шорта)
+                # Свинг-лои из всех доступных свечей
+                swing_lows_sym = []
+                for i in range(2, len(all_lows) - 1):
+                    if all_lows[i] < all_lows[i-1] and all_lows[i] < all_lows[i-2] and \
+                       all_lows[i] < all_lows[i+1]:
+                        swing_lows_sym.append(all_lows[i])
+
+                # Все лои ниже текущей цены, сортируем по близости (ближайший первый)
+                lows_below = sorted([l for l in swing_lows_sym if l < alt_curr * 0.999], reverse=True)
+
+                # Локальный лой для комнаты
                 lows_window = [float(c["l"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
                 local_low   = min(lows_window) if lows_window else alt_curr
-                room_pct    = (alt_curr - local_low) / alt_curr * 100  # расстояние до лоя
+                room_pct    = (alt_curr - local_low) / alt_curr * 100
                 near_floor  = alt_curr <= local_low * 1.005
 
-                tp1_price = local_low
-                tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100  # отрицательный
-                tp2_price = alt_curr - ATR_TP2_MULT * atr
-                tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100  # отрицательный
-                stop      = alt_curr * (1 - STOP_PCT / 100)  # стоп выше для шорта
+                stop = alt_curr * (1 - STOP_PCT / 100)
+
+                # TP1 = ближайший свинг-лой ниже цены
+                if lows_below:
+                    tp1_price = lows_below[0]
+                    tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
+                    tp1_label = "следующий лой"
+                else:
+                    tp1_price = alt_curr - atr
+                    tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
+                    tp1_label = "ATR×1.0"
+
+                # TP2 = следующий свинг-лой после TP1 или ATR×2.0
+                lows_below_tp2 = [l for l in lows_below if l < tp1_price * 0.999]
+                if lows_below_tp2:
+                    tp2_price = lows_below_tp2[0]
+                    tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100
+                    tp2_label = "следующий лой"
+                else:
+                    tp2_price = alt_curr - ATR_TP2_MULT * atr
+                    tp2_pct   = (tp2_price - alt_curr) / alt_curr * 100
+                    tp2_label = f"ATR×{ATR_TP2_MULT}"
 
                 quality = 0; marks = ""
                 if rvol >= RVOL_HOT_THRESHOLD:       quality += 2; marks += "🔥🔥"
@@ -418,8 +472,8 @@ def run_rs_momentum_scan():
                     "alt_chg": alt_chg, "rvol": rvol,
                     "close_position": close_position, "funding": funding,
                     "room_pct": room_pct, "near_floor": near_floor,
-                    "tp1_price": tp1_price, "tp1_pct": tp1_pct,
-                    "tp2_price": tp2_price, "tp2_pct": tp2_pct,
+                    "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
+                    "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
                     "stop": stop, "quality": quality, "marks": marks,
                 })
 
@@ -451,8 +505,8 @@ def run_rs_momentum_scan():
                 f"   Комната до хая: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
                 f"   Стоп: {s['stop']:.6g} ({STOP_PCT}%)\n"
-                f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — локальный хай — 50%\n"
-                f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — ATR×{ATR_TP2_MULT} — 50%\n"
+                f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — {s['tp1_label']} — 50%\n"
+                f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — {s['tp2_label']} — 50%\n"
             )
         lines.append("⚠️ Проверь CVD. Решение за тобой.")
         send_telegram("\n".join(lines))
@@ -477,8 +531,8 @@ def run_rs_momentum_scan():
                 f"   Комната до лоя: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
                 f"   Стоп: {s['stop']:.6g} (+{abs(STOP_PCT):.0f}%)\n"
-                f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — локальный лой — 50%\n"
-                f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — ATR×{ATR_TP2_MULT} — 50%\n"
+                f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — {s['tp1_label']} — 50%\n"
+                f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — {s['tp2_label']} — 50%\n"
             )
         lines.append("⚠️ Проверь CVD. Решение за тобой.")
         send_telegram("\n".join(lines))
