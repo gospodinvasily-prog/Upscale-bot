@@ -557,14 +557,280 @@ def run_sweep_scan():
     send_telegram("\n".join(lines))
     print(f"[SWEEP] Отправлено {len(top)} сигналов")
 
-# ─── СТАТУС ───────────────────────────────────────────────────────────────────
+# ─── СКАН 3: 15М SWEEP REVERSAL (быстрый разворот) ──────────────────────────
+
+# Параметры для 15М — чуть мягче чем 1H
+SWEEP_15M_PIVOT     = 8    # свечей для пивота на 15М
+SWEEP_15M_DISP_MULT = 1.2  # тело displacement
+SWEEP_15M_VOL_MULT  = 1.4  # объём displacement
+SWEEP_15M_SEARCH    = 5    # свечей назад ищем свип
+SWEEP_15M_AFTER     = 2    # свечей после свипа ищем displacement
+SWEEP_15M_ATR_BUF   = 0.3  # буфер стопа (меньше чем на 1H)
+TOP_N_SWEEP_15M     = 2    # максимум 2 сигнала — 15М активнее
+
+def analyze_sweep_15m(symbol: str, ticker_data: dict, candles_15m: list):
+    """
+    Быстрый 15М Sweep Reversal.
+    Использует уже загруженные 15М свечи из раскорреляционного скана.
+    Логика та же что analyze_sweep но на 15М данных.
+    """
+    if not candles_15m or len(candles_15m) < 30:
+        return None
+
+    closes  = [float(c["c"]) for c in candles_15m]
+    highs   = [float(c["h"]) for c in candles_15m]
+    lows    = [float(c["l"]) for c in candles_15m]
+    opens   = [float(c["o"]) for c in candles_15m]
+    volumes = [float(c["v"]) for c in candles_15m]
+
+    n = len(closes)
+    atrs = calc_atr(highs, lows, closes, 14)
+    if not atrs:
+        return None
+    atr = atrs[-1]
+    entry_price = closes[-1]
+
+    avg_body = sum(abs(closes[i]-opens[i]) for i in range(n-21, n-1)) / 20
+    avg_vol  = sum(volumes[n-21:n-1]) / 20
+    if avg_body == 0 or avg_vol == 0:
+        return None
+
+    tick    = ticker_data.get(symbol, {})
+    funding = tick.get("funding", 0)
+
+    def fo_score(is_long: bool) -> tuple:
+        mark = ""; boost = 0
+        if is_long and funding < -FUNDING_EXTREME:   mark += "🔥"; boost += 1
+        elif is_long and funding > FUNDING_EXTREME:  mark += "⚠️"; boost -= 1
+        if not is_long and funding > FUNDING_EXTREME: mark += "🔥"; boost += 1
+        elif not is_long and funding < -FUNDING_EXTREME: mark += "⚠️"; boost -= 1
+        return mark, boost
+
+    search_start = n - SWEEP_15M_SEARCH - SWEEP_15M_AFTER - 1
+    search_end   = n - SWEEP_15M_AFTER - 1
+    best = None
+
+    for si in range(max(search_start, SWEEP_15M_PIVOT + 1), search_end):
+        ph = find_pivot_high(highs, si, SWEEP_15M_PIVOT)
+        pl = find_pivot_low(lows,  si, SWEEP_15M_PIVOT)
+
+        sh = highs[si]; sl = lows[si]; sc = closes[si]
+
+        bull_sweep = pl and sl < pl and sc > pl
+        bear_sweep = ph and sh > ph and sc < ph
+
+        if not bull_sweep and not bear_sweep:
+            continue
+
+        for di in range(si + 1, min(si + SWEEP_15M_AFTER + 1, n - 1)):
+            d_open  = opens[di]; d_close = closes[di]
+            d_body  = abs(d_close - d_open)
+            d_vol   = volumes[di]
+
+            if d_body <= SWEEP_15M_DISP_MULT * avg_body: continue
+            if d_vol  <= SWEEP_15M_VOL_MULT  * avg_vol:  continue
+
+            if bull_sweep and d_close > d_open:
+                stop = sl - SWEEP_15M_ATR_BUF * atr
+                risk = entry_price - stop
+                if risk <= 0: continue
+                fo_mark, fo_boost = fo_score(is_long=True)
+                sig = {
+                    "symbol": symbol, "direction": "ЛОНГ 15М (свип лоя)",
+                    "entry": entry_price, "stop": stop, "tp": entry_price + risk * 2.5,
+                    "disp_vol_x": round(d_vol/avg_vol,1),
+                    "disp_body_x": round(d_body/avg_body,1),
+                    "sweep_level": pl, "funding": funding,
+                    "fo_mark": fo_mark, "fo_boost": fo_boost,
+                    "sweep_age": n - 1 - si,
+                }
+                if best is None or sig["disp_vol_x"] > best["disp_vol_x"]:
+                    best = sig
+
+            elif bear_sweep and d_close < d_open:
+                stop = sh + SWEEP_15M_ATR_BUF * atr
+                risk = stop - entry_price
+                if risk <= 0: continue
+                fo_mark, fo_boost = fo_score(is_long=False)
+                sig = {
+                    "symbol": symbol, "direction": "ШОРТ 15М (свип хая)",
+                    "entry": entry_price, "stop": stop, "tp": entry_price - risk * 2.5,
+                    "disp_vol_x": round(d_vol/avg_vol,1),
+                    "disp_body_x": round(d_body/avg_body,1),
+                    "sweep_level": ph, "funding": funding,
+                    "fo_mark": fo_mark, "fo_boost": fo_boost,
+                    "sweep_age": n - 1 - si,
+                }
+                if best is None or sig["disp_vol_x"] > best["disp_vol_x"]:
+                    best = sig
+
+    return best
+
+def run_decorr_and_sweep15m_scan():
+    """
+    Объединённый скан: раскорреляция + 15М sweep.
+    Один проход по всем парам — загружаем 15М свечи один раз,
+    используем и для раскорреляции и для sweep.
+    """
+    print(f"[SCAN] Старт {msk_time_str()}")
+
+    # BTC свечи
+    try:
+        r = requests.get(
+            "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+            params={"contract": "BTC_USDT", "interval": "15m", "limit": 30},
+            timeout=10
+        )
+        btc_candles = r.json() if r.status_code == 200 else []
+    except Exception:
+        btc_candles = []
+
+    if not btc_candles or len(btc_candles) < 4:
+        print("[SCAN] BTC свечи не получены")
+        return 0, None
+
+    btc_open = float(btc_candles[-2]["o"])
+    btc_close = float(btc_candles[-2]["c"])
+    btc_chg  = (btc_close - btc_open) / btc_open * 100 if btc_open else 0
+    print(f"[SCAN] BTC 15М: {btc_chg:+.2f}%")
+
+    # Один запрос тикеров для всех пар
+    ticker_data = get_gate_tickers()
+
+    decorr_candidates = []
+    sweep15_signals   = []
+
+    for sym in UPSCALE_PAIRS:
+        try:
+            r = requests.get(
+                "https://api.gateio.ws/api/v4/futures/usdt/candlesticks",
+                params={"contract": f"{sym}_USDT", "interval": "15m", "limit": 30},
+                timeout=8
+            )
+            if r.status_code != 200:
+                time.sleep(0.2); continue
+
+            candles = r.json()
+            if not candles or len(candles) < ROOM_LOOKBACK + 3:
+                time.sleep(0.2); continue
+
+            # ── Раскорреляция ──
+            alt_open  = float(candles[-2]["o"])
+            alt_close = float(candles[-2]["c"])
+            alt_high  = float(candles[-2]["h"])
+            alt_low   = float(candles[-2]["l"])
+            alt_curr  = float(candles[-1]["c"])
+
+            if alt_open == 0:
+                time.sleep(0.2); continue
+
+            alt_chg = (alt_close - alt_open) / alt_open * 100
+            decorr  = alt_chg - btc_chg
+
+            candle_range   = alt_high - alt_low
+            close_position = (alt_close - alt_low) / candle_range if candle_range > 0 else 0.5
+            vol_closed     = float(candles[-2]["v"])
+            history_vols   = [float(c["v"]) for c in candles[-22:-2]]
+            vol_avg        = sum(history_vols) / len(history_vols) if history_vols else 0
+            rvol           = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
+            funding        = ticker_data.get(sym, {}).get("funding", 0)
+
+            highs_window = [float(c["h"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
+            local_high   = max(highs_window) if highs_window else alt_curr
+            room_pct     = (local_high - alt_curr) / alt_curr * 100 if alt_curr > 0 else 0
+            near_wall    = alt_curr >= local_high * 0.995
+
+            # Декорр сигнал
+            if decorr >= BTC_DECORR_THRESHOLD and close_position >= CLOSE_POS_THRESHOLD:
+                quality_score = 0
+                warn_marks = ""
+                if rvol >= RVOL_HOT_THRESHOLD:   quality_score += 2; warn_marks += "🔥🔥"
+                elif rvol >= RVOL_THRESHOLD * 2: quality_score += 1; warn_marks += "🔥"
+                if funding > FUNDING_MAX_ALIGNED: quality_score -= 1; warn_marks += "⚠️фандинг"
+                if near_wall:                    quality_score -= 1; warn_marks += "🧱стена"
+
+                if rvol >= RVOL_THRESHOLD:
+                    decorr_candidates.append({
+                        "symbol": sym, "price": alt_curr,
+                        "alt_chg": alt_chg, "btc_chg": btc_chg, "decorr": decorr,
+                        "rvol": rvol, "close_position": close_position,
+                        "funding": funding, "room_pct": room_pct, "near_wall": near_wall,
+                        "quality_score": quality_score, "warn_marks": warn_marks,
+                    })
+
+            # ── 15М Sweep ──
+            sweep_result = analyze_sweep_15m(sym, ticker_data, candles)
+            if sweep_result:
+                sweep15_signals.append(sweep_result)
+                print(f"  🎯 SWEEP15 {sym}: {sweep_result['direction']} | "
+                      f"vol {sweep_result['disp_vol_x']}x | {sweep_result['sweep_age']} св. назад")
+
+        except Exception as e:
+            print(f"  [ERROR] {sym}: {e}")
+
+        time.sleep(0.2)
+
+    # ── Отправка раскорреляции ──
+    decorr_count = len(decorr_candidates)
+    if decorr_candidates:
+        decorr_candidates.sort(key=lambda x: (x["quality_score"], x["decorr"]), reverse=True)
+        top = decorr_candidates[:TOP_N_DECORR]
+        medals = ["🥇","🥈","🥉"]
+        lines = [f"📡 <b>РАСКОРРЕЛЯЦИЯ</b> | {msk_time_str()}\nBTC 15М: <b>{btc_chg:+.2f}%</b>\n"]
+        for i, s in enumerate(top):
+            entry = s["price"]
+            stop  = entry * (1 + STOP_PCT / 100)
+            tp1   = entry * (1 + TP1_PCT  / 100)
+            tp2   = entry * (1 + TP2_PCT  / 100)
+            medal = medals[i] if i < len(medals) else "▪️"
+            marks = f" {s['warn_marks']}" if s['warn_marks'] else ""
+            lines.append(
+                f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
+                f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io (закр. свеча)\n"
+                f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
+                f"   Закрытие свечи: {s['close_position']*100:.0f}% | Фандинг: {s['funding']:+.3f}%\n"
+                f"   Комната до хая: {s['room_pct']:.2f}%\n"
+                f"   Вход: <b>{entry:.6g}</b>\n"
+                f"   Стоп: {stop:.6g} ({STOP_PCT}%)\n"
+                f"   TP1:  {tp1:.6g} ({TP1_PCT:+}%) — 50%\n"
+                f"   TP2:  {tp2:.6g} ({TP2_PCT:+}%) — 50%\n"
+            )
+        lines.append("⚠️ Проверь структуру и CVD. Решение за тобой.")
+        send_telegram("\n".join(lines))
+
+    # ── Отправка 15М sweep ──
+    if sweep15_signals:
+        sweep15_signals.sort(key=lambda x: (x["fo_boost"], x["disp_vol_x"]), reverse=True)
+        top15 = sweep15_signals[:TOP_N_SWEEP_15M]
+        medals = ["🥇","🥈","🥉"]
+        lines = [f"⚡ <b>SWEEP 15М</b> | {msk_time_str()}\n"]
+        for i, s in enumerate(top15):
+            medal = medals[i] if i < len(medals) else "▪️"
+            emoji = "🟢" if "ЛОНГ" in s["direction"] else "🔴"
+            entry = s["entry"]; stop = s["stop"]; tp = s["tp"]
+            rr = abs(tp-entry) / abs(entry-stop) if abs(entry-stop) > 0 else 0
+            fo_text = f"{s['fo_mark']} " if s["fo_mark"] else ""
+            lines.append(
+                f"{medal} {emoji} <b>{s['symbol']}/USDT — {s['direction']}</b>\n"
+                f"   Свип {s['sweep_age']} св. назад | Уровень: {s['sweep_level']:.6g}\n"
+                f"   Displacement: тело {s['disp_body_x']}x | объём {s['disp_vol_x']}x\n"
+                f"   {fo_text}Фандинг: {s['funding']:+.3f}%\n"
+                f"   Вход: <b>{entry:.6g}</b>\n"
+                f"   Стоп: {stop:.6g} | TP: {tp:.6g} | RR 1:{rr:.2f}\n"
+            )
+        lines.append("⚡ Быстрый разворот 15М — проверь график немедленно!")
+        send_telegram("\n".join(lines))
+        print(f"[SWEEP15] Отправлено {len(top15)} сигналов")
+
+    print(f"[SCAN] Декорр: {decorr_count} | Sweep15: {len(sweep15_signals)}")
+    return decorr_count, btc_chg
 
 def send_status(decorr_count=0, btc_1h=None):
     now = datetime.now(MSK)
     btc_line = f"BTC 1h: <b>{btc_1h:+.2f}%</b> " + ("⬇️" if btc_1h and btc_1h < 0 else "➡️") + "\n" if btc_1h is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v6.2</b> | {now.strftime('%H:%M МСК')}\n"
-        f"✅ Gate.io Раскорреляция 15М + Sweep Reversal 1H\n"
+        f"🤖 <b>Upscale Bot v6.3</b> | {now.strftime('%H:%M МСК')}\n"
+        f"✅ Раскорреляция 15М + Sweep 15М + Sweep 1H\n"
         f"{btc_line}"
         f"Раскорреляций: <b>{decorr_count}</b>\n"
         f"{'😴 Жду спайк объёма...' if decorr_count > 0 else '🔍 Раскорреляций нет'}\n"
@@ -576,9 +842,10 @@ def send_status(decorr_count=0, btc_1h=None):
 
 def main():
     send_telegram(
-        f"🚀 <b>Upscale Bot v6.2 запущен</b>\n"
-        "📡 Раскорреляция 15М + фильтры качества (закрытие/фандинг/стена)\n"
-        "🎯 Sweep Reversal 1H каждые 30 мин (свип + displacement + MSS + funding/OI)\n"
+        f"🚀 <b>Upscale Bot v6.3 запущен</b>\n"
+        "📡 Раскорреляция 15М + фильтры качества\n"
+        "⚡ Sweep Reversal 15М (быстрый разворот)\n"
+        "🎯 Sweep Reversal 1H каждые 30 мин\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
     )
 
@@ -593,20 +860,19 @@ def main():
         cur_hour = now_msk.hour
         now_ts   = time.time()
 
-        # Статус раз в час
         if cur_hour != status_sent_hour:
             send_status(last_decorr, last_btc)
             status_sent_hour = cur_hour
 
         if is_trading_hours():
-            # Скан раскорреляции каждые 15 минут
+            # Раскорреляция + 15М sweep каждые 15 минут (один проход по парам)
             if now_ts - last_decorr_scan >= DECORR_SCAN_INTERVAL * 60:
-                result = run_decorr_scan()
+                result = run_decorr_and_sweep15m_scan()
                 if result:
                     last_decorr, last_btc = result
                 last_decorr_scan = now_ts
 
-            # Скан пробоя каждые 60 минут
+            # 1H sweep каждые 30 минут
             if now_ts - last_break_scan >= BREAKOUT_SCAN_INTERVAL * 60:
                 run_sweep_scan()
                 last_break_scan = now_ts
