@@ -227,7 +227,6 @@ def get_market_context() -> str:
             hi4 = [float(c["h"]) for c in c4h]
             lo4 = [float(c["l"]) for c in c4h]
             p4  = cl4[-1]
-            if len(price := p4 or price): pass  # noqa keep price updated
             price = p4
 
             ema20 = calc_ema_simple(cl4, 20)
