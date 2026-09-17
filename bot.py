@@ -198,37 +198,32 @@ def get_market_context() -> str:
         r4h = requests.get(url, params={"contract": "BTC_USDT", "interval": "4h", "limit": 100}, timeout=10)
         c4h = r4h.json() if r4h.status_code == 200 else []
 
-        # 1H
-        r1h = requests.get(url, params={"contract": "BTC_USDT", "interval": "1h", "limit": 50}, timeout=10)
-        c1h = r1h.json() if r1h.status_code == 200 else []
+        # 15М — последние 3 закрытые свечи (45 минут)
+        r15 = requests.get(url, params={"contract": "BTC_USDT", "interval": "15m", "limit": 10}, timeout=10)
+        c15 = r15.json() if r15.status_code == 200 else []
 
         # ── 1D bias ──
+        d_bias = "❓"
+        price  = 0
         if c1d and len(c1d) >= 60:
             closes_1d = [float(c["c"]) for c in c1d]
             price     = closes_1d[-1]
             ema50     = calc_ema_simple(closes_1d, 50)
             ema200    = calc_ema_simple(closes_1d, 200) if len(closes_1d) >= 200 else None
-            if ema200 and price > ema200 and price > ema50:
-                d_bias = "🐂 Бычий"
-            elif ema200 and price < ema200 and price < ema50:
-                d_bias = "🐻 Медвежий"
-            elif price > ema50:
-                d_bias = "📈 Выше EMA50"
-            else:
-                d_bias = "📉 Ниже EMA50"
-        else:
-            d_bias = "❓"
-            price  = 0
+            if ema200 and price > ema200 and price > ema50:   d_bias = "🐂 Бычий"
+            elif ema200 and price < ema200 and price < ema50: d_bias = "🐻 Медвежий"
+            elif price > ema50:                               d_bias = "📈 Выше EMA50"
+            else:                                             d_bias = "📉 Ниже EMA50"
 
         # ── 4H bias + EQH/EQL ──
-        h4_liq = ""
+        h4_bias = "❓"
+        h4_liq  = ""
         if c4h and len(c4h) >= 20:
-            cl4 = [float(c["c"]) for c in c4h]
-            hi4 = [float(c["h"]) for c in c4h]
-            lo4 = [float(c["l"]) for c in c4h]
-            p4  = cl4[-1]
+            cl4  = [float(c["c"]) for c in c4h]
+            hi4  = [float(c["h"]) for c in c4h]
+            lo4  = [float(c["l"]) for c in c4h]
+            p4   = cl4[-1]
             price = p4
-
             ema20 = calc_ema_simple(cl4, 20)
             rh = [max(hi4[i-3:i]) for i in range(3, len(hi4))]
             rl = [min(lo4[i-3:i]) for i in range(3, len(lo4))]
@@ -237,73 +232,56 @@ def get_market_context() -> str:
             lh = rh[-1] < rh[-4] if len(rh) >= 4 else None
             ll = rl[-1] < rl[-4] if len(rl) >= 4 else None
 
-            if hh and hl:     h4_bias = "📈 Восходящий"
-            elif lh and ll:   h4_bias = "📉 Нисходящий"
-            elif p4 > ema20:  h4_bias = "↗️ Выше EMA20"
-            else:             h4_bias = "↘️ Ниже EMA20"
+            if hh and hl:    h4_bias = "📈 Восходящий"
+            elif lh and ll:  h4_bias = "📉 Нисходящий"
+            elif p4 > ema20: h4_bias = "↗️ Выше EMA20"
+            else:            h4_bias = "↘️ Ниже EMA20"
 
             sh4, sl4 = get_swing_levels(hi4, lo4)
             eq_h4 = find_eq_levels(sh4, p4, above=True)
             eq_l4 = find_eq_levels(sl4, p4, above=False)
             h4_liq = format_liq_line(eq_h4, eq_l4, p4, "4H")
-        else:
-            h4_bias = "❓"
 
-        # ── 1H bias + EQH/EQL + направление ──
-        h1_bias = "❓"
-        h1_liq  = ""
-        h1_dir  = ""
-        btc_price_str = ""
-        if c1h and len(c1h) >= 20:
-            cl1 = [float(c["c"]) for c in c1h]
-            hi1 = [float(c["h"]) for c in c1h]
-            lo1 = [float(c["l"]) for c in c1h]
-            p1  = cl1[-1]
-            price = p1
-            btc_price_str = f"{p1:,.0f} USDT"
+        # ── BTC 15М: последние 3 закрытые свечи (45 минут) ──
+        btc_price_str = f"{price:,.0f} USDT" if price else "—"
+        m15_line = ""
+        if c15 and len(c15) >= 5:
+            candles3 = c15[-4:-1]  # 3 закрытые свечи
+            arrows = []
+            for c in candles3:
+                o = float(c["o"]); cl = float(c["c"])
+                chg = (cl - o) / o * 100
+                if chg > 0.05:    arrows.append(f"⬆️{chg:+.2f}%")
+                elif chg < -0.05: arrows.append(f"⬇️{chg:+.2f}%")
+                else:             arrows.append(f"➡️{chg:+.2f}%")
+            # Итог за 45 минут
+            first_open = float(c15[-4]["o"])
+            last_close = float(c15[-2]["c"])
+            total_chg  = (last_close - first_open) / first_open * 100
+            total_emoji = "⬆️" if total_chg > 0.05 else ("⬇️" if total_chg < -0.05 else "➡️")
+            m15_line = f"   15М (45 мин): {' → '.join(arrows)} | Итого: {total_emoji}{total_chg:+.2f}%"
 
-            # 1H изменение за последнюю закрытую свечу
-            h1_chg = (cl1[-2] - cl1[-3]) / cl1[-3] * 100 if len(cl1) >= 3 else 0
-
-            ema20_1h = calc_ema_simple(cl1, 20)
-            if p1 > ema20_1h and h1_chg > 0:
-                h1_dir  = "⬆️ Лонг"
-                h1_bias = "⬆️ Лонг"
-            elif p1 < ema20_1h and h1_chg < 0:
-                h1_dir  = "⬇️ Шорт"
-                h1_bias = "⬇️ Шорт"
-            elif p1 > ema20_1h:
-                h1_dir  = "↗️ Лонг тенденция"
-                h1_bias = "↗️"
-            else:
-                h1_dir  = "↘️ Шорт тенденция"
-                h1_bias = "↘️"
-
-            sh1, sl1 = get_swing_levels(hi1, lo1)
-            eq_h1 = find_eq_levels(sh1, p1, above=True)
-            eq_l1 = find_eq_levels(sl1, p1, above=False)
-            h1_liq = format_liq_line(eq_h1, eq_l1, p1, "1H")
-
+        # ── Сборка ──
         lines = [
-            f"📊 BTC: {btc_price_str} | 1H: {h1_dir}",
+            f"📊 BTC: {btc_price_str}",
             f"   1D: {d_bias}",
             f"   4H: {h4_bias}",
         ]
-        liq_parts = []
-        if h4_liq: liq_parts.append(h4_liq)
-        if h1_liq: liq_parts.append(h1_liq)
-        if liq_parts:
-            lines.append("💧 BTC ликвидность:")
-            lines.extend(liq_parts)
+        if m15_line:
+            lines.append(m15_line)
+        if h4_liq:
+            lines.append("💧 BTC ликвидность 4H:")
+            lines.append(h4_liq)
 
         context = "\n".join(lines)
         _market_cache = {"text": context, "updated_at": now_ts}
-        print(f"[MARKET] обновлён")
+        print("[MARKET] обновлён")
         return context
 
     except Exception as e:
         print(f"[MARKET ERROR] {e}")
         return "📊 BTC: данные недоступны"
+
 
 # ─── RS MOMENTUM СКАН (лонг + шорт) ─────────────────────────────────────────
 
