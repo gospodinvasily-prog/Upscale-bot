@@ -283,6 +283,52 @@ def get_market_context() -> str:
         return "📊 BTC: данные недоступны"
 
 
+def get_fresh_price(symbol: str):
+    """
+    Лёгкий одиночный запрос — самая свежая цена прямо перед отправкой сигнала.
+    Используем только для топ-N отобранных сигналов, не для всех 103 пар.
+    """
+    url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+    try:
+        r = requests.get(url, params={"contract": f"{symbol}_USDT"}, timeout=5)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if data and len(data) > 0:
+            return float(data[0].get("last", 0)) or None
+    except Exception as e:
+        print(f"[FRESH PRICE ERROR] {symbol}: {e}")
+    return None
+
+def refresh_signal(s: dict, is_long: bool) -> dict:
+    """
+    Обновляет вход, стоп, комнату и TP% на самой свежей цене прямо перед отправкой.
+    Структурные уровни (TP1/TP2 хаи/лои) не пересчитываются — только цена входа
+    и зависящие от неё проценты, чтобы "комната до хая/лоя" была актуальной.
+    """
+    fresh = get_fresh_price(s["symbol"])
+    if not fresh:
+        return s  # не удалось обновить — отправляем как было
+
+    old_price = s["price"]
+    s["price"] = fresh
+
+    if is_long:
+        s["stop"] = fresh * (1 + STOP_PCT / 100)
+        local_high = s.get("local_high", s["tp1_price"])
+        s["room_pct"]  = (local_high - fresh) / fresh * 100
+        s["near_wall"] = fresh >= local_high * 0.995
+    else:
+        s["stop"] = fresh * (1 - STOP_PCT / 100)
+        local_low = s.get("local_low", s["tp1_price"])
+        s["room_pct"]   = (fresh - local_low) / fresh * 100
+        s["near_floor"] = fresh <= local_low * 1.005
+
+    s["tp1_pct"] = (s["tp1_price"] - fresh) / fresh * 100
+    s["tp2_pct"] = (s["tp2_price"] - fresh) / fresh * 100
+    print(f"  [REFRESH] {s['symbol']}: {old_price:.6g} → {fresh:.6g}")
+    return s
+
 # ─── RS MOMENTUM СКАН (лонг + шорт) ─────────────────────────────────────────
 
 def run_rs_momentum_scan():
@@ -320,11 +366,11 @@ def run_rs_momentum_scan():
                 params={"contract": f"{sym}_USDT", "interval": "15m", "limit": 30},
                 timeout=8)
             if r.status_code != 200:
-                time.sleep(0.2); continue
+                time.sleep(0.05); continue
 
             candles = r.json()
             if not candles or len(candles) < ROOM_LOOKBACK + 3:
-                time.sleep(0.2); continue
+                time.sleep(0.05); continue
 
             # Закрытая свеча [-2]
             alt_open  = float(candles[-2]["o"])
@@ -334,7 +380,7 @@ def run_rs_momentum_scan():
             alt_curr  = float(candles[-1]["c"])
 
             if alt_open == 0:
-                time.sleep(0.2); continue
+                time.sleep(0.05); continue
 
             alt_chg = (alt_close - alt_open) / alt_open * 100
             decorr  = alt_chg - btc_chg
@@ -346,7 +392,7 @@ def run_rs_momentum_scan():
             rvol         = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
 
             if rvol < RVOL_THRESHOLD:
-                time.sleep(0.2); continue
+                time.sleep(0.05); continue
 
             # Размер свечи
             candle_range   = alt_high - alt_low
@@ -414,7 +460,7 @@ def run_rs_momentum_scan():
                     "symbol": sym, "price": alt_curr, "decorr": decorr,
                     "alt_chg": alt_chg, "rvol": rvol,
                     "close_position": close_position, "funding": funding,
-                    "room_pct": room_pct, "near_wall": near_wall,
+                    "room_pct": room_pct, "near_wall": near_wall, "local_high": local_high,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
                     "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
                     "stop": stop, "quality": quality, "marks": marks,
@@ -471,7 +517,7 @@ def run_rs_momentum_scan():
                     "symbol": sym, "price": alt_curr, "decorr": decorr,
                     "alt_chg": alt_chg, "rvol": rvol,
                     "close_position": close_position, "funding": funding,
-                    "room_pct": room_pct, "near_floor": near_floor,
+                    "room_pct": room_pct, "near_floor": near_floor, "local_low": local_low,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
                     "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
                     "stop": stop, "quality": quality, "marks": marks,
@@ -479,7 +525,7 @@ def run_rs_momentum_scan():
 
         except Exception as e:
             print(f"  [ERROR] {sym}: {e}")
-        time.sleep(0.2)
+        time.sleep(0.05)
 
     print(f"[RS] Лонгов: {len(longs)} | Шортов: {len(shorts)}")
 
@@ -489,6 +535,7 @@ def run_rs_momentum_scan():
     if longs:
         longs.sort(key=lambda x: (x["quality"], x["decorr"]), reverse=True)
         top = longs[:TOP_N]
+        top = [refresh_signal(s, is_long=True) for s in top]  # свежая цена перед отправкой
         lines = [
             f"📡 <b>RS MOMENTUM — ЛОНГ</b> | {msk_time_str()}\n"
             f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"
@@ -515,6 +562,7 @@ def run_rs_momentum_scan():
     if shorts:
         shorts.sort(key=lambda x: (x["quality"], abs(x["decorr"])), reverse=True)
         top = shorts[:TOP_N]
+        top = [refresh_signal(s, is_long=False) for s in top]  # свежая цена перед отправкой
         lines = [
             f"📡 <b>RS MOMENTUM — ШОРТ</b> | {msk_time_str()}\n"
             f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n"
@@ -588,7 +636,7 @@ def main():
         else:
             print(f"[LOOP] Вне часов ({msk_time_str()})")
 
-        time.sleep(60)
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
