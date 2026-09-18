@@ -315,14 +315,14 @@ def refresh_signal(s: dict, is_long: bool) -> dict:
 
     if is_long:
         s["stop"] = fresh * (1 + STOP_PCT / 100)
-        local_high = s.get("local_high", s["tp1_price"])
-        s["room_pct"]  = (local_high - fresh) / fresh * 100
-        s["near_wall"] = fresh >= local_high * 0.995
+        tp1 = s["tp1_price"]
+        s["room_pct"]  = (tp1 - fresh) / fresh * 100
+        s["near_wall"] = s["room_pct"] < 0.5
     else:
         s["stop"] = fresh * (1 - STOP_PCT / 100)
-        local_low = s.get("local_low", s["tp1_price"])
-        s["room_pct"]   = (fresh - local_low) / fresh * 100
-        s["near_floor"] = fresh <= local_low * 1.005
+        tp1 = s["tp1_price"]
+        s["room_pct"]   = (fresh - tp1) / fresh * 100
+        s["near_floor"] = s["room_pct"] < 0.5
 
     s["tp1_pct"] = (s["tp1_price"] - fresh) / fresh * 100
     s["tp2_pct"] = (s["tp2_price"] - fresh) / fresh * 100
@@ -418,13 +418,7 @@ def run_rs_momentum_scan():
                         swing_highs_sym.append(all_highs[i])
 
                 # Все хаи выше текущей цены, сортируем по близости
-                highs_above = sorted([h for h in swing_highs_sym if h > alt_curr * 1.001])
-
-                # Локальный хай для комнаты (последние ROOM_LOOKBACK свечей)
-                highs_window = [float(c["h"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
-                local_high   = max(highs_window) if highs_window else alt_curr
-                room_pct     = (local_high - alt_curr) / alt_curr * 100
-                near_wall    = alt_curr >= local_high * 0.995
+                highs_above = sorted([h for h in swing_highs_sym if h > alt_curr * 1.0001])
 
                 stop = alt_curr * (1 + STOP_PCT / 100)
 
@@ -437,6 +431,11 @@ def run_rs_momentum_scan():
                     tp1_price = alt_curr + atr
                     tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
                     tp1_label = "ATR×1.0"
+
+                # Комната до TP1 (расстояние от цены до ближайшего хая/TP1)
+                local_high = tp1_price
+                room_pct   = (tp1_price - alt_curr) / alt_curr * 100
+                near_wall  = room_pct < 0.5  # TP1 ближе 0.5% — стена
 
                 # TP2 = следующий свинг-хай после TP1 или ATR×2.0
                 highs_above_tp2 = [h for h in highs_above if h > tp1_price * 1.001]
@@ -476,13 +475,7 @@ def run_rs_momentum_scan():
                         swing_lows_sym.append(all_lows[i])
 
                 # Все лои ниже текущей цены, сортируем по близости (ближайший первый)
-                lows_below = sorted([l for l in swing_lows_sym if l < alt_curr * 0.999], reverse=True)
-
-                # Локальный лой для комнаты
-                lows_window = [float(c["l"]) for c in candles[-(ROOM_LOOKBACK+2):-2]]
-                local_low   = min(lows_window) if lows_window else alt_curr
-                room_pct    = (alt_curr - local_low) / alt_curr * 100
-                near_floor  = alt_curr <= local_low * 1.005
+                lows_below = sorted([l for l in swing_lows_sym if l < alt_curr * 0.9999], reverse=True)
 
                 stop = alt_curr * (1 - STOP_PCT / 100)
 
@@ -495,6 +488,11 @@ def run_rs_momentum_scan():
                     tp1_price = alt_curr - atr
                     tp1_pct   = (tp1_price - alt_curr) / alt_curr * 100
                     tp1_label = "ATR×1.0"
+
+                # Комната до TP1 (расстояние от цены до ближайшего лоя/TP1)
+                local_low  = tp1_price
+                room_pct   = (alt_curr - tp1_price) / alt_curr * 100
+                near_floor = room_pct < 0.5  # TP1 ближе 0.5% — пол
 
                 # TP2 = следующий свинг-лой после TP1 или ATR×2.0
                 lows_below_tp2 = [l for l in lows_below if l < tp1_price * 0.999]
