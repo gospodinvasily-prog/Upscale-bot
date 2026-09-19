@@ -13,7 +13,7 @@ TRADING_END_MSK   = 22
 MSK = timezone(timedelta(hours=3))
 
 # ── RS Momentum параметры ──
-SCAN_INTERVAL        = 15      # минут
+SCAN_INTERVAL        = 5       # минут (5M таймфрейм)
 BTC_DECORR_THRESHOLD = 1.5     # % раскорреляция для лонга
 BTC_DECORR_SHORT     = -1.5    # % раскорреляция для шорта (альт падает сильнее)
 RVOL_THRESHOLD       = 1.2     # минимальный объём
@@ -56,6 +56,21 @@ def send_telegram(text: str):
 
 def is_trading_hours() -> bool:
     return TRADING_START_MSK <= datetime.now(MSK).hour < TRADING_END_MSK
+
+# Мёртвые зоны — откаты, сигналы не отправляем
+DEAD_ZONES = [
+    (13, 45, 14, 30),
+    (15, 45, 16, 30),
+    (17, 45, 18, 30),
+]
+
+def is_dead_zone() -> bool:
+    now = datetime.now(MSK)
+    now_min = now.hour * 60 + now.minute
+    for h_start, m_start, h_end, m_end in DEAD_ZONES:
+        if h_start * 60 + m_start <= now_min < h_end * 60 + m_end:
+            return True
+    return False
 
 def msk_time_str() -> str:
     return datetime.now(MSK).strftime("%H:%M МСК")
@@ -363,20 +378,37 @@ def run_rs_momentum_scan():
     for sym in UPSCALE_PAIRS:
         try:
             r = requests.get(url,
-                params={"contract": f"{sym}_USDT", "interval": "15m", "limit": 30},
+                params={"contract": f"{sym}_USDT", "interval": "5m", "limit": 60},
                 timeout=8)
             if r.status_code != 200:
                 time.sleep(0.05); continue
 
             candles = r.json()
-            if not candles or len(candles) < ROOM_LOOKBACK + 3:
+            if not candles or len(candles) < ROOM_LOOKBACK + 5:
                 time.sleep(0.05); continue
 
-            # Закрытая свеча [-2]
-            alt_open  = float(candles[-2]["o"])
-            alt_close = float(candles[-2]["c"])
-            alt_high  = float(candles[-2]["h"])
-            alt_low   = float(candles[-2]["l"])
+            # Берём 2 последние закрытые 5M свечи, выбираем лучшую по RVOL
+            history_vols = [float(c["v"]) for c in candles[-24:-2]]
+            vol_avg = sum(history_vols) / len(history_vols) if history_vols else 0
+
+            best_candle = None
+            best_rvol   = 0
+            for idx in [-2, -3]:  # две последние закрытые свечи
+                c = candles[idx]
+                v = float(c["v"])
+                r_vol = round(v / vol_avg, 2) if vol_avg > 0 else 0
+                if r_vol > best_rvol:
+                    best_rvol   = r_vol
+                    best_candle = c
+
+            if best_candle is None or best_rvol < RVOL_THRESHOLD:
+                time.sleep(0.05); continue
+
+            rvol = best_rvol
+            alt_open  = float(best_candle["o"])
+            alt_close = float(best_candle["c"])
+            alt_high  = float(best_candle["h"])
+            alt_low   = float(best_candle["l"])
             alt_curr  = float(candles[-1]["c"])
 
             if alt_open == 0:
@@ -384,12 +416,6 @@ def run_rs_momentum_scan():
 
             alt_chg = (alt_close - alt_open) / alt_open * 100
             decorr  = alt_chg - btc_chg
-
-            # RVOL
-            vol_closed   = float(candles[-2]["v"])
-            history_vols = [float(c["v"]) for c in candles[-22:-2]]
-            vol_avg      = sum(history_vols) / len(history_vols) if history_vols else 0
-            rvol         = round(vol_closed / vol_avg, 2) if vol_avg > 0 else 0
 
             if rvol < RVOL_THRESHOLD:
                 time.sleep(0.05); continue
@@ -592,7 +618,7 @@ def send_status(signal_count=0, btc_chg=None):
     ctx = get_market_context()
     btc_line = f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n" if btc_chg is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v7.0</b> | {now.strftime('%H:%M МСК')}\n"
+        f"🤖 <b>Upscale Bot v7.1</b> | {now.strftime('%H:%M МСК')}\n"
         f"✅ RS Momentum 15М (Лонг + Шорт)\n"
         f"{btc_line}"
         f"{ctx}\n"
@@ -605,7 +631,7 @@ def send_status(signal_count=0, btc_chg=None):
 
 def main():
     send_telegram(
-        "🚀 <b>Upscale Bot v7.0 запущен</b>\n"
+        "🚀 <b>Upscale Bot v7.1 запущен</b>\n"
         "📡 RS Momentum 15М — Лонг + Шорт\n"
         "📊 BTC контекст: 1D + 4H + 1H + EQH/EQL ликвидность\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
@@ -626,13 +652,13 @@ def main():
             status_sent_hour = cur_hour
 
         if is_trading_hours():
-            if now_ts - last_scan >= SCAN_INTERVAL * 60:
+            if is_dead_zone():
+                print(f"[LOOP] Мёртвая зона, скан пропущен ({msk_time_str()})")
+            elif now_ts - last_scan >= SCAN_INTERVAL * 60:
                 result = run_rs_momentum_scan()
                 if result:
                     last_signal_count, last_btc = result
                 last_scan = now_ts
-        else:
-            print(f"[LOOP] Вне часов ({msk_time_str()})")
 
         time.sleep(10)
 
