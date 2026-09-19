@@ -54,6 +54,19 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
+# История OI для отслеживания изменений (3 скана = 15 минут)
+OI_HISTORY: list = []   # [{sym: oi, ...}, ...]
+OI_HISTORY_MAX = 3
+
+def get_oi_change(sym: str) -> float:
+    if len(OI_HISTORY) < OI_HISTORY_MAX:
+        return None
+    old_oi = OI_HISTORY[0].get(sym, 0)
+    new_oi = OI_HISTORY[-1].get(sym, 0)
+    if not old_oi:
+        return None
+    return round((new_oi - old_oi) / old_oi * 100, 2)
+
 def is_trading_hours() -> bool:
     return TRADING_START_MSK <= datetime.now(MSK).hour < TRADING_END_MSK
 
@@ -367,8 +380,14 @@ def run_rs_momentum_scan():
     btc_chg   = (btc_close - btc_open) / btc_open * 100 if btc_open else 0
     print(f"[RS] BTC 15М: {btc_chg:+.2f}%")
 
-    # Тикеры (funding)
+    # Тикеры (funding + OI)
     ticker_data = get_gate_tickers()
+
+    # Снимок OI в историю
+    oi_snapshot = {sym: d["oi"] for sym, d in ticker_data.items()}
+    OI_HISTORY.append(oi_snapshot)
+    if len(OI_HISTORY) > OI_HISTORY_MAX:
+        OI_HISTORY.pop(0)
 
     # Контекст рынка
     market_ctx = get_market_context()
@@ -446,6 +465,7 @@ def run_rs_momentum_scan():
             # Funding
             funding    = ticker_data.get(sym, {}).get("funding", 0)
             change_24h = ticker_data.get(sym, {}).get("change_24h", 0)
+            oi_chg     = get_oi_change(sym)
 
             # ATR для TP2
             all_highs  = [float(c["h"]) for c in candles]
@@ -504,7 +524,7 @@ def run_rs_momentum_scan():
                 longs.append({
                     "symbol": sym, "price": alt_curr, "decorr": decorr,
                     "alt_chg": alt_chg, "rvol": rvol, "signal_mode": signal_mode,
-                    "close_position": close_position, "funding": funding, "change_24h": change_24h,
+                    "close_position": close_position, "funding": funding, "change_24h": change_24h, "oi_chg": oi_chg,
                     "room_pct": room_pct, "near_wall": near_wall, "local_high": local_high,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
                     "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
@@ -560,7 +580,7 @@ def run_rs_momentum_scan():
                 shorts.append({
                     "symbol": sym, "price": alt_curr, "decorr": decorr,
                     "alt_chg": alt_chg, "rvol": rvol, "signal_mode": signal_mode,
-                    "close_position": close_position, "funding": funding, "change_24h": change_24h,
+                    "close_position": close_position, "funding": funding, "change_24h": change_24h, "oi_chg": oi_chg,
                     "room_pct": room_pct, "near_floor": near_floor, "local_low": local_low,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
                     "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
@@ -594,6 +614,7 @@ def run_rs_momentum_scan():
                 f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
                 f"   Закрытие свечи: {s['close_position']*100:.0f}% | Фандинг: {s['funding']:+.3f}%\n"
                 f"   📈 Рост 24ч: {s.get('change_24h', 0):+.2f}%\n"
+                f"   {'📈 OI +' + str(s['oi_chg']) + '% (растёт ✅)' if s.get('oi_chg') is not None and s['oi_chg'] > 1 else '📉 OI ' + str(s['oi_chg']) + '% (падает ⚠️)' if s.get('oi_chg') is not None and s['oi_chg'] < -1 else '➡️ OI ' + str(s['oi_chg']) + '% (стоит)' if s.get('oi_chg') is not None else '⏳ OI накапливается...'}\n"
                 f"   Комната до хая: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
                 f"   Стоп: {s['stop']:.6g} ({STOP_PCT}%)\n"
@@ -622,6 +643,7 @@ def run_rs_momentum_scan():
                 f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
                 f"   Закрытие свечи: {s['close_position']*100:.0f}% | Фандинг: {s['funding']:+.3f}%\n"
                 f"   📈 Рост 24ч: {s.get('change_24h', 0):+.2f}%\n"
+                f"   {'📈 OI +' + str(s['oi_chg']) + '% (растёт ✅)' if s.get('oi_chg') is not None and s['oi_chg'] > 1 else '📉 OI ' + str(s['oi_chg']) + '% (падает ⚠️)' if s.get('oi_chg') is not None and s['oi_chg'] < -1 else '➡️ OI ' + str(s['oi_chg']) + '% (стоит)' if s.get('oi_chg') is not None else '⏳ OI накапливается...'}\n"
                 f"   Комната до лоя: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
                 f"   Стоп: {s['stop']:.6g} (+{abs(STOP_PCT):.0f}%)\n"
