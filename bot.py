@@ -93,12 +93,13 @@ def get_gate_tickers() -> dict:
                 continue
             sym = contract.replace("_USDT", "")
             try:
-                funding = float(t.get("funding_rate", 0)) * 100
-                oi_raw  = t.get("total_size") or t.get("open_interest") or t.get("position_size") or 0
-                oi      = float(oi_raw)
+                funding    = float(t.get("funding_rate", 0)) * 100
+                oi_raw     = t.get("total_size") or t.get("open_interest") or t.get("position_size") or 0
+                oi         = float(oi_raw)
+                change_24h = float(t.get("change_percentage", 0))
             except (ValueError, TypeError):
                 continue
-            result[sym] = {"funding": funding, "oi": oi}
+            result[sym] = {"funding": funding, "oi": oi, "change_24h": change_24h}
         print(f"[TICKERS] Загружено {len(result)} пар")
         return result
     except Exception as e:
@@ -387,13 +388,17 @@ def run_rs_momentum_scan():
             if not candles or len(candles) < ROOM_LOOKBACK + 5:
                 time.sleep(0.05); continue
 
-            # Берём 2 последние закрытые 5M свечи, выбираем лучшую по RVOL
-            history_vols = [float(c["v"]) for c in candles[-24:-2]]
+            # Средний объём за последние 24 закрытые свечи (2 часа)
+            history_vols = [float(c["v"]) for c in candles[-26:-2]]
             vol_avg = sum(history_vols) / len(history_vols) if history_vols else 0
+            if vol_avg == 0:
+                time.sleep(0.05); continue
 
+            # ── Условие 1: ВЗРЫВ ──
+            # Хотя бы одна из 3 последних закрытых свечей даёт RVOL >= порога
             best_candle = None
             best_rvol   = 0
-            for idx in [-2, -3]:  # две последние закрытые свечи
+            for idx in [-2, -3, -4]:
                 c = candles[idx]
                 v = float(c["v"])
                 r_vol = round(v / vol_avg, 2) if vol_avg > 0 else 0
@@ -401,10 +406,24 @@ def run_rs_momentum_scan():
                     best_rvol   = r_vol
                     best_candle = c
 
-            if best_candle is None or best_rvol < RVOL_THRESHOLD:
-                time.sleep(0.05); continue
+            signal_mode = None
+            if best_rvol >= RVOL_THRESHOLD:
+                signal_mode = "explosion"
+                rvol = best_rvol
 
-            rvol = best_rvol
+            # ── Условие 2: НАКОПЛЕНИЕ ──
+            # Объём 4 закрытых свечей подряд растёт И средний RVOL > 1.5x
+            if signal_mode is None:
+                vols4 = [float(candles[i]["v"]) for i in [-5, -4, -3, -2]]
+                growing = all(vols4[i] < vols4[i+1] for i in range(3))
+                avg_rvol4 = round(sum(vols4) / (4 * vol_avg), 2) if vol_avg > 0 else 0
+                if growing and avg_rvol4 >= 1.5:
+                    signal_mode = "accumulation"
+                    best_candle = candles[-2]  # последняя закрытая
+                    rvol = avg_rvol4
+
+            if signal_mode is None:
+                time.sleep(0.05); continue
             alt_open  = float(best_candle["o"])
             alt_close = float(best_candle["c"])
             alt_high  = float(best_candle["h"])
@@ -425,7 +444,8 @@ def run_rs_momentum_scan():
             close_position = (alt_close - alt_low) / candle_range if candle_range > 0 else 0.5
 
             # Funding
-            funding = ticker_data.get(sym, {}).get("funding", 0)
+            funding    = ticker_data.get(sym, {}).get("funding", 0)
+            change_24h = ticker_data.get(sym, {}).get("change_24h", 0)
 
             # ATR для TP2
             all_highs  = [float(c["h"]) for c in candles]
@@ -483,8 +503,8 @@ def run_rs_momentum_scan():
 
                 longs.append({
                     "symbol": sym, "price": alt_curr, "decorr": decorr,
-                    "alt_chg": alt_chg, "rvol": rvol,
-                    "close_position": close_position, "funding": funding,
+                    "alt_chg": alt_chg, "rvol": rvol, "signal_mode": signal_mode,
+                    "close_position": close_position, "funding": funding, "change_24h": change_24h,
                     "room_pct": room_pct, "near_wall": near_wall, "local_high": local_high,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
                     "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
@@ -539,8 +559,8 @@ def run_rs_momentum_scan():
 
                 shorts.append({
                     "symbol": sym, "price": alt_curr, "decorr": decorr,
-                    "alt_chg": alt_chg, "rvol": rvol,
-                    "close_position": close_position, "funding": funding,
+                    "alt_chg": alt_chg, "rvol": rvol, "signal_mode": signal_mode,
+                    "close_position": close_position, "funding": funding, "change_24h": change_24h,
                     "room_pct": room_pct, "near_floor": near_floor, "local_low": local_low,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
                     "tp2_price": tp2_price, "tp2_pct": tp2_pct, "tp2_label": tp2_label,
@@ -570,9 +590,10 @@ def run_rs_momentum_scan():
             marks = f" {s['marks']}" if s['marks'] else ""
             lines.append(
                 f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
-                f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io\n"
+                f"   RVOL: <b>{s['rvol']}x</b> {'🚀 Взрыв' if s.get('signal_mode') == 'explosion' else '📊 Накопление'} ✅ Gate.io\n"
                 f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
                 f"   Закрытие свечи: {s['close_position']*100:.0f}% | Фандинг: {s['funding']:+.3f}%\n"
+                f"   📈 Рост 24ч: {s.get('change_24h', 0):+.2f}%\n"
                 f"   Комната до хая: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
                 f"   Стоп: {s['stop']:.6g} ({STOP_PCT}%)\n"
@@ -597,9 +618,10 @@ def run_rs_momentum_scan():
             marks = f" {s['marks']}" if s['marks'] else ""
             lines.append(
                 f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
-                f"   RVOL: <b>{s['rvol']}x</b> ✅ Gate.io\n"
+                f"   RVOL: <b>{s['rvol']}x</b> {'🚀 Взрыв' if s.get('signal_mode') == 'explosion' else '📊 Накопление'} ✅ Gate.io\n"
                 f"   Раскорр: <b>{s['decorr']:+.2f}%</b> vs BTC | Альт 15М: {s['alt_chg']:+.2f}%\n"
                 f"   Закрытие свечи: {s['close_position']*100:.0f}% | Фандинг: {s['funding']:+.3f}%\n"
+                f"   📈 Рост 24ч: {s.get('change_24h', 0):+.2f}%\n"
                 f"   Комната до лоя: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
                 f"   Стоп: {s['stop']:.6g} (+{abs(STOP_PCT):.0f}%)\n"
@@ -618,7 +640,7 @@ def send_status(signal_count=0, btc_chg=None):
     ctx = get_market_context()
     btc_line = f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n" if btc_chg is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v7.1</b> | {now.strftime('%H:%M МСК')}\n"
+        f"🤖 <b>Upscale Bot v7.2</b> | {now.strftime('%H:%M МСК')}\n"
         f"✅ RS Momentum 15М (Лонг + Шорт)\n"
         f"{btc_line}"
         f"{ctx}\n"
@@ -631,7 +653,7 @@ def send_status(signal_count=0, btc_chg=None):
 
 def main():
     send_telegram(
-        "🚀 <b>Upscale Bot v7.1 запущен</b>\n"
+        "🚀 <b>Upscale Bot v7.2 запущен</b>\n"
         "📡 RS Momentum 15М — Лонг + Шорт\n"
         "📊 BTC контекст: 1D + 4H + 1H + EQH/EQL ликвидность\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
