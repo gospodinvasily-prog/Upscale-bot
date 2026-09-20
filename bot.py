@@ -531,12 +531,12 @@ def run_rs_momentum_scan():
                 rvol = best_rvol
 
             # ── Условие 2: НАКОПЛЕНИЕ ──
-            # Объём 4 закрытых свечей подряд растёт И средний RVOL > 1.5x
+            # Объём растёт минимум в 2 из 3 пар И средний RVOL > 1.2x
             if signal_mode is None:
                 vols4 = [float(candles[i]["v"]) for i in [-5, -4, -3, -2]]
-                growing = all(vols4[i] < vols4[i+1] for i in range(3))
+                growing_pairs = sum(1 for i in range(3) if vols4[i] < vols4[i+1])
                 avg_rvol4 = round(sum(vols4) / (4 * vol_avg), 2) if vol_avg > 0 else 0
-                if growing and avg_rvol4 >= 1.5:
+                if growing_pairs >= 2 and avg_rvol4 >= 1.2:
                     signal_mode = "accumulation"
                     best_candle = candles[-2]  # последняя закрытая
                     rvol = avg_rvol4
@@ -555,7 +555,8 @@ def run_rs_momentum_scan():
             alt_chg = (alt_close - alt_open) / alt_open * 100
             decorr  = alt_chg - btc_chg
 
-            if rvol < RVOL_THRESHOLD:
+            # Для накопления порог уже проверен выше (1.2x)
+            if signal_mode == "explosion" and rvol < RVOL_THRESHOLD:
                 time.sleep(0.05); continue
 
             # Размер свечи
