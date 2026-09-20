@@ -67,6 +67,91 @@ def get_oi_change(sym: str) -> float:
         return None
     return round((new_oi - old_oi) / old_oi * 100, 2)
 
+def analyze_signal(s: dict, is_long: bool, btc_chg: float) -> tuple:
+    score = 0
+    notes = []
+
+    # RVOL
+    rvol = s.get("rvol", 0)
+    mode = s.get("signal_mode", "explosion")
+    if mode == "accumulation":
+        if rvol >= 3:     score += 2; notes.append("накопление объёма")
+        elif rvol >= 1.5: score += 1
+    else:
+        if rvol >= 10:    score += 3; notes.append("взрывной объём")
+        elif rvol >= 5:   score += 2; notes.append("сильный объём")
+        elif rvol >= 3:   score += 1
+
+    # OI
+    oi = s.get("oi_chg")
+    if oi is not None:
+        if oi > 1.5:    score += 2; notes.append("OI растёт")
+        elif oi > 0.5:  score += 1
+        elif oi < -1:   score -= 2; notes.append("OI падает")
+
+    # Закрытие свечи (для шорта инвертируем)
+    cp = s.get("close_position", 0.5)
+    eff_cp = cp if is_long else (1 - cp)
+    if eff_cp >= 0.90:   score += 2
+    elif eff_cp >= 0.75: score += 1
+    elif eff_cp < 0.60:  score -= 1; notes.append("слабое закрытие свечи")
+
+    # Раскорр (абсолютное значение)
+    decorr = abs(s.get("decorr", 0))
+    if decorr >= 3:    score += 2; notes.append("сильный раскорр")
+    elif decorr >= 2:  score += 1
+
+    # Рост 24ч
+    ch24 = s.get("change_24h", 0)
+    if is_long:
+        if ch24 < 5:     score += 1
+        elif ch24 > 25:  score -= 2; notes.append("монета перегрета")
+        elif ch24 > 15:  score -= 1
+    else:
+        if ch24 > 15:    score += 1; notes.append("перегрета — шорт логичен")
+        elif ch24 < -10: score += 1
+
+    # Фандинг
+    funding = s.get("funding", 0)
+    if is_long:
+        if funding < -0.005:  score += 1
+        elif funding > 0.03:  score -= 1; notes.append("фандинг перегрет")
+    else:
+        if funding > 0.02:    score += 1; notes.append("лонги перегружены")
+        elif funding < -0.02: score -= 1
+
+    # TP1 — есть структурная цель?
+    tp1_label = s.get("tp1_label", "")
+    if "хай" in tp1_label or "лой" in tp1_label:
+        score += 1
+
+    # BTC контекст
+    if is_long:
+        if btc_chg > 0.1:    score += 1
+        elif btc_chg < -0.3: score -= 1; notes.append("BTC против")
+    else:
+        if btc_chg < -0.1:   score += 1
+        elif btc_chg > 0.3:  score -= 1; notes.append("BTC против")
+
+    # Вердикт
+    if score >= 8:
+        v = "🟢 Сильный"
+        if notes: v += f" — {', '.join(notes[:2])}"
+        v += ". Входи."
+    elif score >= 5:
+        v = "🟡 Нормальный"
+        if notes: v += f" — {notes[0]}"
+        v += ". Проверь CVD."
+    elif score >= 2:
+        v = "🟠 Слабый"
+        if notes: v += f" — {notes[0]}"
+        v += ". Уменьши позицию."
+    else:
+        v = "🔴 Пропустить"
+        if notes: v += f" — {', '.join(notes[:2])}"
+
+    return score, v
+
 def is_trading_hours() -> bool:
     return TRADING_START_MSK <= datetime.now(MSK).hour < TRADING_END_MSK
 
@@ -188,6 +273,9 @@ def get_swing_levels(highs: list, lows: list) -> tuple:
 
 def format_liq_line(eq_highs, eq_lows, price, tf_label):
     parts = []
+    # Фильтруем уровни которые цена уже прошла
+    eq_highs = [(lvl, cnt) for lvl, cnt in eq_highs if lvl > price * 1.001]
+    eq_lows  = [(lvl, cnt) for lvl, cnt in eq_lows  if lvl < price * 0.999]
     if eq_highs:
         lvl, cnt = eq_highs[0]
         pct = (lvl - price) / price * 100
@@ -214,7 +302,7 @@ def format_liq_line(eq_highs, eq_lows, price, tf_label):
 def get_market_context() -> str:
     global _market_cache
     now_ts = time.time()
-    if now_ts - _market_cache["updated_at"] < 3600 and _market_cache["text"]:
+    if now_ts - _market_cache["updated_at"] < 900 and _market_cache["text"]:
         return _market_cache["text"]
 
     url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
@@ -608,6 +696,7 @@ def run_rs_momentum_scan():
         for i, s in enumerate(top):
             medal = medals[i] if i < len(medals) else "▪️"
             marks = f" {s['marks']}" if s['marks'] else ""
+            score, verdict = analyze_signal(s, is_long=True, btc_chg=btc_chg)
             lines.append(
                 f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
                 f"   RVOL: <b>{s['rvol']}x</b> {'🚀 Взрыв' if s.get('signal_mode') == 'explosion' else '📊 Накопление'} ✅ Gate.io\n"
@@ -620,8 +709,8 @@ def run_rs_momentum_scan():
                 f"   Стоп: {s['stop']:.6g} ({STOP_PCT}%)\n"
                 f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — {s['tp1_label']} — 50%\n"
                 f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — {s['tp2_label']} — 50%\n"
+                f"   💡 {verdict}\n"
             )
-        lines.append("⚠️ Проверь CVD. Решение за тобой.")
         send_telegram("\n".join(lines))
 
     # ── Отправка шортов ──
@@ -637,6 +726,7 @@ def run_rs_momentum_scan():
         for i, s in enumerate(top):
             medal = medals[i] if i < len(medals) else "▪️"
             marks = f" {s['marks']}" if s['marks'] else ""
+            score, verdict = analyze_signal(s, is_long=False, btc_chg=btc_chg)
             lines.append(
                 f"{medal} <b>{s['symbol']}/USDT</b>{marks}\n"
                 f"   RVOL: <b>{s['rvol']}x</b> {'🚀 Взрыв' if s.get('signal_mode') == 'explosion' else '📊 Накопление'} ✅ Gate.io\n"
@@ -649,8 +739,8 @@ def run_rs_momentum_scan():
                 f"   Стоп: {s['stop']:.6g} (+{abs(STOP_PCT):.0f}%)\n"
                 f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — {s['tp1_label']} — 50%\n"
                 f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — {s['tp2_label']} — 50%\n"
+                f"   💡 {verdict}\n"
             )
-        lines.append("⚠️ Проверь CVD. Решение за тобой.")
         send_telegram("\n".join(lines))
 
     return len(longs) + len(shorts), btc_chg
