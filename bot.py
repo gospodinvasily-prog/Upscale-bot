@@ -125,13 +125,24 @@ def analyze_signal(s: dict, is_long: bool, btc_chg: float) -> tuple:
     if "хай" in tp1_label or "лой" in tp1_label:
         score += 1
 
-    # BTC контекст
+    # BTC 15M контекст
     if is_long:
         if btc_chg > 0.1:    score += 1
-        elif btc_chg < -0.3: score -= 1; notes.append("BTC против")
+        elif btc_chg < -0.3: score -= 1; notes.append("BTC 15M против")
     else:
         if btc_chg < -0.1:   score += 1
-        elif btc_chg > 0.3:  score -= 1; notes.append("BTC против")
+        elif btc_chg > 0.3:  score -= 1; notes.append("BTC 15M против")
+
+    # BTC 4H тренд — важнее 15M!
+    h4_bias = _market_cache.get("h4_bias", "❓")
+    if is_long:
+        if "Восходящий" in h4_bias:   score += 1
+        elif "Нисходящий" in h4_bias: score -= 2; notes.append("⚠️ BTC 4H нисходящий — против тренда")
+        elif "Ниже EMA20" in h4_bias: score -= 1; notes.append("BTC 4H слабый")
+    else:
+        if "Нисходящий" in h4_bias:   score += 1
+        elif "Восходящий" in h4_bias: score -= 2; notes.append("⚠️ BTC 4H восходящий — против тренда")
+        elif "Выше EMA20" in h4_bias: score -= 1; notes.append("BTC 4H сильный")
 
     # Вердикт
     if score >= 8:
@@ -238,7 +249,7 @@ def calc_atr(highs, lows, closes, period=14) -> list:
 
 # ─── КОНТЕКСТ РЫНКА: BTC 1D + 4H + 1H + EQH/EQL ─────────────────────────────
 
-_market_cache = {"text": "", "updated_at": 0}
+_market_cache = {"text": "", "updated_at": 0, "h4_bias": "❓"}
 
 def find_eq_levels(levels: list, price: float, above: bool, tolerance: float = 0.15) -> list:
     filtered = [l for l in levels if (l > price if above else l < price)]
@@ -353,6 +364,7 @@ def get_market_context() -> str:
             elif lh and ll:  h4_bias = "📉 Нисходящий"
             elif p4 > ema20: h4_bias = "↗️ Выше EMA20"
             else:            h4_bias = "↘️ Ниже EMA20"
+            _market_cache["h4_bias"] = h4_bias
 
             sh4, sl4 = get_swing_levels(hi4, lo4)
             eq_h4 = find_eq_levels(sh4, p4, above=True)
