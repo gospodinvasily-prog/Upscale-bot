@@ -576,7 +576,8 @@ def run_rs_momentum_scan():
             atr  = atrs[-1] if atrs else 0
 
             # ── ЛОНГ ──
-            if decorr >= BTC_DECORR_THRESHOLD and close_position >= CLOSE_POS_THRESHOLD:
+            close_thr = CLOSE_POS_THRESHOLD if signal_mode == "explosion" else 0.4
+            if decorr >= BTC_DECORR_THRESHOLD and close_position >= close_thr:
                 # Свинг-хаи из всех доступных свечей
                 swing_highs_sym = []
                 for i in range(2, len(all_highs) - 1):
@@ -633,7 +634,7 @@ def run_rs_momentum_scan():
                 })
 
             # ── ШОРТ ──
-            elif decorr <= BTC_DECORR_SHORT and close_position <= CLOSE_POS_SHORT:
+            elif decorr <= BTC_DECORR_SHORT and close_position <= (CLOSE_POS_SHORT if signal_mode == "explosion" else 0.6):
                 # Свинг-лои из всех доступных свечей
                 swing_lows_sym = []
                 for i in range(2, len(all_lows) - 1):
