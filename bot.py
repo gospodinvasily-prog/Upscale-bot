@@ -16,7 +16,8 @@ MSK = timezone(timedelta(hours=3))
 SCAN_INTERVAL        = 5       # минут (5M таймфрейм)
 BTC_DECORR_THRESHOLD = 1.5     # % раскорреляция для лонга
 BTC_DECORR_SHORT     = -1.5    # % раскорреляция для шорта (альт падает сильнее)
-RVOL_THRESHOLD       = 1.2     # минимальный объём
+RVOL_THRESHOLD           = 1.2   # абсолютный минимум объёма (для накопления)
+RVOL_EXPLOSION_THRESHOLD = 2.5   # порог для одиночного взрывного скачка
 RVOL_HOT_THRESHOLD   = 8.0     # горячий объём 🔥🔥
 CLOSE_POS_THRESHOLD  = 0.6     # закрытие в верхних 40% для лонга
 CLOSE_POS_SHORT      = 0.4     # закрытие в нижних 40% для шорта
@@ -24,7 +25,9 @@ FUNDING_MAX_LONG     = 0.06    # % — перегруз лонгами (пред
 FUNDING_MIN_SHORT    = -0.06   # % — перегруз шортами (предупреждение для шорта)
 FUNDING_EXTREME      = 0.05    # для sweep
 ROOM_LOOKBACK        = 20      # свечей для комнаты до хая/лоя
-STOP_PCT             = -3.0    # % стоп
+STOP_PCT             = -3.0    # % аварийный потолок стопа (не даём уйти дальше)
+STOP_PCT_BASE        = 1.5     # % базовый стоп (обычный рабочий стоп)
+ATR_STOP_MULT        = 1.0     # множитель ATR для динамического стопа
 ATR_TP2_MULT         = 2.0     # ATR множитель для TP2
 TOP_N                = 3       # топ сигналов
 
@@ -68,100 +71,174 @@ def get_oi_change(sym: str) -> float:
     return round((new_oi - old_oi) / old_oi * 100, 2)
 
 def analyze_signal(s: dict, is_long: bool, btc_chg: float) -> tuple:
+    """Считает score сигнала. notes_plus — что усиливает вход,
+    notes_minus — что ослабляет/занижает вход. Каждая ветка комментируется,
+    даже нейтральные и слабые значения — чтобы было видно ПОЧЕМУ балл не начислен."""
     score = 0
-    notes = []
+    notes_plus  = []
+    notes_minus = []
 
-    # RVOL
+    # ── RVOL ──
     rvol = s.get("rvol", 0)
     mode = s.get("signal_mode", "explosion")
     if mode == "accumulation":
-        if rvol >= 3:     score += 2; notes.append("накопление объёма")
-        elif rvol >= 1.5: score += 1
+        if rvol >= 3:
+            score += 2; notes_plus.append(f"накопление сильное ({rvol}x)")
+        elif rvol >= 1.5:
+            score += 1; notes_plus.append(f"накопление умеренное ({rvol}x)")
+        else:
+            notes_minus.append(f"накопление слабое ({rvol}x, у порога 1.2x)")
     else:
-        if rvol >= 10:    score += 3; notes.append("взрывной объём")
-        elif rvol >= 5:   score += 2; notes.append("сильный объём")
-        elif rvol >= 3:   score += 1
+        if rvol >= 10:
+            score += 3; notes_plus.append(f"взрывной объём ({rvol}x)")
+        elif rvol >= 5:
+            score += 2; notes_plus.append(f"сильный объём ({rvol}x)")
+        elif rvol >= 3:
+            score += 1; notes_plus.append(f"объём выше среднего ({rvol}x)")
+        else:
+            notes_minus.append(f"взрыв слабый ({rvol}x, у порога 2.5x)")
 
-    # OI
+    # ── OI ──
     oi = s.get("oi_chg")
-    if oi is not None:
-        if oi > 1.5:    score += 2; notes.append("OI растёт")
-        elif oi > 0.5:  score += 1
-        elif oi < -1:   score -= 2; notes.append("OI падает")
+    if oi is None:
+        notes_minus.append("OI ещё не накопился — нет данных")
+    elif oi > 1.5:
+        score += 2; notes_plus.append(f"OI растёт (+{oi}%) — новые деньги")
+    elif oi > 0.5:
+        score += 1; notes_plus.append(f"OI слегка растёт (+{oi}%)")
+    elif oi < -1:
+        score -= 2; notes_minus.append(f"OI падает ({oi}%) — закрытие позиций, не новый вход")
+    else:
+        notes_minus.append(f"OI стоит ({oi}%) — нет подтверждения новыми деньгами")
 
-    # Закрытие свечи (для шорта инвертируем)
+    # ── Закрытие свечи (для шорта инвертируем) ──
     cp = s.get("close_position", 0.5)
     eff_cp = cp if is_long else (1 - cp)
-    if eff_cp >= 0.90:   score += 2
-    elif eff_cp >= 0.75: score += 1
-    elif eff_cp < 0.60:  score -= 1; notes.append("слабое закрытие свечи")
+    if eff_cp >= 0.90:
+        score += 2; notes_plus.append("свеча закрылась у края — контроль полный")
+    elif eff_cp >= 0.75:
+        score += 1; notes_plus.append("свеча закрылась уверенно")
+    elif eff_cp < 0.60:
+        score -= 1; notes_minus.append("слабое закрытие свечи — нет полного контроля стороны")
+    else:
+        notes_minus.append("закрытие свечи среднее — не даёт явного перевеса")
 
-    # Раскорр (абсолютное значение)
+    # ── Раскорр (абсолютное значение) ──
     decorr = abs(s.get("decorr", 0))
-    if decorr >= 3:    score += 2; notes.append("сильный раскорр")
-    elif decorr >= 2:  score += 1
+    if decorr >= 3:
+        score += 2; notes_plus.append(f"сильный раскорр ({decorr:.1f}%)")
+    elif decorr >= 2:
+        score += 1; notes_plus.append(f"умеренный раскорр ({decorr:.1f}%)")
+    else:
+        notes_minus.append(f"раскорр слабый ({decorr:.1f}%, у порога 1.5%)")
 
-    # Рост 24ч
+    # ── Рост 24ч ──
     ch24 = s.get("change_24h", 0)
     if is_long:
-        if ch24 < 5:     score += 1
-        elif ch24 > 25:  score -= 2; notes.append("монета перегрета")
-        elif ch24 > 15:  score -= 1
+        if ch24 < 5:
+            score += 1; notes_plus.append(f"монета не разогрета ({ch24:+.1f}% за 24ч)")
+        elif ch24 > 25:
+            score -= 2; notes_minus.append(f"монета перегрета ({ch24:+.1f}% за 24ч) — риск разворота")
+        elif ch24 > 15:
+            score -= 1; notes_minus.append(f"монета разогрета ({ch24:+.1f}% за 24ч)")
+        else:
+            notes_minus.append(f"рост 24ч нейтральный ({ch24:+.1f}%) — не даёт бонуса")
     else:
-        if ch24 > 15:    score += 1; notes.append("перегрета — шорт логичен")
-        elif ch24 < -10: score += 1
+        if ch24 > 15:
+            score += 1; notes_plus.append(f"перегрета ({ch24:+.1f}%) — шорт логичен")
+        elif ch24 < -10:
+            score += 1; notes_plus.append(f"уже сильно падает ({ch24:+.1f}%) — тренд на нашей стороне")
+        else:
+            notes_minus.append(f"рост 24ч нейтральный ({ch24:+.1f}%) — не даёт бонуса шорту")
 
-    # Фандинг
+    # ── Фандинг ──
     funding = s.get("funding", 0)
     if is_long:
-        if funding < -0.005:  score += 1
-        elif funding > 0.03:  score -= 1; notes.append("фандинг перегрет")
+        if funding < -0.005:
+            score += 1; notes_plus.append(f"фандинг отрицательный ({funding:+.3f}%) — шорты платят")
+        elif funding > 0.03:
+            score -= 1; notes_minus.append(f"фандинг перегрет ({funding:+.3f}%) — лонги переполнены")
+        else:
+            notes_minus.append(f"фандинг нейтральный ({funding:+.3f}%)")
     else:
-        if funding > 0.02:    score += 1; notes.append("лонги перегружены")
-        elif funding < -0.02: score -= 1
+        if funding > 0.02:
+            score += 1; notes_plus.append(f"лонги перегружены ({funding:+.3f}%) — топливо для шорта")
+        elif funding < -0.02:
+            score -= 1; notes_minus.append(f"фандинг против шорта ({funding:+.3f}%)")
+        else:
+            notes_minus.append(f"фандинг нейтральный ({funding:+.3f}%)")
 
-    # TP1 — есть структурная цель?
+    # ── TP1 — есть структурная цель? ──
     tp1_label = s.get("tp1_label", "")
     if "хай" in tp1_label or "лой" in tp1_label:
-        score += 1
-
-    # BTC 15M контекст
-    if is_long:
-        if btc_chg > 0.1:    score += 1
-        elif btc_chg < -0.3: score -= 1; notes.append("BTC 15M против")
+        score += 1; notes_plus.append("есть структурный уровень для TP1")
     else:
-        if btc_chg < -0.1:   score += 1
-        elif btc_chg > 0.3:  score -= 1; notes.append("BTC 15M против")
+        notes_minus.append("TP1 по ATR — нет свинг-уровня впереди, цена уже выше/ниже недавних хаёв/лоёв")
 
-    # BTC 4H тренд — важнее 15M!
+    # ── BTC 15M контекст ──
+    if is_long:
+        if btc_chg > 0.1:
+            score += 1; notes_plus.append(f"BTC 15M поддерживает ({btc_chg:+.2f}%)")
+        elif btc_chg < -0.3:
+            score -= 1; notes_minus.append(f"BTC 15M против ({btc_chg:+.2f}%)")
+        else:
+            notes_minus.append(f"BTC 15M нейтральный ({btc_chg:+.2f}%)")
+    else:
+        if btc_chg < -0.1:
+            score += 1; notes_plus.append(f"BTC 15M поддерживает ({btc_chg:+.2f}%)")
+        elif btc_chg > 0.3:
+            score -= 1; notes_minus.append(f"BTC 15M против ({btc_chg:+.2f}%)")
+        else:
+            notes_minus.append(f"BTC 15M нейтральный ({btc_chg:+.2f}%)")
+
+    # ── BTC 4H тренд — важнее 15M! ──
     h4_bias = _market_cache.get("h4_bias", "❓")
     if is_long:
-        if "Восходящий" in h4_bias:   score += 1
-        elif "Нисходящий" in h4_bias: score -= 2; notes.append("⚠️ BTC 4H нисходящий — против тренда")
-        elif "Ниже EMA20" in h4_bias: score -= 1; notes.append("BTC 4H слабый")
+        if "Восходящий" in h4_bias:
+            score += 1; notes_plus.append("BTC 4H восходящий — по тренду")
+        elif "Нисходящий" in h4_bias:
+            score -= 2; notes_minus.append("⚠️ BTC 4H нисходящий — вход против старшего тренда")
+        elif "Ниже EMA20" in h4_bias:
+            score -= 1; notes_minus.append("BTC 4H слабый (ниже EMA20)")
+        else:
+            notes_minus.append(f"BTC 4H неопределён ({h4_bias})")
     else:
-        if "Нисходящий" in h4_bias:   score += 1
-        elif "Восходящий" in h4_bias: score -= 2; notes.append("⚠️ BTC 4H восходящий — против тренда")
-        elif "Выше EMA20" in h4_bias: score -= 1; notes.append("BTC 4H сильный")
+        if "Нисходящий" in h4_bias:
+            score += 1; notes_plus.append("BTC 4H нисходящий — по тренду")
+        elif "Восходящий" in h4_bias:
+            score -= 2; notes_minus.append("⚠️ BTC 4H восходящий — вход против старшего тренда")
+        elif "Выше EMA20" in h4_bias:
+            score -= 1; notes_minus.append("BTC 4H сильный (выше EMA20)")
+        else:
+            notes_minus.append(f"BTC 4H неопределён ({h4_bias})")
 
-    # Вердикт
+    # ── Вердикт ──
     if score >= 8:
         v = "🟢 Сильный"
-        if notes: v += f" — {', '.join(notes[:2])}"
+        if notes_plus: v += f" — {', '.join(notes_plus[:2])}"
         v += ". Входи."
     elif score >= 5:
         v = "🟡 Нормальный"
-        if notes: v += f" — {notes[0]}"
+        if notes_plus: v += f" — {notes_plus[0]}"
+        if notes_minus: v += f"; но {notes_minus[0]}"
         v += ". Проверь CVD."
     elif score >= 2:
         v = "🟠 Слабый"
-        if notes: v += f" — {notes[0]}"
+        if notes_minus: v += f" — {', '.join(notes_minus[:2])}"
         v += ". Уменьши позицию."
     else:
         v = "🔴 Пропустить"
-        if notes: v += f" — {', '.join(notes[:2])}"
+        if notes_minus: v += f" — {', '.join(notes_minus[:3])}"
 
     return score, v
+
+def calc_dynamic_stop_pct(atr: float, price: float) -> float:
+    """Стоп = max(базовый 1.5%, ATR%), но не дальше аварийного потолка 3%."""
+    if price <= 0:
+        return STOP_PCT_BASE
+    atr_pct = (atr / price) * 100 * ATR_STOP_MULT
+    stop_pct = max(STOP_PCT_BASE, atr_pct)
+    return min(stop_pct, abs(STOP_PCT))
 
 def is_trading_hours() -> bool:
     return TRADING_START_MSK <= datetime.now(MSK).hour < TRADING_END_MSK
@@ -442,13 +519,14 @@ def refresh_signal(s: dict, is_long: bool) -> dict:
     old_price = s["price"]
     s["price"] = fresh
 
+    sp = s.get("stop_pct", STOP_PCT_BASE)
     if is_long:
-        s["stop"] = fresh * (1 + STOP_PCT / 100)
+        s["stop"] = fresh * (1 - sp / 100)
         tp1 = s["tp1_price"]
         s["room_pct"]  = (tp1 - fresh) / fresh * 100
         s["near_wall"] = s["room_pct"] < 0.5
     else:
-        s["stop"] = fresh * (1 - STOP_PCT / 100)
+        s["stop"] = fresh * (1 + sp / 100)
         tp1 = s["tp1_price"]
         s["room_pct"]   = (fresh - tp1) / fresh * 100
         s["near_floor"] = s["room_pct"] < 0.5
@@ -526,7 +604,7 @@ def run_rs_momentum_scan():
                     best_candle = c
 
             signal_mode = None
-            if best_rvol >= RVOL_THRESHOLD:
+            if best_rvol >= RVOL_EXPLOSION_THRESHOLD:
                 signal_mode = "explosion"
                 rvol = best_rvol
 
@@ -552,11 +630,18 @@ def run_rs_momentum_scan():
             if alt_open == 0:
                 time.sleep(0.05); continue
 
-            alt_chg = (alt_close - alt_open) / alt_open * 100
-            decorr  = alt_chg - btc_chg
+            # Раскорр считаем по накопленному движению за 3 последние закрытые
+            # свечи (15 минут: candles[-4]..candles[-2]), ВСЕГДА до самой свежей
+            # закрытой свечи — не до best_candle, иначе при explosion на дальней
+            # свече (-4) окно схлопывается обратно в одну свечу.
+            window_open  = float(candles[-4]["o"])
+            window_close = float(candles[-2]["c"])
+            alt_chg_window = (window_close - window_open) / window_open * 100 if window_open else 0
+            alt_chg = (alt_close - alt_open) / alt_open * 100  # для отображения (сама сигнальная свеча)
+            decorr  = alt_chg_window - btc_chg
 
-            # Для накопления порог уже проверен выше (1.2x)
-            if signal_mode == "explosion" and rvol < RVOL_THRESHOLD:
+            # Для накопления порог уже проверен выше
+            if signal_mode == "explosion" and rvol < RVOL_EXPLOSION_THRESHOLD:
                 time.sleep(0.05); continue
 
             # Размер свечи
@@ -588,7 +673,8 @@ def run_rs_momentum_scan():
                 # Все хаи выше текущей цены, сортируем по близости
                 highs_above = sorted([h for h in swing_highs_sym if h > alt_curr * 1.0001])
 
-                stop = alt_curr * (1 + STOP_PCT / 100)
+                dyn_stop_pct = calc_dynamic_stop_pct(atr, alt_curr)
+                stop = alt_curr * (1 - dyn_stop_pct / 100)
 
                 # TP1 = ближайший свинг-хай выше цены
                 if highs_above:
@@ -624,8 +710,8 @@ def run_rs_momentum_scan():
                 if near_wall:                        quality -= 1; marks += "🧱стена"
 
                 longs.append({
-                    "symbol": sym, "price": alt_curr, "decorr": decorr,
-                    "alt_chg": alt_chg, "rvol": rvol, "signal_mode": signal_mode,
+                    "symbol": sym, "price": alt_curr, "decorr": decorr, "stop_pct": dyn_stop_pct,
+                    "alt_chg": alt_chg_window, "rvol": rvol, "signal_mode": signal_mode,
                     "close_position": close_position, "funding": funding, "change_24h": change_24h, "oi_chg": oi_chg,
                     "room_pct": room_pct, "near_wall": near_wall, "local_high": local_high,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
@@ -645,7 +731,8 @@ def run_rs_momentum_scan():
                 # Все лои ниже текущей цены, сортируем по близости (ближайший первый)
                 lows_below = sorted([l for l in swing_lows_sym if l < alt_curr * 0.9999], reverse=True)
 
-                stop = alt_curr * (1 - STOP_PCT / 100)
+                dyn_stop_pct = calc_dynamic_stop_pct(atr, alt_curr)
+                stop = alt_curr * (1 + dyn_stop_pct / 100)
 
                 # TP1 = ближайший свинг-лой ниже цены
                 if lows_below:
@@ -680,8 +767,8 @@ def run_rs_momentum_scan():
                 if near_floor:                       quality -= 1; marks += "🧱пол"
 
                 shorts.append({
-                    "symbol": sym, "price": alt_curr, "decorr": decorr,
-                    "alt_chg": alt_chg, "rvol": rvol, "signal_mode": signal_mode,
+                    "symbol": sym, "price": alt_curr, "decorr": decorr, "stop_pct": dyn_stop_pct,
+                    "alt_chg": alt_chg_window, "rvol": rvol, "signal_mode": signal_mode,
                     "close_position": close_position, "funding": funding, "change_24h": change_24h, "oi_chg": oi_chg,
                     "room_pct": room_pct, "near_floor": near_floor, "local_low": local_low,
                     "tp1_price": tp1_price, "tp1_pct": tp1_pct, "tp1_label": tp1_label,
@@ -720,7 +807,7 @@ def run_rs_momentum_scan():
                 f"   {'📈 OI +' + str(s['oi_chg']) + '% — новые лонги ✅' if s.get('oi_chg') is not None and s['oi_chg'] > 1 else '📉 OI ' + str(s['oi_chg']) + '% — шорты закрываются ⚠️' if s.get('oi_chg') is not None and s['oi_chg'] < -1 else '➡️ OI ' + str(s['oi_chg']) + '% (стоит)' if s.get('oi_chg') is not None else '⏳ OI накапливается...'}\n"
                 f"   Комната до хая: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
-                f"   Стоп: {s['stop']:.6g} ({STOP_PCT}%)\n"
+                f"   Стоп: {s['stop']:.6g} (-{s.get('stop_pct', STOP_PCT_BASE):.2f}%)\n"
                 f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — {s['tp1_label']} — 50%\n"
                 f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — {s['tp2_label']} — 50%\n"
                 f"   💡 {verdict}\n"
@@ -750,7 +837,7 @@ def run_rs_momentum_scan():
                 f"   {'📈 OI +' + str(s['oi_chg']) + '% — новые шорты ✅' if s.get('oi_chg') is not None and s['oi_chg'] > 1 else '📉 OI ' + str(s['oi_chg']) + '% — лонги закрываются ⚠️' if s.get('oi_chg') is not None and s['oi_chg'] < -1 else '➡️ OI ' + str(s['oi_chg']) + '% (стоит)' if s.get('oi_chg') is not None else '⏳ OI накапливается...'}\n"
                 f"   Комната до лоя: {s['room_pct']:.2f}%\n"
                 f"   Вход: <b>{s['price']:.6g}</b>\n"
-                f"   Стоп: {s['stop']:.6g} (+{abs(STOP_PCT):.0f}%)\n"
+                f"   Стоп: {s['stop']:.6g} (+{s.get('stop_pct', STOP_PCT_BASE):.2f}%)\n"
                 f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — {s['tp1_label']} — 50%\n"
                 f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — {s['tp2_label']} — 50%\n"
                 f"   💡 {verdict}\n"
