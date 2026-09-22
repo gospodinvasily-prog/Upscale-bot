@@ -592,9 +592,13 @@ def run_rs_momentum_scan():
                 time.sleep(0.05); continue
 
             # ── Условие 1: ВЗРЫВ ──
-            # Хотя бы одна из 3 последних закрытых свечей даёт RVOL >= порога
+            # Хотя бы одна из 3 последних закрытых свечей даёт RVOL >= порога.
+            # Берём МАКСИМАЛЬНЫЙ RVOL среди трёх — но если это не самая свежая
+            # свеча (-2), а более старая (-3/-4), и цена с тех пор уже заметно
+            # ушла — это устаревший взрыв, а не текущий момент. Пропускаем.
             best_candle = None
             best_rvol   = 0
+            best_idx    = None
             for idx in [-2, -3, -4]:
                 c = candles[idx]
                 v = float(c["v"])
@@ -602,22 +606,43 @@ def run_rs_momentum_scan():
                 if r_vol > best_rvol:
                     best_rvol   = r_vol
                     best_candle = c
+                    best_idx    = idx
 
             signal_mode = None
             if best_rvol >= RVOL_EXPLOSION_THRESHOLD:
-                signal_mode = "explosion"
-                rvol = best_rvol
+                stale_explosion = False
+                if best_idx != -2:
+                    spike_close = float(best_candle["c"])
+                    live_price  = float(candles[-1]["c"])
+                    if spike_close > 0:
+                        drift = abs((live_price - spike_close) / spike_close * 100)
+                        stale_explosion = drift > 1.0  # цена уже ушла 1%+ от взрывной свечи
+                if not stale_explosion:
+                    signal_mode = "explosion"
+                    rvol = best_rvol
 
             # ── Условие 2: НАКОПЛЕНИЕ ──
-            # Объём растёт минимум в 2 из 3 пар И средний RVOL > 1.2x
+            # Объём второй свечи выше первой минимум на 10%, средний RVOL >= 1.2x.
+            # ВАЖНО: если цена уже прошла заметное расстояние за последние ~30 минут
+            # (8 свечей), значит настоящий взрыв был раньше и выпал из окна проверки —
+            # текущий сигнал был бы просто хвостом уже прошедшего движения. Пропускаем.
             if signal_mode is None:
-                vols4 = [float(candles[i]["v"]) for i in [-5, -4, -3, -2]]
-                growing_pairs = sum(1 for i in range(3) if vols4[i] < vols4[i+1])
-                avg_rvol4 = round(sum(vols4) / (4 * vol_avg), 2) if vol_avg > 0 else 0
-                if growing_pairs >= 2 and avg_rvol4 >= 1.2:
+                v_prev = float(candles[-3]["v"])
+                v_last = float(candles[-2]["v"])
+                avg_rvol2 = round((v_prev + v_last) / (2 * vol_avg), 2) if vol_avg > 0 else 0
+                growing = v_last > v_prev * 1.10
+
+                already_moved = False
+                if len(candles) >= 9:
+                    far_open = float(candles[-9]["o"])
+                    if far_open > 0:
+                        far_chg = abs((alt_close - far_open) / far_open * 100)
+                        already_moved = far_chg > 2.0  # уже ушла на 2%+ за 30 минут — поздно
+
+                if growing and avg_rvol2 >= 1.2 and not already_moved:
                     signal_mode = "accumulation"
                     best_candle = candles[-2]  # последняя закрытая
-                    rvol = avg_rvol4
+                    rvol = avg_rvol2
 
             if signal_mode is None:
                 time.sleep(0.05); continue
@@ -853,7 +878,7 @@ def send_status(signal_count=0, btc_chg=None):
     ctx = get_market_context()
     btc_line = f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n" if btc_chg is not None else ""
     status = (
-        f"🤖 <b>Upscale Bot v7.2</b> | {now.strftime('%H:%M МСК')}\n"
+        f"🤖 <b>Upscale Bot v7.3</b> | {now.strftime('%H:%M МСК')}\n"
         f"✅ RS Momentum 15М (Лонг + Шорт)\n"
         f"{btc_line}"
         f"{ctx}\n"
@@ -866,7 +891,7 @@ def send_status(signal_count=0, btc_chg=None):
 
 def main():
     send_telegram(
-        "🚀 <b>Upscale Bot v7.2 запущен</b>\n"
+        "🚀 <b>Upscale Bot v7.3 запущен</b>\n"
         "📡 RS Momentum 15М — Лонг + Шорт\n"
         "📊 BTC контекст: 1D + 4H + 1H + EQH/EQL ликвидность\n"
         f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
@@ -875,12 +900,11 @@ def main():
     last_signal_count = 0
     last_btc          = None
     status_sent_hour  = -1
-    last_scan         = 0
+    last_scan_minute  = -1  # минута (0,5,10,15...) последнего скана — не даём повторить дважды
 
     while True:
         now_msk  = datetime.now(MSK)
         cur_hour = now_msk.hour
-        now_ts   = time.time()
 
         if cur_hour != status_sent_hour:
             send_status(last_signal_count, last_btc)
@@ -889,13 +913,18 @@ def main():
         if is_trading_hours():
             if is_dead_zone():
                 print(f"[LOOP] Мёртвая зона, скан пропущен ({msk_time_str()})")
-            elif now_ts - last_scan >= SCAN_INTERVAL * 60:
-                result = run_rs_momentum_scan()
-                if result:
-                    last_signal_count, last_btc = result
-                last_scan = now_ts
+            else:
+                # Скан строго на границе 5-минутной свечи (:00,:05,:10...),
+                # а не через 5 минут от старта бота — иначе теряем до 5 минут
+                # случайной задержки после закрытия каждой свечи.
+                aligned_minute = (now_msk.minute // SCAN_INTERVAL) * SCAN_INTERVAL
+                if now_msk.second < 15 and aligned_minute != last_scan_minute:
+                    result = run_rs_momentum_scan()
+                    if result:
+                        last_signal_count, last_btc = result
+                    last_scan_minute = aligned_minute
 
-        time.sleep(10)
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()
