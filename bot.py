@@ -593,12 +593,8 @@ def run_rs_momentum_scan():
 
             # ── Условие 1: ВЗРЫВ ──
             # Хотя бы одна из 3 последних закрытых свечей даёт RVOL >= порога.
-            # Берём МАКСИМАЛЬНЫЙ RVOL среди трёх — но если это не самая свежая
-            # свеча (-2), а более старая (-3/-4), и цена с тех пор уже заметно
-            # ушла — это устаревший взрыв, а не текущий момент. Пропускаем.
             best_candle = None
             best_rvol   = 0
-            best_idx    = None
             for idx in [-2, -3, -4]:
                 c = candles[idx]
                 v = float(c["v"])
@@ -606,40 +602,20 @@ def run_rs_momentum_scan():
                 if r_vol > best_rvol:
                     best_rvol   = r_vol
                     best_candle = c
-                    best_idx    = idx
 
             signal_mode = None
             if best_rvol >= RVOL_EXPLOSION_THRESHOLD:
-                stale_explosion = False
-                if best_idx != -2:
-                    spike_close = float(best_candle["c"])
-                    live_price  = float(candles[-1]["c"])
-                    if spike_close > 0:
-                        drift = abs((live_price - spike_close) / spike_close * 100)
-                        stale_explosion = drift > 1.0  # цена уже ушла 1%+ от взрывной свечи
-                if not stale_explosion:
-                    signal_mode = "explosion"
-                    rvol = best_rvol
+                signal_mode = "explosion"
+                rvol = best_rvol
 
             # ── Условие 2: НАКОПЛЕНИЕ ──
             # Объём второй свечи выше первой минимум на 10%, средний RVOL >= 1.2x.
-            # ВАЖНО: если цена уже прошла заметное расстояние за последние ~30 минут
-            # (8 свечей), значит настоящий взрыв был раньше и выпал из окна проверки —
-            # текущий сигнал был бы просто хвостом уже прошедшего движения. Пропускаем.
             if signal_mode is None:
                 v_prev = float(candles[-3]["v"])
                 v_last = float(candles[-2]["v"])
                 avg_rvol2 = round((v_prev + v_last) / (2 * vol_avg), 2) if vol_avg > 0 else 0
                 growing = v_last > v_prev * 1.10
-
-                already_moved = False
-                if len(candles) >= 9:
-                    far_open = float(candles[-9]["o"])
-                    if far_open > 0:
-                        far_chg = abs((alt_close - far_open) / far_open * 100)
-                        already_moved = far_chg > 2.0  # уже ушла на 2%+ за 30 минут — поздно
-
-                if growing and avg_rvol2 >= 1.2 and not already_moved:
+                if growing and avg_rvol2 >= 1.2:
                     signal_mode = "accumulation"
                     best_candle = candles[-2]  # последняя закрытая
                     rvol = avg_rvol2
