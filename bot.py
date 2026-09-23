@@ -1,11 +1,11 @@
 """
-Upscale Bot v8.0 — воронка из трёх ступеней (Gate.io USDT-фьючерсы):
-  ⏳ ЗАРЯД   — монета сжимается, объём/OI растут, цена стоит (ДО движения)
-  ⚡ ПРОБОЙ  — быстрый триггер по watchlist из ЗАРЯДа (1м свечи, каждые 20 сек)
-  🚀 ИМПУЛЬС — прежний RS Momentum (взрыв / разгон объёма) как подтверждение
+Upscale Bot v8.1 — воронка (Gate.io USDT-фьючерсы):
+  ⏳ ЗАРЯД   — сжатие, объём/OI растут, цена стоит (ДО движения): альты на 15м (окно 3ч), BTC на 1h (окно 12ч)
+  ⚡ ПРОБОЙ  — по закрытию 5м свечи за уровнем ЗАРЯДа на объёме ≥ нормы (проверка каждые 20 сек)
+  🚀 ИМПУЛЬС — RS Momentum на 5м, только оценка 🟢 8+ (страховка для движений без заряда)
 
-Все сигналы пишутся в CSV, через 60 минут бот сам считает исход
-(что было раньше: TP1 или стоп, максимальный ход в плюс/минус).
+Все сигналы пишутся в CSV; бот сам считает исход (TP1 или стоп первым, TP2 до стопа, ход в плюс/минус).
+Каждый день в 23:05 МСК — сводка и CSV-файлы в Telegram.
 Зависимости: только requests. Переменные окружения: TELEGRAM_TOKEN, LOG_DIR (необязательно).
 """
 
@@ -24,7 +24,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v8.0"
+BOT_VERSION    = "v8.1"
 
 TRADING_START_MSK = 4
 TRADING_END_MSK   = 22
@@ -36,8 +36,26 @@ GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 API_RATE_PER_SEC = 12      # общий лимит запросов к Gate (с запасом к публичному лимиту)
 SCAN_WORKERS     = 8       # параллельных потоков в основном скане
 
+# ── v8.1: таймфрейм ЗАРЯДа и ПРОБОЯ ──
+# Все окна ниже заданы в свечах, поэтому при смене таймфрейма растягиваются автоматически.
+# "5m" = как в v8.0 (узкие диапазоны, маленькие цели); "15m" = диапазоны и цели шире; "1h" — ещё шире, сигналов мало.
+CHARGE_TF        = "15m"
+TF_MIN           = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}[CHARGE_TF]
+MOMENTUM_ENABLED   = True      # 🚀 ИМПУЛЬС — страховка для движений без предварительного ЗАРЯДа (всегда на 5м свечах)
+MOMENTUM_MIN_SCORE = 8         # слать только 🟢 Сильный (8+); 5 — ещё и 🟡 Нормальный
+
+def fmt_minutes(m: float) -> str:
+    """180 → «3ч», 90 → «1.5ч», 30 → «30м»."""
+    if m >= 2880:
+        d = m / 1440
+        return f"{d:.0f} дн" if d == int(d) else f"{d:.1f} дн"
+    if m >= 60:
+        h = m / 60
+        return f"{h:.0f}ч" if h == int(h) else f"{h:.1f}ч"
+    return f"{m:.0f}м"
+
 # ── RS Momentum (ИМПУЛЬС) ──
-SCAN_INTERVAL        = 5       # минут (5M таймфрейм)
+SCAN_INTERVAL        = 5 if MOMENTUM_ENABLED else TF_MIN  # ИМПУЛЬС — каждые 5 мин, ЗАРЯД — на границе своего таймфрейма
 BTC_DECORR_THRESHOLD = 1.5     # % раскорр для лонга
 BTC_DECORR_SHORT     = -1.5    # % раскорр для шорта
 DECORR_WATCH         = 1.0     # % сниженный порог для монет из watchlist ЗАРЯДа
@@ -52,47 +70,77 @@ STOP_PCT             = -3.0    # % аварийный потолок стопа
 STOP_PCT_BASE        = 1.5     # % базовый стоп
 ATR_STOP_MULT        = 1.0
 ATR_TP2_MULT         = 2.0
-TOP_N                = 3
-MOMENTUM_COOLDOWN_MIN = 30     # не повторять ту же монету/сторону чаще (если оценка не выросла на 2+)
+TOP_N                = 2       # максимум импульсов одной стороны за скан
+MOMENTUM_COOLDOWN_MIN = 120    # по отчёту v8.0 повторные сигналы хуже первых (47% против 58% TP1)
 
 # ── Свечи / база объёма ──
-CANDLES_LIMIT    = 300         # 5м свечей (~25ч)
-BASE_FROM        = 84          # база объёма: закрытые свечи [-84 : -12] = 6 часов,
-BASE_TO          = 12          # заканчиваются час назад (не включают проверяемые свечи)
-SWING_LOOKBACK   = 144         # 12 часов для свинг-уровней
+CANDLES_LIMIT    = 300         # свечей таймфрейма (15м → ~3 суток)
+BASE_FROM        = 84          # база объёма: закрытые свечи [-84 : -12] (15м → 18ч,
+BASE_TO          = 12          # заканчиваются 3ч назад — не включают проверяемые свечи)
+SWING_LOOKBACK   = 144         # свечей для свинг-уровней и процентиля BB (15м → 36ч)
 
 # ── ЗАРЯД (накопление) ──
-ACC_WINDOW        = 12         # 12 × 5м = 1 час
-ACC_FLAT_ATR      = 2.0        # |изменение цены за час| ≤ 2 × нормальный ATR
-ACC_MAX_RANGE_PCT = 5.0        # диапазон часа не шире 5%
-ACC_SQUEEZE_PCTL  = 35         # ширина Боллинджера в нижних 35% за 12ч
+ACC_WINDOW        = 12         # свечей в окне заряда (15м → 3 часа)
+WIN_MIN           = ACC_WINDOW * TF_MIN          # окно заряда в минутах
+HALF_MIN          = WIN_MIN // 2                 # половина окна (для объёма)
+WIN_TXT, HALF_TXT = fmt_minutes(WIN_MIN), fmt_minutes(HALF_MIN)
+ACC_FLAT_ATR      = 2.0        # |изменение цены за окно| ≤ 2 × нормальный ATR
+ACC_MAX_RANGE_PCT = 5.0        # диапазон окна не шире 5%
+ACC_SQUEEZE_PCTL  = 35         # ширина Боллинджера в нижних 35% за SWING_LOOKBACK свечей
 ACC_TR_RATIO_MAX  = 0.75       # или средний диапазон свечей ≤ 75% от нормы
-ACC_RVOL_MIN      = 1.3        # объём за 30 мин ≥ 1.3× нормы
-ACC_OI_PREFILTER  = 1.5        # или OI за час ≥ +1.5% (по тикерам)
+ACC_RVOL_MIN      = 1.3        # объём второй половины окна ≥ 1.3× нормы
+ACC_OI_PREFILTER  = 1.5        # или OI за окно ≥ +1.5% (по тикерам)
 ACC_MIN_SCORE     = 6          # минимальная сила заряда для алерта
 ACC_MAX_SCORE     = 12
 ACC_REALERT_DELTA = 2          # повторный алерт, только если сила выросла на 2+
 
+# ── Профили таймфрейма: у каждого ЗАРЯДа свой (альты — CHARGE_TF, BTC — BTC_CHARGE_TF) ──
+BTC_CHARGE_ENABLED = True
+BTC_CHARGE_TF      = "1h"      # BTC движется медленнее альтов — на 1h диапазоны 1–3%, пробои крупнее
+
+def tf_profile(tf: str) -> dict:
+    m = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}[tf]
+    win = ACC_WINDOW * m
+    return {
+        "tf": tf, "tf_min": m, "win_min": win, "win_txt": fmt_minutes(win),
+        "half_txt": fmt_minutes(win // 2), "swing_txt": fmt_minutes(SWING_LOOKBACK * m),
+        "watch_ttl_min": 16 * m,                       # сколько живёт в watchlist (15м → 4ч, 1h → 16ч)
+        "eval_window": min(24 * m, 1800) * 60,         # оценка заряда по ценам (15м → 6ч, 1h → 24ч)
+        "follow_min": 12 * m,                          # ход после выхода (15м → 3ч, 1h → 12ч)
+        "horizon": min(12 * m, 1800) * 60,             # оценка сигнала (5м → 1ч, 15м → 3ч, 1h → 12ч)
+        "cooldown_min": max(120, 3 * m),               # пауза после пробоя (15м → 2ч, 1h → 3ч)
+    }
+ACC_REALERT_MIN   = 30         # повтор из-за смены уклона — не чаще раза в 30 мин (v8.0 спамил)
+
 # ── ПРОБОЙ (быстрый триггер) ──
 FAST_INTERVAL_SEC = 20         # опрос watchlist
-WATCH_TTL_MIN     = 120        # сколько живёт ЗАРЯД в watchlist
+WATCH_TTL_MIN     = 16 * TF_MIN  # сколько живёт ЗАРЯД в watchlist (15м → 4ч)
 WATCH_MAX         = 15
 BREAK_BUFFER      = 0.001      # 0.1% за уровень, чтобы не ловить касания
-FAST_PACE_STRONG  = 3.0        # темп объёма ≥3× — сигнал сразу
-FAST_PACE_MIN     = 1.2        # темп ≥1.2× — сигнал после удержания за уровнем
-BREAK_STOP_MIN    = 0.6        # % минимальный стоп пробоя
-BREAKOUT_COOLDOWN_MIN = 45
+# v8.1: ⚡ПРОБОЙ только по ЗАКРЫТИЮ 5м свечи за уровнем (в v8.0 — касание цены на 1м:
+# 47% пробоев возвращались в диапазон за 15 мин). Проверка по-прежнему каждые 20с,
+# поэтому сигнал приходит через несколько секунд после закрытия свечи.
+BREAK_CONFIRM_TF  = "5m"
+BREAK_CONFIRM_SEC = 300
+BREAK_MIN_RVOL    = 1.2        # объём свечи пробоя ≥1.2× нормы, иначе пробой «на пустом месте» — не шлём
+BREAK_STOP_MIN    = 0.8        # % минимальный стоп пробоя (0.6% выбивало шумом)
+TP1_MIN_RR        = 1.0        # TP1 не ближе 1× расстояния до стопа
+TP2_MIN_RR        = 2.0        # TP2 не ближе 2× расстояния до стопа
+BREAKOUT_COOLDOWN_MIN = max(120, 3 * TF_MIN)  # повторы хуже первых сигналов — пауза 2ч; у BTC своя в профиле
 
 # ── Логирование исходов ──
 LOG_DIR          = os.environ.get("LOG_DIR", ".")
 SIGNALS_CSV      = os.path.join(LOG_DIR, "signals_v8.csv")
 OUTCOMES_CSV     = os.path.join(LOG_DIR, "outcomes_v8.csv")
-OUTCOME_HORIZON  = 3600        # оцениваем через 60 минут
+OUTCOME_HORIZON  = 12 * TF_MIN * 60   # горизонт оценки сигнала (15м → 3ч, цели дальше)
 CHARGES_CSV          = os.path.join(LOG_DIR, "charges_v8.csv")
 CHARGE_OUTCOMES_CSV  = os.path.join(LOG_DIR, "charge_outcomes_v8.csv")
-CHARGE_EVAL_WINDOW   = 7200    # заряд оцениваем по ценам за 2 часа после первого алерта
-CHARGE_FOLLOW_MIN    = 60      # насколько ушла цена за 60 мин после выхода из диапазона
+CHARGE_EVAL_WINDOW   = 24 * TF_MIN * 60   # заряд оцениваем по ценам за это время после алерта (15м → 6ч)
+CHARGE_FOLLOW_MIN    = 12 * TF_MIN        # насколько ушла цена после выхода из диапазона (15м → 3ч)
 CHARGE_RETURN_MIN    = 15      # возврат внутрь диапазона за 15 мин = ложный выход
+ALT_P = tf_profile(CHARGE_TF)
+BTC_P = tf_profile(BTC_CHARGE_TF)
+MOM_P = tf_profile("5m")        # ИМПУЛЬС всегда на 5м — его горизонт оценки 1ч
 
 # ─── UPSCALE PAIRS ────────────────────────────────────────────────────────────
 
@@ -115,7 +163,7 @@ UPSCALE_PAIRS = [
 WATCHLIST: dict = {}          # sym -> данные ЗАРЯДа (уровни, база объёма, свинги...)
 LAST_SENT: dict = {}          # (kind, sym, side) -> (ts, score)
 OI_TICKER_HIST: list = []     # [(ts, {sym: oi})] — запасной источник OI (≤75 мин)
-LAST_BTC = {"chg15": 0.0, "chg1h": 0.0, "ts": 0}
+LAST_BTC = {"chg15": 0.0, "chgwin": 0.0, "ts": 0}
 PENDING_OUTCOMES: list = []
 DAY_RESULTS: list = []
 CHARGE_PENDING: list = []     # эпизоды зарядов, ждущие оценки
@@ -362,7 +410,8 @@ def get_gate_tickers() -> dict:
 
 def push_oi_snapshot(ticker_data: dict, now_ts: float):
     OI_TICKER_HIST.append((now_ts, {s: d["oi"] for s, d in ticker_data.items()}))
-    while OI_TICKER_HIST and now_ts - OI_TICKER_HIST[0][0] > 75 * 60:
+    keep = max(ALT_P["win_min"], BTC_P["win_min"] if BTC_CHARGE_ENABLED else 0) + 20
+    while OI_TICKER_HIST and now_ts - OI_TICKER_HIST[0][0] > keep * 60:
         OI_TICKER_HIST.pop(0)
 
 def ticker_oi_change(sym: str, minutes: int):
@@ -382,8 +431,11 @@ def ticker_oi_change(sym: str, minutes: int):
 
 # ─── GATE: статистика контракта (OI-история, taker L/S, ликвидации) ─────────
 
-def get_contract_stats(sym: str):
-    data = api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": "5m", "limit": 16})
+def get_contract_stats(sym: str, win_min: int = WIN_MIN):
+    # длинные окна (BTC 1h → 12ч) — по часовым строкам, иначе 5-минутных понадобилось бы 150+
+    iv_min = 5 if win_min <= 360 else 60
+    data = api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": f"{iv_min}m" if iv_min < 60 else "1h",
+                                      "limit": max(16, win_min // iv_min + 4)})
     if not isinstance(data, list) or len(data) < 2:
         return None
     rows = []
@@ -417,13 +469,19 @@ def get_contract_stats(sym: str):
         return round(math.exp(sum(math.log(v) for v in vals) / len(vals)), 2)  # геометрическое среднее
 
     hour_rows = [r for r in rows if r["t"] > last["t"] - 3600]
+    win_rows  = [r for r in rows if r["t"] > last["t"] - win_min * 60]
+    fine = iv_min == 5    # 15-минутные значения есть только на 5-минутных строках
     return {
-        "oi_15m": oi_change(900),
+        "oi_15m": oi_change(900) if fine else None,
         "oi_1h":  oi_change(3600),
-        "taker_15m": taker_avg(900),
+        "oi_win": oi_change(win_min * 60),
+        "taker_15m": taker_avg(900) if fine else None,
         "taker_1h":  taker_avg(3600),
+        "taker_win": taker_avg(win_min * 60),
         "liq_long_1h":  sum(r["liq_l"] for r in hour_rows),
         "liq_short_1h": sum(r["liq_s"] for r in hour_rows),
+        "liq_long_win":  sum(r["liq_l"] for r in win_rows),
+        "liq_short_win": sum(r["liq_s"] for r in win_rows),
     }
 
 def get_trade_delta(sym: str, seconds: int = 120):
@@ -491,15 +549,84 @@ def format_liq_line(eq_highs, eq_lows, price, tf_label):
         parts.append("🎯 ⬇️ вниз")
     return f"   {tf_label}: " + " | ".join(parts) if parts else ""
 
+BTC_BREAK_LOOKBACK = 12   # пробой 1h = закрытие часа выше максимума / ниже минимума предыдущих 12 часов
+BTC_BREAK_MIN_ATR  = 0.25 # ...с запасом не меньше 0.25 часового ATR (и не меньше 0.1%)
+
+def find_last_btc_break(c1h_closed: list):
+    """Последний часовой пробой BTC по свечам (работает и сразу после перезапуска бота)."""
+    N = BTC_BREAK_LOOKBACK
+    trs = true_ranges(c1h_closed)
+    for i in range(len(c1h_closed) - 1, N, -1):
+        c = c1h_closed[i]
+        prev = c1h_closed[i - N:i]
+        atr = sum(trs[i - N:i]) / N
+        margin = max(0.001 * c["c"], BTC_BREAK_MIN_ATR * atr)   # копеечный выход за край — не пробой
+        if c["c"] > max(x["h"] for x in prev) + margin:
+            side = "long"
+        elif c["c"] < min(x["l"] for x in prev) - margin:
+            side = "short"
+        else:
+            continue
+        return {"side": side, "t": c["t"] + 3600, "p": c["c"], "src": "свечи"}
+    return None
+
 def get_market_context() -> str:
+    """Общий блок BTC + всегда свежая строка статуса 1h (пробой / зарядка) + ликвидность."""
+    base = _market_base()
+    return base + btc_1h_status() + _market_cache.get("liq_text", "")
+
+def fmt_ago(ts: float) -> str:
+    mins = max(0, (time.time() - ts) / 60)
+    when = datetime.fromtimestamp(ts, MSK)
+    day = "" if when.date() == datetime.now(MSK).date() else when.strftime("%d.%m ")
+    return f"{day}{when.strftime('%H:%M')} ({fmt_minutes(mins)} назад)" if mins >= 1 else f"{when.strftime('%H:%M')} (только что)"
+
+def btc_1h_status() -> str:
+    lines = []
+    br = _market_cache.get("btc_break")
+    # собственный ⚡ПРОБОЙ BTC точнее по времени, чем закрытие часовой свечи
+    own = [(v[0], k[2]) for k, v in LAST_SENT.items() if k[0] == "breakout" and k[1] == "BTC"]
+    if own:
+        ts, side = max(own)
+        if not br or ts > br["t"]:
+            br = {"side": side, "t": ts, "p": LAST_BTC.get("price_at_break", {}).get(side), "src": "сигнал бота"}
+    price = LAST_BTC.get("price") or _market_cache.get("btc_price") or 0
+    if br:
+        up = br["side"] == "long"
+        since = ""
+        if br.get("p") and price:
+            since = f", с тех пор BTC {pct(br['p'], price):+.2f}%"
+        lines.append(f"   1H пробой: {'⬆️ вверх' if up else '⬇️ вниз'} {fmt_ago(br['t'])}{since}")
+    else:
+        lines.append("   1H пробой: за последние 3 суток не было")
+    w = WATCHLIST.get("BTC")
+    if w:
+        bl, bs = w.get("bl", 0), w.get("bs", 0)
+        p_up = (bl + 1) / (bl + bs + 2) * 100          # сглаживание: без признаков — 50/50, не бывает 0% и 100%
+        if p_up >= 58:   where = "⬆️ вероятнее вверх"
+        elif p_up <= 42: where = "⬇️ вероятнее вниз"
+        else:            where = "↔️ направление неясно"
+        lines.append(f"   ⏳ 1H зарядка: {w['lo']:,.0f}–{w['hi']:,.0f} (ширина {w['rng_pct']:.2f}%), сила {w['score']}/{ACC_MAX_SCORE}")
+        lines.append(f"      {where}: {p_up:.0f}% / {100 - p_up:.0f}% (признаков вверх {bl}, вниз {bs})")
+    elif br and time.time() - br["t"] > 12 * 3600:
+        lines.append("   ⏳ 1H: давно без пробоя, заряда сейчас нет — BTC в стороне")
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+def _market_base() -> str:
     now_ts = time.time()
     if now_ts - _market_cache["updated_at"] < 900 and _market_cache["text"]:
         return _market_cache["text"]
     try:
         c1d = get_candles("BTC", "1d", 210)
         c4h = get_candles("BTC", "4h", 100)
-        c15 = get_candles("BTC", "15m", 10)
-        c15_closed, _, _ = split_closed(c15, 900, now_ts)
+        try:   # сбой часовых свечей не должен ломать 1D/4H — от 4H зависят оценки сигналов
+            c1h = get_candles("BTC", "1h", 80)
+            c1h_closed, _, p1h = split_closed(c1h, 3600, now_ts)
+            _market_cache["btc_break"] = find_last_btc_break(c1h_closed)
+            if p1h:
+                _market_cache["btc_price"] = p1h
+        except Exception as e:
+            print(f"[MARKET 1H ERROR] {e}")
 
         d_bias, price = "❓", 0
         if len(c1d) >= 60:
@@ -533,23 +660,9 @@ def get_market_context() -> str:
             sh4, sl4 = find_swings(hi4, lo4, left=2, right=2)
             h4_liq = format_liq_line(find_eq_levels(sh4, p4, True), find_eq_levels(sl4, p4, False), p4, "4H")
 
-        m15_line = ""
-        if len(c15_closed) >= 3:
-            last3 = c15_closed[-3:]
-            arrows = []
-            for c in last3:
-                chg = pct(c["o"], c["c"])
-                arrows.append(("⬆️" if chg > 0.05 else "⬇️" if chg < -0.05 else "➡️") + f"{chg:+.2f}%")
-            total = pct(last3[0]["o"], last3[-1]["c"])
-            te = "⬆️" if total > 0.05 else ("⬇️" if total < -0.05 else "➡️")
-            m15_line = f"   15М (45 мин): {' → '.join(arrows)} | Итого: {te}{total:+.2f}%"
-
         lines = [f"📊 BTC: {price:,.0f} USDT" if price else "📊 BTC: —",
                  f"   1D: {d_bias}", f"   4H: {h4_bias}"]
-        if m15_line: lines.append(m15_line)
-        if h4_liq:
-            lines.append("💧 BTC ликвидность 4H:")
-            lines.append(h4_liq)
+        _market_cache["liq_text"] = ("\n💧 BTC ликвидность 4H:\n" + h4_liq) if h4_liq else ""
         # FIX v8: раньше словарь перезаписывался целиком и h4_bias терялся —
         # оценка тренда BTC 4H в анализе всегда была «неопределён».
         _market_cache.update({"text": "\n".join(lines), "updated_at": now_ts, "h4_bias": h4_bias})
@@ -599,7 +712,9 @@ def log_signal(kind: str, s: dict, side: str, score: int):
         "kind": kind, "symbol": s["symbol"], "side": side, "score": score,
         "price": s["price"], "stop": s["stop"], "tp1": s["tp1_price"], "tp2": s["tp2_price"],
         "rvol": s.get("rvol", ""), "decorr": round(s.get("decorr", 0), 2),
-        "oi_15m": s.get("oi_15m", ""), "oi_1h": s.get("oi_1h", ""),
+        "oi_15m": s.get("oi_15m", ""), "oi_1h": s.get("oi_1h", ""), "oi_win": s.get("oi_win", ""),
+        "stop_pct": round(s.get("stop_pct", 0), 2), "tp1_pct": round(s.get("tp1_pct", 0), 2),
+        "tp2_pct": round(s.get("tp2_pct", 0), 2), "tf": s.get("tf", "5m"),
         "taker": s.get("taker_15m", ""), "funding": round(s.get("funding", 0), 4),
         "ch24": round(s.get("change_24h", 0), 2), "from_charge": s.get("from_charge", False),
         "charge_score": s.get("charge_score", ""), "charge_side": s.get("charge_side", ""),
@@ -609,35 +724,50 @@ def log_signal(kind: str, s: dict, side: str, score: int):
     _append_csv(SIGNALS_CSV, row)
     PENDING_OUTCOMES.append({"id": sid, "kind": kind, "symbol": s["symbol"], "side": side,
                              "score": score, "entry": s["price"], "stop": s["stop"],
-                             "tp1": s["tp1_price"], "ts": now_ts})
+                             "tp1": s["tp1_price"], "tp2": s["tp2_price"], "ts": now_ts,
+                             "horizon": s.get("horizon", MOM_P["horizon"])})
 
 def evaluate_outcome(p: dict):
     raw = api_get("candlesticks", {"contract": f"{p['symbol']}_USDT", "interval": "1m",
-                                   "from": int(p["ts"]), "to": int(p["ts"] + OUTCOME_HORIZON)})
+                                   "from": int(p["ts"]), "to": int(p["ts"] + p.get("horizon", OUTCOME_HORIZON))})
     # свеча, в которой пришёл сигнал, началась раньше входа — её не учитываем
     candles = [c for c in parse_candles(raw) if c["t"] >= p["ts"] - 1]
     if not candles:
         return None
     is_long = p["side"] == "long"
     entry = p["entry"]
-    first, close30 = "none", None
+    first, close30, close60 = "none", None, None
+    tp2_first, stopped = False, False
+    tp2 = p.get("tp2")
     for c in candles:
         stop_hit = c["l"] <= p["stop"] if is_long else c["h"] >= p["stop"]
         tp_hit   = c["h"] >= p["tp1"]  if is_long else c["l"] <= p["tp1"]
         if first == "none":
             if stop_hit:  first = "stop"       # обе цели в одной свече — считаем стоп (консервативно)
             elif tp_hit:  first = "tp1"
+        # TP2 до исходного стопа (консервативно, без переноса в безубыток)
+        if not stopped and not tp2_first and tp2:
+            if stop_hit:
+                stopped = True
+            elif (c["h"] >= tp2 if is_long else c["l"] <= tp2):
+                tp2_first = True
         if close30 is None and c["t"] >= p["ts"] + 1800:
             close30 = c["c"]
+        if close60 is None and c["t"] >= p["ts"] + 3600:
+            close60 = c["c"]
     hi = max(c["h"] for c in candles); lo = min(c["l"] for c in candles)
     mfe = pct(entry, hi) if is_long else -pct(entry, lo)
     mae = pct(entry, lo) if is_long else -pct(entry, hi)
     sign = 1 if is_long else -1
     r30 = sign * pct(entry, close30) if close30 else None
-    r60 = sign * pct(entry, candles[-1]["c"])
+    r60 = sign * pct(entry, close60) if close60 else None
+    r_end = sign * pct(entry, candles[-1]["c"])
     return {"id": p["id"], "kind": p["kind"], "symbol": p["symbol"], "side": p["side"],
             "score": p["score"], "first_hit": first, "mfe_pct": round(mfe, 2), "mae_pct": round(mae, 2),
-            "ret_30m": round(r30, 2) if r30 is not None else "", "ret_60m": round(r60, 2),
+            "tp2_before_stop": tp2_first,
+            "ret_30m": round(r30, 2) if r30 is not None else "",
+            "ret_60m": round(r60, 2) if r60 is not None else "",
+            "ret_end": round(r_end, 2), "horizon_min": p.get("horizon", OUTCOME_HORIZON) // 60,
             "date": datetime.fromtimestamp(p["ts"], MSK).strftime("%Y-%m-%d")}
 
 def log_charge(c: dict):
@@ -650,16 +780,18 @@ def log_charge(c: dict):
         "hi": c["hi"], "lo": c["lo"], "range_pct": round(c["rng_pct"], 2), "price": c["price"],
         "pos_in_range": round(c["pos"], 2),
         "bb_pctl": round(c["sq_pct"], 1) if c["sq_pct"] is not None else "",
-        "tr_ratio": round(c["tr_ratio"], 2), "rvol30m": round(c["rvol6"], 2), "vol_rising": c["vol_rising"],
-        "oi_1h": c["oi_1h"] if c["oi_1h"] is not None else "",
+        "tr_ratio": round(c["tr_ratio"], 2), "rvol_half": round(c["rvol_half"], 2), "vol_rising": c["vol_rising"],
+        "oi_win": c["oi_win"] if c["oi_win"] is not None else "",
         "oi_15m": c["oi_15m"] if c["oi_15m"] is not None else "",
-        "taker_1h": c["taker_1h"] if c["taker_1h"] is not None else "",
-        "funding": round(c["funding"], 4), "chg_1h": round(c["chg_1h"], 2), "ch24": round(c["change_24h"], 2),
-        "h4": _market_cache.get("h4_bias", ""), "btc_1h": round(LAST_BTC["chg1h"], 2),
+        "taker_win": c["taker_win"] if c["taker_win"] is not None else "",
+        "funding": round(c["funding"], 4), "chg_win": round(c["chg_win"], 2), "ch24": round(c["change_24h"], 2),
+        "h4": _market_cache.get("h4_bias", ""), "btc_win": round(LAST_BTC["chgwin"], 2) if c["symbol"] != "BTC" else "",
+        "tf": c["P"]["tf"], "window_min": c["P"]["win_min"],
     }
     _append_csv(CHARGES_CSV, row)
     ep = {"id": cid, "symbol": c["symbol"], "bias": c["side"], "score": c["score"], "max_score": c["score"],
           "hi": c["hi"], "lo": c["lo"], "height": c["height"], "ts": now_ts,
+          "eval_window": c["P"]["eval_window"], "follow_min": c["P"]["follow_min"], "tf": c["P"]["tf"],
           "bot_signal": "", "side_changes": 0}
     CHARGE_PENDING.append(ep)
     CHARGE_ACTIVE[c["symbol"]] = ep
@@ -669,7 +801,7 @@ def evaluate_charge(ep: dict):
     вышла ли цена из диапазона, куда, когда, насколько далеко и не вернулась ли назад.
     Уровни — те, что были в первом алерте (по ним трейдер ставил алерты)."""
     raw = api_get("candlesticks", {"contract": f"{ep['symbol']}_USDT", "interval": "1m",
-                                   "from": int(ep["ts"]), "to": int(ep["ts"] + CHARGE_EVAL_WINDOW)})
+                                   "from": int(ep["ts"]), "to": int(ep["ts"] + ep["eval_window"])})
     candles = [c for c in parse_candles(raw) if c["t"] >= ep["ts"] - 1]
     if not candles:
         return None
@@ -691,13 +823,13 @@ def evaluate_charge(ep: dict):
            "score": ep["score"], "max_score": ep["max_score"], "broke": broke,
            "break_min": "", "matched_bias": "", "follow_pct": "", "follow_heights": "",
            "reached_1x": "", "returned_15m": "", "adverse_pct": "", "bot_signal": ep["bot_signal"],
-           "date": datetime.fromtimestamp(ep["ts"], MSK).strftime("%Y-%m-%d")}
+           "tf": ep.get("tf", ""), "date": datetime.fromtimestamp(ep["ts"], MSK).strftime("%Y-%m-%d")}
     if broke in ("up", "down"):
         bc = candles[bi]
         res["break_min"] = round((bc["t"] - ep["ts"]) / 60, 1)
         if ep["bias"] != "both":
             res["matched_bias"] = (broke == "up") == (ep["bias"] == "long")
-        after = [c for c in candles[bi:] if c["t"] <= bc["t"] + CHARGE_FOLLOW_MIN * 60]
+        after = [c for c in candles[bi:] if c["t"] <= bc["t"] + ep["follow_min"] * 60]
         early = [c for c in candles[bi:] if c["t"] <= bc["t"] + CHARGE_RETURN_MIN * 60]
         if broke == "up":
             ext = max(c["h"] for c in after) - hi
@@ -722,7 +854,7 @@ def process_outcomes(max_items: int = 5):
     for p in list(PENDING_OUTCOMES):
         if done >= max_items:
             break
-        if now_ts < p["ts"] + OUTCOME_HORIZON + 90:
+        if now_ts < p["ts"] + p.get("horizon", OUTCOME_HORIZON) + 90:
             continue
         PENDING_OUTCOMES.remove(p)
         try:
@@ -737,7 +869,7 @@ def process_outcomes(max_items: int = 5):
     for ep in list(CHARGE_PENDING):
         if done >= max_items:
             break
-        if now_ts < ep["ts"] + CHARGE_EVAL_WINDOW + 90:
+        if now_ts < ep["ts"] + ep["eval_window"] + 90:
             continue
         CHARGE_PENDING.remove(ep)
         if CHARGE_ACTIVE.get(ep["symbol"]) is ep:
@@ -754,7 +886,7 @@ def process_outcomes(max_items: int = 5):
 
 def send_daily_summary():
     today = datetime.now(MSK).strftime("%Y-%m-%d")
-    # берём всё, что оценено с прошлой сводки: заряды оцениваются через 2ч,
+    # берём всё, что оценено с прошлой сводки: заряды оцениваются через CHARGE_EVAL_WINDOW,
     # поэтому поздние вчерашние заряды попадают в сегодняшнюю сводку, а не теряются
     res = list(DAY_RESULTS)
     lines = [f"📒 <b>Итог дня {today}</b> (оценено с прошлой сводки)"]
@@ -765,7 +897,7 @@ def send_daily_summary():
         n = len(ch)
         brk = [r for r in ch if r["broke"] in ("up", "down")]
         nb = len(brk)
-        line = f"⏳ ЗАРЯД: {n} | выход из диапазона за 2ч: {nb} ({nb/n*100:.0f}%)"
+        line = f"⏳ ЗАРЯД: {n} | вышли из диапазона: {nb} ({nb/n*100:.0f}%)"
         dirn = [r for r in brk if r["matched_bias"] != ""]
         if dirn:
             ok = sum(1 for r in dirn if r["matched_bias"])
@@ -786,8 +918,10 @@ def send_daily_summary():
         st = sum(1 for r in rs if r["first_hit"] == "stop")
         mfe = sum(r["mfe_pct"] for r in rs) / n
         mae = sum(r["mae_pct"] for r in rs) / n
+        t2 = sum(1 for r in rs if r.get("tp2_before_stop"))
         lines.append(f"{names[kind]}: {n} сигн. | TP1 первым {tp} ({tp/n*100:.0f}%) | "
-                     f"стоп первым {st} ({st/n*100:.0f}%) | ср. макс. ход {mfe:+.2f}% / просадка {mae:+.2f}%")
+                     f"стоп первым {st} ({st/n*100:.0f}%) | TP2 до стопа {t2} ({t2/n*100:.0f}%) | "
+                     f"ср. макс. ход {mfe:+.2f}% / просадка {mae:+.2f}%")
     lines.append("📎 Файлы с подробностями — ниже (накопительные, с начала работы после последнего деплоя).")
     send_telegram("\n".join(lines))
     DAY_RESULTS.clear()
@@ -836,8 +970,9 @@ def structure_targets(price: float, is_long: bool, swings: list, atr: float):
 #  ⏳ ЗАРЯД — поиск накопления ДО движения
 # ═════════════════════════════════════════════════════════════════════════════
 
-def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache):
+def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache, P=ALT_P):
     W = ACC_WINDOW
+    WT, HT = P["win_txt"], P["half_txt"]
     if len(closed) < 60 or atr_norm <= 0 or baseline <= 0:
         return None
     win = closed[-W:]
@@ -848,7 +983,7 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
     height = hi - lo
     rng_pct = height / lo * 100
     move = win[-1]["c"] - win[0]["o"]
-    chg_1h = pct(win[0]["o"], win[-1]["c"])
+    chg_win = pct(win[0]["o"], win[-1]["c"])
 
     # 1) Цена стоит
     if abs(move) > ACC_FLAT_ATR * atr_norm or rng_pct > ACC_MAX_RANGE_PCT:
@@ -862,50 +997,51 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
     if not squeezed:
         return None
     # 3) Объём или OI растут
-    vol6      = sum(c["v"] for c in win[-6:]) / 6
-    vol_prev6 = sum(c["v"] for c in win[:6]) / 6
-    rvol6 = vol6 / baseline
-    vol_rising = vol_prev6 > 0 and vol6 > vol_prev6 * 1.15
-    oi_1h_tk = ticker_oi_change(sym, 60)
-    if not (rvol6 >= ACC_RVOL_MIN or (oi_1h_tk is not None and oi_1h_tk >= ACC_OI_PREFILTER)):
+    half = W // 2
+    vol_half  = sum(c["v"] for c in win[-half:]) / half
+    vol_prevh = sum(c["v"] for c in win[:half]) / half
+    rvol_half = vol_half / baseline
+    vol_rising = vol_prevh > 0 and vol_half > vol_prevh * 1.15
+    oi_win_tk = ticker_oi_change(sym, P["win_min"])
+    if not (rvol_half >= ACC_RVOL_MIN or (oi_win_tk is not None and oi_win_tk >= ACC_OI_PREFILTER)):
         return None
 
     stats = stats_cache(sym)
-    oi_1h  = stats["oi_1h"]  if stats and stats["oi_1h"]  is not None else oi_1h_tk
+    oi_win = stats["oi_win"] if stats and stats["oi_win"] is not None else oi_win_tk
     oi_15m = stats["oi_15m"] if stats and stats["oi_15m"] is not None else ticker_oi_change(sym, 15)
-    taker_1h = stats["taker_1h"] if stats else None
+    taker_win = stats["taker_win"] if stats else None
     funding = tick.get("funding", 0)
 
     score, plus, minus = 0, [], []
 
     if sq_pct is not None and sq_pct <= 15:
-        score += 2; plus.append(f"сильное сжатие (ширина BB в нижних {sq_pct:.0f}% за 12ч)")
+        score += 2; plus.append(f"сильное сжатие (ширина BB в нижних {sq_pct:.0f}% за {P['swing_txt']})")
     elif sq_pct is not None and sq_pct <= ACC_SQUEEZE_PCTL:
         score += 1; plus.append(f"сжатие (ширина BB в нижних {sq_pct:.0f}%)")
     if tr_ratio <= 0.6:
         score += 1; plus.append(f"свечи сузились до {tr_ratio*100:.0f}% от нормы")
 
-    if rvol6 >= 2:
-        score += 2; plus.append(f"объём 30 мин {rvol6:.1f}× нормы при стоящей цене — поглощение")
-    elif rvol6 >= ACC_RVOL_MIN:
-        score += 1; plus.append(f"объём 30 мин {rvol6:.1f}× нормы")
+    if rvol_half >= 2:
+        score += 2; plus.append(f"объём за {HT} {rvol_half:.1f}× нормы при стоящей цене — поглощение")
+    elif rvol_half >= ACC_RVOL_MIN:
+        score += 1; plus.append(f"объём за {HT} {rvol_half:.1f}× нормы")
     else:
-        minus.append(f"объём обычный ({rvol6:.1f}×) — заряд держится на OI")
+        minus.append(f"объём обычный ({rvol_half:.1f}×) — заряд держится на OI")
     if vol_rising:
         score += 1; plus.append("объём нарастает внутри диапазона")
 
-    if oi_1h is None:
+    if oi_win is None:
         minus.append("нет данных OI — заряд не подтверждён позициями")
-    elif oi_1h >= 4:
-        score += 3; plus.append(f"OI +{oi_1h}% за час без движения цены — крупный набор позиций")
-    elif oi_1h >= 2:
-        score += 2; plus.append(f"OI +{oi_1h}% за час — позиции набираются")
-    elif oi_1h >= 1:
-        score += 1; plus.append(f"OI слегка растёт (+{oi_1h}%)")
-    elif oi_1h <= -2:
-        score -= 2; minus.append(f"OI падает ({oi_1h}%) — это выход из позиций, а не накопление")
+    elif oi_win >= 4:
+        score += 3; plus.append(f"OI +{oi_win}% за {WT} без движения цены — крупный набор позиций")
+    elif oi_win >= 2:
+        score += 2; plus.append(f"OI +{oi_win}% за {WT} — позиции набираются")
+    elif oi_win >= 1:
+        score += 1; plus.append(f"OI слегка растёт (+{oi_win}% за {WT})")
+    elif oi_win <= -2:
+        score -= 2; minus.append(f"OI падает ({oi_win}%) — это выход из позиций, а не накопление")
     else:
-        minus.append(f"OI стоит ({oi_1h:+}%)")
+        minus.append(f"OI стоит ({oi_win:+}% за {WT})")
 
     # ── Направление: кто кого поглощает ──
     bl, bs, dir_notes = 0, 0, []
@@ -918,25 +1054,27 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
         bl += 1; dir_notes.append("повышающиеся минимумы (сжатие к сопротивлению)")
     if highs_c < highs_a and lows_c <= lows_a * 1.002:
         bs += 1; dir_notes.append("понижающиеся максимумы (сжатие к поддержке)")
-    decorr_1h = chg_1h - ctx["btc_chg_1h"]
-    if ctx["btc_chg_1h"] <= -0.3 and decorr_1h >= 0.3:
-        bl += 1; dir_notes.append(f"держится при падении BTC ({ctx['btc_chg_1h']:+.2f}%) — скрытая сила")
-    if ctx["btc_chg_1h"] >= 0.3 and decorr_1h <= -0.3:
-        bs += 1; dir_notes.append(f"не растёт при росте BTC ({ctx['btc_chg_1h']:+.2f}%) — скрытая слабость")
-    oi_up = oi_1h is not None and oi_1h >= 1
+    if sym != "BTC" and P["win_min"] == WIN_MIN:
+        btc_w = ctx["btc_chg_win"]
+        decorr_w = chg_win - btc_w
+        if btc_w <= -0.3 and decorr_w >= 0.3:
+            bl += 1; dir_notes.append(f"держится при падении BTC ({btc_w:+.2f}% за {WT}) — скрытая сила")
+        if btc_w >= 0.3 and decorr_w <= -0.3:
+            bs += 1; dir_notes.append(f"не растёт при росте BTC ({btc_w:+.2f}% за {WT}) — скрытая слабость")
+    oi_up = oi_win is not None and oi_win >= 1
     if funding < -0.005 and oi_up:
         bl += 1; dir_notes.append(f"шорты набиваются при фандинге {funding:+.3f}% — топливо для сквиза вверх")
     if funding > FUNDING_HOT_LONG and oi_up:
         bs += 1; dir_notes.append(f"лонги набиваются при фандинге {funding:+.3f}% — топливо для пролива")
-    if taker_1h is not None:
-        if taker_1h <= 0.9 and chg_1h >= 0:
-            bl += 2; dir_notes.append(f"агрессивные продажи (taker L/S {taker_1h}) не давят цену — внизу лимитный покупатель")
-        elif taker_1h >= 1.1 and chg_1h <= 0:
-            bs += 2; dir_notes.append(f"агрессивные покупки (taker L/S {taker_1h}) не поднимают цену — сверху лимитный продавец")
-        elif taker_1h >= 1.1:
-            bl += 1; dir_notes.append(f"покупатели агрессивнее (taker L/S {taker_1h})")
-        elif taker_1h <= 0.9:
-            bs += 1; dir_notes.append(f"продавцы агрессивнее (taker L/S {taker_1h})")
+    if taker_win is not None:
+        if taker_win <= 0.9 and chg_win >= 0:
+            bl += 2; dir_notes.append(f"агрессивные продажи (taker L/S {taker_win}) не давят цену — внизу лимитный покупатель")
+        elif taker_win >= 1.1 and chg_win <= 0:
+            bs += 2; dir_notes.append(f"агрессивные покупки (taker L/S {taker_win}) не поднимают цену — сверху лимитный продавец")
+        elif taker_win >= 1.1:
+            bl += 1; dir_notes.append(f"покупатели агрессивнее (taker L/S {taker_win})")
+        elif taker_win <= 0.9:
+            bs += 1; dir_notes.append(f"продавцы агрессивнее (taker L/S {taker_win})")
 
     bias = bl - bs
     side = "long" if bias >= 2 else ("short" if bias <= -2 else "both")
@@ -956,41 +1094,42 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
     sw = closed[-SWING_LOOKBACK:]
     sh, sl = find_swings([c["h"] for c in sw], [c["l"] for c in sw])
     return {
-        "symbol": sym, "side": side, "score": score, "bias": bias,
+        "symbol": sym, "side": side, "score": score, "bias": bias, "bl": bl, "bs": bs,
         "hi": hi, "lo": lo, "height": height, "rng_pct": rng_pct, "price": price, "pos": pos,
-        "sq_pct": sq_pct, "tr_ratio": tr_ratio, "rvol6": rvol6, "vol_rising": vol_rising,
-        "oi_1h": oi_1h, "oi_15m": oi_15m, "taker_1h": taker_1h, "funding": funding,
-        "change_24h": tick.get("change_24h", 0), "chg_1h": chg_1h,
-        "liq_long_1h": stats["liq_long_1h"] if stats else 0,
-        "liq_short_1h": stats["liq_short_1h"] if stats else 0,
-        "baseline5": baseline, "atr": atr_norm, "swing_highs": sh, "swing_lows": sl,
+        "sq_pct": sq_pct, "tr_ratio": tr_ratio, "rvol_half": rvol_half, "vol_rising": vol_rising,
+        "oi_win": oi_win, "oi_15m": oi_15m, "taker_win": taker_win, "funding": funding,
+        "change_24h": tick.get("change_24h", 0), "chg_win": chg_win,
+        "liq_long_win": stats["liq_long_win"] if stats else 0,
+        "liq_short_win": stats["liq_short_win"] if stats else 0,
+        "baseline_tf": baseline, "atr": atr_norm, "swing_highs": sh, "swing_lows": sl, "P": P,
         "plus": plus, "minus": minus, "dir_notes": dir_notes,
     }
 
 def format_charge(c: dict) -> str:
+    P = c["P"]; WT, HT = P["win_txt"], P["half_txt"]
     side_txt = {"long": "🟢 ЛОНГ-уклон", "short": "🔴 ШОРТ-уклон", "both": "⚪ Неясно — ждём любой пробой"}[c["side"]]
     filled = max(1, min(5, round(c["score"] / ACC_MAX_SCORE * 5)))
     bat = "🔋" * filled + "▫️" * (5 - filled)
-    oi_line = (f"OI 1ч: <b>{c['oi_1h']:+.2f}%</b>" if c["oi_1h"] is not None else "OI 1ч: нет данных") + \
+    oi_line = (f"OI {WT}: <b>{c['oi_win']:+.2f}%</b>" if c["oi_win"] is not None else f"OI {WT}: нет данных") + \
               (f" | 15м: {c['oi_15m']:+.2f}%" if c["oi_15m"] is not None else "")
-    taker = f"{c['taker_1h']}" if c["taker_1h"] is not None else "—"
+    taker = f"{c['taker_win']}" if c["taker_win"] is not None else "—"
     # Ориентир стопа для пробоя: за уровнем на 1 нормальный ATR, но не дальше противоположной границы
     up_stop = max(c["lo"], c["hi"] - c["atr"])
     dn_stop = min(c["hi"], c["lo"] + c["atr"])
     sq = f"BB в нижних {c['sq_pct']:.0f}%" if c["sq_pct"] is not None else "BB —"
     lines = [
-        f"⏳ <b>ЗАРЯД — {c['symbol']}/USDT</b> | {msk_time_str()}",
+        f"⏳ <b>ЗАРЯД {P['tf']} — {c['symbol']}/USDT</b> | {msk_time_str()}",
         f"Направление: <b>{side_txt}</b>",
         f"Сила заряда: {bat} ({c['score']}/{ACC_MAX_SCORE})",
-        f"Диапазон 1ч: {c['lo']:.6g} – {c['hi']:.6g} (ширина {c['rng_pct']:.2f}%)",
-        f"Цена: {c['price']:.6g} — {c['pos']*100:.0f}% диапазона | за час {c['chg_1h']:+.2f}%",
+        f"Таймфрейм: {P['tf']} | Диапазон {WT}: {c['lo']:.6g} – {c['hi']:.6g} (ширина {c['rng_pct']:.2f}%)",
+        f"Цена: {c['price']:.6g} — {c['pos']*100:.0f}% диапазона | за {WT} {c['chg_win']:+.2f}%",
         f"Сжатие: {sq} | свечи {c['tr_ratio']*100:.0f}% от нормы",
-        f"Объём 30м: {c['rvol6']:.1f}× нормы{' 📈 растёт' if c['vol_rising'] else ''}",
+        f"Объём {HT}: {c['rvol_half']:.1f}× нормы{' 📈 растёт' if c['vol_rising'] else ''}",
         oi_line,
-        f"Taker L/S 1ч: {taker} | Фандинг: {c['funding']:+.3f}% | 24ч: {c['change_24h']:+.1f}%",
+        f"Taker L/S {WT}: {taker} | Фандинг: {c['funding']:+.3f}% | 24ч: {c['change_24h']:+.1f}%",
     ]
-    if c["liq_short_1h"] or c["liq_long_1h"]:
-        lines.append(f"Ликвидации 1ч: шортов {fmt_usd(c['liq_short_1h'])} / лонгов {fmt_usd(c['liq_long_1h'])}")
+    if c["liq_short_win"] or c["liq_long_win"]:
+        lines.append(f"Ликвидации {WT}: шортов {fmt_usd(c['liq_short_win'])} / лонгов {fmt_usd(c['liq_long_win'])}")
     if c["side"] in ("long", "both"):
         lines.append(f"⚡ Пробой вверх: выше <b>{c['hi']:.6g}</b> → стоп ~{up_stop:.6g} "
                      f"({pct(c['hi'], up_stop):.2f}% от уровня)")
@@ -1002,13 +1141,15 @@ def format_charge(c: dict) -> str:
     for n in c["dir_notes"]: lines.append(f"  🧭 {esc(n)}")
     for n in c["minus"]:     lines.append(f"  ⚠️ {esc(n)}")
     lines.append("👀 <b>На что смотреть:</b>")
-    lines.append("  • Внутри диапазона не входить — ждём ⚡ПРОБОЙ, бот пришлёт его сам.")
-    if c["oi_1h"] is not None and c["oi_1h"] >= 2:
+    lines.append("  • Внутри диапазона не входить — ждём ⚡ПРОБОЙ: бот пришлёт его после закрытия 5м свечи за уровнем.")
+    if c["oi_win"] is not None and c["oi_win"] >= 2:
         lines.append("  • Если OI продолжит расти, а цена стоять — пружина сжимается сильнее.")
     lines.append("  • Резкий прокол границы с возвратом внутрь = сбор стопов; настоящий выход часто в обратную сторону.")
     if c["side"] == "both":
         lines.append("  • Направление покажет первая сторона, куда уйдут объём и дельта.")
-    lines.append(f"  • Заряд действует до {msk_time_str(time.time() + WATCH_TTL_MIN * 60)}.")
+    if c["symbol"] == "BTC":
+        lines.append("  • Пробой BTC 1h задаёт направление и альтам: лонги по альтам надёжнее после пробоя вверх, и наоборот.")
+    lines.append(f"  • Заряд действует до {msk_time_str(time.time() + P['watch_ttl_min'] * 60)}.")
     return "\n".join(lines)
 
 def register_charges(charges: list):
@@ -1018,20 +1159,25 @@ def register_charges(charges: list):
     for c in sorted(charges, key=lambda x: x["score"], reverse=True):
         sym = c["symbol"]
         recent_break = [v for k, v in LAST_SENT.items() if k[0] == "breakout" and k[1] == sym
-                        and now_ts - v[0] < BREAKOUT_COOLDOWN_MIN * 60]
+                        and now_ts - v[0] < c["P"]["cooldown_min"] * 60]
         if recent_break:
             continue  # недавно уже был пробой по этой монете
         old = WATCHLIST.get(sym)
-        if not old and len(WATCHLIST) >= WATCH_MAX:
-            weakest = min(WATCHLIST.values(), key=lambda x: x["score"])
+        if old and (c["price"] > old["hi"] or c["price"] < old["lo"]):
+            # цена уже вышла за старые границы — ждём закрытия 5м свечи по СТАРЫМ уровням;
+            # иначе новый диапазон «проглотит» свечу пробоя и сигнал не придёт
+            continue
+        alts_in = [w for s, w in WATCHLIST.items() if s != "BTC"]
+        if not old and sym != "BTC" and len(alts_in) >= WATCH_MAX:   # BTC не занимает и не вытесняет места альтов
+            weakest = min(alts_in, key=lambda x: x["score"])
             if weakest["score"] >= c["score"]:
                 continue
             WATCHLIST.pop(weakest["symbol"], None)
         entry = dict(c)
         entry["created"] = old["created"] if old else now_ts
-        entry["expires"] = now_ts + WATCH_TTL_MIN * 60
-        entry["alert_score"] = old["alert_score"] if old else -99
-        entry["pending"] = old.get("pending") if old else None
+        entry["expires"] = now_ts + c["P"]["watch_ttl_min"] * 60
+        entry["alert_score"] = old.get("alert_score", -99) if old else -99
+        entry["alert_ts"] = old.get("alert_ts", 0) if old else 0
         WATCHLIST[sym] = entry
         side_changed = old is not None and old["side"] != c["side"]
         ep = CHARGE_ACTIVE.get(sym)
@@ -1041,8 +1187,10 @@ def register_charges(charges: list):
             ep["max_score"] = max(ep["max_score"], c["score"])
             if side_changed:
                 ep["side_changes"] += 1
-        if c["score"] >= entry["alert_score"] + ACC_REALERT_DELTA or side_changed:
+        side_realert = side_changed and now_ts - entry["alert_ts"] >= ACC_REALERT_MIN * 60
+        if c["score"] >= entry["alert_score"] + ACC_REALERT_DELTA or side_realert:
             entry["alert_score"] = c["score"]
+            entry["alert_ts"] = now_ts
             to_alert.append(entry)
     return to_alert
 
@@ -1066,52 +1214,60 @@ def build_breakout(w: dict, side: str, price: float, pace: float, delta):
     dist = min(max(dist, BREAK_STOP_MIN), abs(STOP_PCT))
     stop = price * (1 - dist / 100) if is_long else price * (1 + dist / 100)
 
-    # Цели: свинги + measured move (высота диапазона от уровня пробоя)
+    # Цели: свинги + measured move (высота диапазона от уровня пробоя).
+    # v8.1: TP1 не ближе расстояния до стопа (прибыль/риск ≥ 1:1), TP2 — не ближе 2× стопа.
+    # В v8.0 первой целью часто становился свинг в 0.3% от входа при стопе 1%+ — цели были меньше риска.
+    tp1_min = max(0.3, dist * TP1_MIN_RR)
+    tp2_min = max(0.6, dist * TP2_MIN_RR)
     if is_long:
         cands = [(h, "свинг-хай") for h in w["swing_highs"]]
         cands += [(level + height, "высота диапазона ×1"), (level + 2 * height, "высота диапазона ×2")]
-        cands = sorted([x for x in cands if x[0] > price * 1.003], key=lambda x: x[0])
+        cands = sorted([x for x in cands if x[0] > price * (1 + tp1_min / 100)], key=lambda x: x[0])
     else:
         cands = [(l, "свинг-лой") for l in w["swing_lows"]]
         cands += [(level - height, "высота диапазона ×1"), (level - 2 * height, "высота диапазона ×2")]
-        cands = sorted([x for x in cands if 0 < x[0] < price * 0.997], key=lambda x: -x[0])
+        cands = sorted([x for x in cands if 0 < x[0] < price * (1 - tp1_min / 100)], key=lambda x: -x[0])
     if cands:
         tp1, l1 = cands[0]
     else:
-        tp1, l1 = (price + atr, "ATR×1.0") if is_long else (price - atr, "ATR×1.0")
-    nxt = [x for x in cands if (x[0] > tp1 * 1.003 if is_long else x[0] < tp1 * 0.997)]
+        d1 = max(tp1_min / 100 * price, atr)
+        tp1, l1 = (price + d1, f"{TP1_MIN_RR:g}× стопа") if is_long else (price - d1, f"{TP1_MIN_RR:g}× стопа")
+    lim2 = max(tp2_min / 100 * price, abs(tp1 - price) * 1.3)
+    nxt = [x for x in cands if (x[0] >= price + lim2 if is_long else x[0] <= price - lim2)]
     if nxt:
         tp2, l2 = nxt[0]
     else:
-        tp2, l2 = (tp1 + atr, "TP1+ATR") if is_long else (tp1 - atr, "TP1+ATR")
+        tp2, l2 = (price + lim2, f"{TP2_MIN_RR:g}× стопа") if is_long else (price - lim2, f"{TP2_MIN_RR:g}× стопа")
 
     ext  = pct(level, price) if is_long else -pct(level, price)   # насколько уже ушли за уровень
+    ext_atr = abs(price - level) / atr if atr > 0 else 0          # то же в ATR таймфрейма
     room = pct(price, tp1) if is_long else -pct(price, tp1)
     return {
-        "symbol": w["symbol"], "side": side, "price": price, "level": level, "ext": ext,
+        "symbol": w["symbol"], "side": side, "price": price, "level": level, "ext": ext, "ext_atr": ext_atr,
         "stop": stop, "stop_pct": dist, "tp1_price": tp1, "tp1_label": l1, "tp2_price": tp2, "tp2_label": l2,
         "tp1_pct": pct(price, tp1), "tp2_pct": pct(price, tp2), "room_pct": room,
         "pace": round(pace, 2), "delta": delta, "charge_score": w["score"], "charge_side": w["side"],
         "charge_created": w["created"], "funding": w["funding"], "change_24h": w["change_24h"],
-        "oi_1h": w["oi_1h"], "oi_15m": w["oi_15m"], "taker_15m": w.get("taker_1h"),
+        "oi_win": w["oi_win"], "oi_15m": w["oi_15m"], "taker_15m": w.get("taker_win"),
         "decorr": 0.0, "rvol": round(pace, 2), "from_charge": True,
+        "tf": w["P"]["tf"], "win_txt": w["P"]["win_txt"], "horizon": w["P"]["horizon"],
     }
 
 def analyze_breakout(b: dict):
     is_long = b["side"] == "long"
     score, plus, minus = 0, [], []
-    p = b["pace"]
-    if p >= 5:     score += 3; plus.append(f"взрывной темп объёма ({p:.1f}× нормы)")
-    elif p >= 3:   score += 2; plus.append(f"сильный темп объёма ({p:.1f}×)")
-    elif p >= 1.5: score += 1; plus.append(f"объём выше нормы ({p:.1f}×)")
-    else:          score -= 1; minus.append(f"пробой на слабом объёме ({p:.1f}×) — риск ложного")
+    p = b["pace"]   # объём закрытой 5м свечи пробоя к норме
+    if p >= 5:     score += 3; plus.append(f"взрывной объём свечи пробоя ({p:.1f}× нормы)")
+    elif p >= 3:   score += 2; plus.append(f"сильный объём свечи пробоя ({p:.1f}×)")
+    elif p >= 1.5: score += 1; plus.append(f"объём свечи пробоя выше нормы ({p:.1f}×)")
+    else:          minus.append(f"объём свечи пробоя на грани ({p:.1f}×) — риск ложного")
 
     d = b["delta"]
     if d is None:
         minus.append("дельта недоступна — проверь CVD вручную")
     else:
         dd = d if is_long else 1 - d
-        if dd >= 0.6:    score += 2; plus.append(f"дельта 2 мин {dd*100:.0f}% в нашу сторону — агрессор с нами")
+        if dd >= 0.6:    score += 2; plus.append(f"дельта за свечу {dd*100:.0f}% в нашу сторону — агрессор с нами")
         elif dd >= 0.55: score += 1; plus.append(f"дельта слегка в нашу сторону ({dd*100:.0f}%)")
         elif dd <= 0.45: score -= 2; minus.append(f"дельта против ({dd*100:.0f}%) — пробой без агрессора, похоже на вынос")
         else:            minus.append(f"дельта нейтральная ({dd*100:.0f}%)")
@@ -1125,13 +1281,16 @@ def analyze_breakout(b: dict):
     elif b["charge_side"] != "both":
         score -= 2; minus.append("пробой ПРОТИВ уклона ЗАРЯДа — осторожно")
 
-    if b["ext"] <= 0.4:
-        score += 1; plus.append(f"вход у самого уровня (+{b['ext']:.2f}%)")
-    elif b["ext"] > 1.0:
-        score -= 1; minus.append(f"цена уже ушла на {b['ext']:.2f}% за уровень — догоняешь, лучше ретест")
+    ea = b.get("ext_atr", 0)
+    if ea <= 0.3:
+        score += 1; plus.append(f"вход у самого уровня (+{b['ext']:.2f}%, {ea:.1f} ATR)")
+    elif ea > 1.0:
+        score -= 1; minus.append(f"цена уже ушла на {b['ext']:.2f}% ({ea:.1f} ATR) за уровень — догоняешь, лучше ретест")
 
-    btc = LAST_BTC["chg15"]
-    if (btc > 0.1 and is_long) or (btc < -0.1 and not is_long):
+    btc = LAST_BTC["chg15"] if b["symbol"] != "BTC" else 0.0   # для самого BTC это не внешний фактор
+    if b["symbol"] == "BTC":
+        pass
+    elif (btc > 0.1 and is_long) or (btc < -0.1 and not is_long):
         score += 1; plus.append(f"BTC 15M поддерживает ({btc:+.2f}%)")
     elif (btc < -0.3 and is_long) or (btc > 0.3 and not is_long):
         score -= 1; minus.append(f"BTC 15M против ({btc:+.2f}%)")
@@ -1147,7 +1306,7 @@ def analyze_breakout(b: dict):
         score -= 1; minus.append(f"до TP1 всего {b['room_pct']:.2f}% — мало места")
 
     if score >= 7:   v = "🟢 Сильный. Входи."
-    elif score >= 4: v = "🟡 Нормальный. Подтверди 1м закрытием за уровнем."
+    elif score >= 4: v = "🟡 Нормальный. Проверь CVD."
     elif score >= 1: v = "🟠 Слабый. Половина позиции или жди ретест."
     else:            v = "🔴 Пропустить / только ретест."
     return score, v, plus, minus
@@ -1155,15 +1314,17 @@ def analyze_breakout(b: dict):
 def format_breakout(b: dict, score: int, verdict: str, plus: list, minus: list) -> str:
     is_long = b["side"] == "long"
     head = "⚡ <b>ПРОБОЙ — ЛОНГ</b>" if is_long else "⚡ <b>ПРОБОЙ — ШОРТ</b>"
+    if b["symbol"] == "BTC":
+        head += f" 🟠 BTC {b['tf']}"
     delta = f"{(b['delta'] if is_long else 1 - b['delta'])*100:.0f}% в нашу сторону" if b["delta"] is not None else "—"
-    oi = f"{b['oi_1h']:+.2f}%" if b["oi_1h"] is not None else "—"
+    oi = f"{b['oi_win']:+.2f}%" if b["oi_win"] is not None else "—"
     sign = "-" if is_long else "+"
     lines = [
         f"{head} {b['symbol']}/USDT | {msk_time_str()}",
-        f"Уровень {'вверх' if is_long else 'вниз'}: {b['level']:.6g} пробит, цена {b['price']:.6g} "
-        f"({b['ext']:+.2f}% за уровнем)",
-        f"Темп объёма: <b>{b['pace']:.1f}×</b> | Дельта 2м: {delta}",
-        f"Из ЗАРЯДа от {msk_time_str(b['charge_created'])} (сила {b['charge_score']}) | OI 1ч: {oi}",
+        f"Уровень {'вверх' if is_long else 'вниз'}: {b['level']:.6g} — 5м свеча закрылась за ним ({b.get('bar_close', b['price']):.6g})",
+        f"Цена сейчас {b['price']:.6g} ({b['ext']:+.2f}% за уровнем)",
+        f"Объём свечи пробоя: <b>{b['pace']:.1f}×</b> нормы | Дельта за свечу: {delta}",
+        f"Из ЗАРЯДа {b['tf']} от {msk_time_str(b['charge_created'])} (сила {b['charge_score']}) | OI {b['win_txt']}: {oi}",
         f"Фандинг: {b['funding']:+.3f}% | 24ч: {b['change_24h']:+.1f}%",
         f"   Вход: <b>{b['price']:.6g}</b>",
         f"   Стоп: {b['stop']:.6g} ({sign}{b['stop_pct']:.2f}%) — за уровнем",
@@ -1175,65 +1336,67 @@ def format_breakout(b: dict, score: int, verdict: str, plus: list, minus: list) 
     lines += [f"  ✅ {esc(n)}" for n in plus]
     lines += [f"  ⚠️ {esc(n)}" for n in minus]
     lines.append("👀 <b>На что смотреть:</b>")
-    lines.append(f"  • Возврат за {b['level']:.6g} и закрытие 1м внутри диапазона = ложный пробой, выходи.")
+    lines.append(f"  • Следующая 5м свеча закрылась обратно за {b['level']:.6g} — ложный пробой, выходи.")
     lines.append(f"  • Ретест {b['level']:.6g} с удержанием — второй шанс входа с коротким стопом.")
-    if b["ext"] > 1.0:
+    if b.get("ext_atr", 0) > 1.0:
         lines.append("  • Цена уже далеко от уровня: не гонись, лимитка ближе к уровню.")
     lines.append("  • После TP1 стоп в безубыток.")
     return "\n".join(lines)
 
 def fast_check():
-    """Опрос watchlist по 1м свечам: цена за уровнем + темп объёма."""
+    """⚡ПРОБОЙ по watchlist: 5м свеча ЗАКРЫЛАСЬ за уровнем заряда на объёме ≥ нормы.
+    Опрос каждые 20с, но каждая монета проверяется один раз на каждую новую закрытую 5м свечу."""
     now_ts = time.time()
     for sym in [s for s, w in WATCHLIST.items() if w["expires"] < now_ts]:
         print(f"[WATCH] {sym}: заряд истёк")
         WATCHLIST.pop(sym, None)
 
+    bar = BREAK_CONFIRM_SEC
+    boundary = int(now_ts // bar * bar)          # время закрытия последней завершённой 5м свечи
     for sym, w in list(WATCHLIST.items()):
+        if w.get("checked_bar") == boundary:
+            continue                              # эту свечу уже проверили — ждём следующую
         try:
-            candles = get_candles(sym, "1m", 3)
+            candles = get_candles(sym, BREAK_CONFIRM_TF, 4)
             if not candles:
                 continue
-            now_ts = time.time()
-            closed, forming, price = split_closed(candles, 60, now_ts)
-            base1m = w["baseline5"] / 5
-            if base1m <= 0 or price <= 0:
+            closed, _, price = split_closed(candles, bar, time.time())
+            if not closed or price <= 0:
                 continue
-            proj = 0.0
-            if forming:
-                elapsed = max(now_ts - forming["t"], 10)   # первые секунды свечи не экстраполируем
-                proj = forming["v"] / elapsed * 60
-            last_closed_v = closed[-1]["v"] if closed else 0
-            pace = max(proj, last_closed_v) / base1m
+            last = closed[-1]
+            if last["t"] + bar < boundary:
+                continue                          # биржа ещё не отдала только что закрытую свечу — повтор через 20с
+            w["checked_bar"] = boundary
 
-            up   = price > w["hi"] * (1 + BREAK_BUFFER)
-            down = price < w["lo"] * (1 - BREAK_BUFFER)
+            close = last["c"]
+            buf = max(BREAK_BUFFER, 0.1 * w["atr"] / close) if close > 0 else BREAK_BUFFER
+            up   = close > w["hi"] * (1 + buf)
+            down = close < w["lo"] * (1 - buf)
             if not up and not down:
-                w["pending"] = None
                 continue
             side = "long" if up else "short"
 
-            pend = w.get("pending")
-            held = pend is not None and pend["side"] == side and now_ts - pend["ts"] >= FAST_INTERVAL_SEC * 0.8
-            fire = pace >= FAST_PACE_STRONG or (held and pace >= FAST_PACE_MIN)
-            if not fire:
-                if not pend or pend["side"] != side:
-                    w["pending"] = {"side": side, "ts": now_ts}
+            base5 = w["baseline_tf"] / (w["P"]["tf_min"] / 5)    # норма объёма на одну 5м свечу
+            rvol_bar = last["v"] / base5 if base5 > 0 else 0
+            if rvol_bar < BREAK_MIN_RVOL:
+                print(f"[BREAKOUT] {sym} {side}: закрытие за уровнем, но объём {rvol_bar:.1f}× < {BREAK_MIN_RVOL}× — пропуск")
                 continue
 
-            delta = get_trade_delta(sym, 120)
-            b = build_breakout(w, side, price, pace, delta)
+            delta = get_trade_delta(sym, bar)     # агрессор за время свечи пробоя
+            b = build_breakout(w, side, price, rvol_bar, delta)
+            b["bar_close"] = close
             score, verdict, plus, minus = analyze_breakout(b)
-            if not held:
-                plus.append("отправлен сразу — темп объёма ≥3×, без ожидания удержания")
             send_telegram(format_breakout(b, score, verdict, plus, minus))
             log_signal("breakout", b, side, score)
+            now_ts = time.time()
             LAST_SENT[("breakout", sym, side)] = (now_ts, score)
+            if sym == "BTC":
+                LAST_BTC.setdefault("price_at_break", {})[side] = price
             if sym in CHARGE_ACTIVE:
                 CHARGE_ACTIVE[sym]["bot_signal"] = f"{side}:{score}"
                 CHARGE_ACTIVE.pop(sym, None)     # эпизод закрыт пробоем, но оценка по ценам остаётся в очереди
             WATCHLIST.pop(sym, None)
-            print(f"[BREAKOUT] {sym} {side} pace={pace:.1f} score={score}")
+            print(f"[BREAKOUT] {sym} {side} close={close:.6g} rvol={rvol_bar:.1f} score={score}")
         except Exception as e:
             print(f"[FAST ERROR] {sym}: {e}")
 
@@ -1521,49 +1684,85 @@ def format_momentum(s: dict, i: int, is_long: bool, score: int, verdict: str, pl
 
 def scan_symbol(sym: str, ctx: dict) -> dict:
     out = {"momentum": None, "charge": None}
-    candles = get_candles(sym, "5m", CANDLES_LIMIT)
-    closed, _, price = split_closed(candles, 300, ctx["now_ts"])
-    if len(closed) < 60 or price <= 0:
-        return out
-    baseline = trimmed_mean([c["v"] for c in closed[-BASE_FROM:-BASE_TO]])
-    if baseline <= 0:
-        return out
-    tr_slice = true_ranges(closed)[-BASE_FROM:-BASE_TO]
-    atr_norm = sum(tr_slice) / len(tr_slice) if tr_slice else 0
     tick = ctx["tickers"].get(sym, {})
-
     cache = {}
     def stats_cache(s):
         if s not in cache:
             cache[s] = get_contract_stats(s)
         return cache[s]
 
-    out["momentum"] = build_momentum(sym, closed, price, baseline, ctx, tick, stats_cache)
-    out["charge"] = detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache)
+    def load(tf: str, tf_min: int):
+        candles = get_candles(sym, tf, CANDLES_LIMIT)
+        closed, _, price = split_closed(candles, tf_min * 60, ctx["now_ts"])
+        if len(closed) < 60 or price <= 0:
+            return None
+        baseline = trimmed_mean([c["v"] for c in closed[-BASE_FROM:-BASE_TO]])
+        if baseline <= 0:
+            return None
+        return closed, price, baseline
+
+    data_tf = None
+    if ctx["do_charge"]:
+        data_tf = load(CHARGE_TF, TF_MIN)
+        if data_tf:
+            closed, price, baseline = data_tf
+            tr_slice = true_ranges(closed)[-BASE_FROM:-BASE_TO]
+            atr_norm = sum(tr_slice) / len(tr_slice) if tr_slice else 0
+            out["charge"] = detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache)
+
+    if ctx["do_momentum"]:
+        # ИМПУЛЬС всегда на 5м свечах; если заряд тоже на 5м — свечи уже загружены
+        data5 = data_tf if (TF_MIN == 5 and ctx["do_charge"]) else load("5m", 5)
+        if data5:
+            closed5, price5, baseline5 = data5
+            out["momentum"] = build_momentum(sym, closed5, price5, baseline5, ctx, tick, stats_cache)
     return out
 
-def run_scan():
+def scan_btc_charge(ctx: dict):
+    """Отдельный ЗАРЯД для BTC на своём таймфрейме (по умолчанию 1h)."""
+    P = BTC_P
+    candles = get_candles("BTC", P["tf"], CANDLES_LIMIT)
+    closed, _, price = split_closed(candles, P["tf_min"] * 60, ctx["now_ts"])
+    if len(closed) < 60 or price <= 0:
+        return None
+    baseline = trimmed_mean([c["v"] for c in closed[-BASE_FROM:-BASE_TO]])
+    if baseline <= 0:
+        return None
+    tr_slice = true_ranges(closed)[-BASE_FROM:-BASE_TO]
+    atr_norm = sum(tr_slice) / len(tr_slice) if tr_slice else 0
+    stats = {}
+    def stats_cache(s):
+        if s not in stats:
+            stats[s] = get_contract_stats(s, P["win_min"])
+        return stats[s]
+    return detect_charge("BTC", closed, price, baseline, atr_norm, ctx, ctx["tickers"].get("BTC", {}), stats_cache, P)
+
+def run_scan(do_charge: bool = True, do_btc: bool = False):
     now_ts = time.time()
+    do_momentum = MOMENTUM_ENABLED
     print(f"[SCAN] Старт {msk_time_str()}")
 
-    btc = get_candles("BTC", "5m", 20)
-    btc_closed, _, _ = split_closed(btc, 300, now_ts)
-    if len(btc_closed) < 13:
+    n_win5 = WIN_MIN // 5
+    btc = get_candles("BTC", "5m", n_win5 + 8)
+    btc_closed, _, btc_price = split_closed(btc, 300, now_ts)
+    if len(btc_closed) < n_win5 + 1:
         print("[SCAN] BTC свечи не получены")
         return None
     btc_chg_15 = pct(btc_closed[-3]["o"], btc_closed[-1]["c"])
-    btc_chg_1h = pct(btc_closed[-12]["o"], btc_closed[-1]["c"])
-    LAST_BTC.update({"chg15": btc_chg_15, "chg1h": btc_chg_1h, "ts": now_ts})
-    print(f"[SCAN] BTC 15М: {btc_chg_15:+.2f}% | 1ч: {btc_chg_1h:+.2f}%")
+    btc_chg_win = pct(btc_closed[-n_win5]["o"], btc_closed[-1]["c"])   # тот же отрезок, что окно заряда
+    btc_chg_1h = pct(btc_closed[-12]["o"], btc_closed[-1]["c"]) if len(btc_closed) >= 12 else btc_chg_win
+    LAST_BTC.update({"chg15": btc_chg_15, "chgwin": btc_chg_win, "ts": now_ts, "price": btc_price})
+    print(f"[SCAN] BTC 15М: {btc_chg_15:+.2f}% | {WIN_TXT}: {btc_chg_win:+.2f}%")
 
     tickers = get_gate_tickers()
     if tickers:
         push_oi_snapshot(tickers, now_ts)
     market_ctx = get_market_context()
 
-    ctx = {"now_ts": now_ts, "btc_chg_15": btc_chg_15, "btc_chg_1h": btc_chg_1h,
+    ctx = {"now_ts": now_ts, "btc_chg_15": btc_chg_15, "btc_chg_1h": btc_chg_1h, "btc_chg_win": btc_chg_win,
            "tickers": tickers, "watch": {s: w["side"] for s, w in WATCHLIST.items()},
-           "watch_score": {s: w["score"] for s, w in WATCHLIST.items()}}
+           "watch_score": {s: w["score"] for s, w in WATCHLIST.items()},
+           "do_charge": do_charge, "do_momentum": do_momentum}
 
     results = []
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
@@ -1577,7 +1776,15 @@ def run_scan():
 
     # ── ⏳ ЗАРЯДЫ ──
     charges = [r["charge"] for r in results if r["charge"]]
-    alerts = register_charges(charges)
+    if do_btc and BTC_CHARGE_ENABLED:
+        try:
+            bc = scan_btc_charge(ctx)
+            print(f"[BTC {BTC_CHARGE_TF}] заряд: {'score=' + str(bc['score']) + ' ' + bc['side'] if bc else 'нет'}")
+            if bc:
+                charges.append(bc)
+        except Exception as e:
+            print(f"  [ERROR] BTC {BTC_CHARGE_TF}: {e}")
+    alerts = register_charges(charges) if (do_charge or do_btc) else []
     if alerts:
         send_blocks([format_charge(c) for c in alerts])
         for c in alerts:
@@ -1593,6 +1800,11 @@ def run_scan():
         # FIX v8: сортируем по полной оценке, а не по упрощённой quality
         for s in group:
             s["score"] = analyze_signal(s, is_long, btc_chg_15)[0]
+        # v8.1: только 🟡/🟢 и не дублируем свежий ⚡ПРОБОЙ по той же монете
+        def recent_breakout(sym):
+            return any(k[0] == "breakout" and k[1] == sym and now_ts - v[0] < BREAKOUT_COOLDOWN_MIN * 60
+                       for k, v in LAST_SENT.items())
+        group = [s for s in group if s["score"] >= MOMENTUM_MIN_SCORE and not recent_breakout(s["symbol"])]
         group.sort(key=lambda x: (x["score"], x["quality"], abs(x["decorr"])), reverse=True)
         side = "long" if is_long else "short"
         top = []
@@ -1607,7 +1819,7 @@ def run_scan():
             continue
         top = [refresh_signal(s, is_long) for s in top]
         header = (f"📡 <b>{'🚀 ИМПУЛЬС — ЛОНГ' if is_long else '🚀 ИМПУЛЬС — ШОРТ'}</b> | {msk_time_str()}\n"
-                  f"BTC 15М: <b>{btc_chg_15:+.2f}%</b> | 1ч: {btc_chg_1h:+.2f}%\n{market_ctx}\n")
+                  f"{market_ctx}\n")
         blocks = [header]
         for i, s in enumerate(top):
             score, verdict, plus, minus = analyze_signal(s, is_long, btc_chg_15)
@@ -1625,12 +1837,12 @@ def run_scan():
 def send_status(signal_count=0, btc_chg=None):
     now = datetime.now(MSK)
     ctx = get_market_context()
-    btc_line = f"BTC 15М: <b>{btc_chg:+.2f}%</b>\n" if btc_chg is not None else ""
+    btc_line = ""
     wl = ", ".join(f"{s}{'🟢' if w['side']=='long' else '🔴' if w['side']=='short' else '⚪'}"
                    for s, w in WATCHLIST.items()) or "пусто"
     send_telegram(
         f"🤖 <b>Upscale Bot {BOT_VERSION}</b> | {now.strftime('%H:%M МСК')}\n"
-        f"✅ ⏳ЗАРЯД → ⚡ПРОБОЙ → 🚀ИМПУЛЬС\n"
+        f"✅ ⏳ЗАРЯД {CHARGE_TF}{' + BTC ' + BTC_CHARGE_TF if BTC_CHARGE_ENABLED else ''} → ⚡ПРОБОЙ{' → 🚀ИМПУЛЬС' if MOMENTUM_ENABLED else ''}\n"
         f"{btc_line}{ctx}\n"
         f"Сигналов в последнем скане: <b>{signal_count}</b>\n"
         f"Watchlist ({len(WATCHLIST)}): {wl}\n"
@@ -1641,15 +1853,24 @@ def send_status(signal_count=0, btc_chg=None):
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 
 def main():
-    send_telegram(
-        f"🚀 <b>Upscale Bot {BOT_VERSION} запущен</b>\n"
-        "⏳ ЗАРЯД — сжатие + объём/OI при стоящей цене (до движения)\n"
-        f"⚡ ПРОБОЙ — триггер по watchlist каждые {FAST_INTERVAL_SEC}с на 1м свечах\n"
-        "🚀 ИМПУЛЬС — RS Momentum 5М (взрыв / разгон объёма)\n"
-        "📊 BTC контекст: 1D + 4H + 15M + EQH/EQL\n"
-        f"📒 Лог сигналов и исходов: {os.path.basename(SIGNALS_CSV)}\n"
-        f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК"
-    )
+    mom_lvl = "🟢" if MOMENTUM_MIN_SCORE >= 8 else "🟡/🟢"
+    start_lines = [
+        f"🚀 <b>Upscale Bot {BOT_VERSION} запущен</b>",
+        f"⏳ ЗАРЯД {CHARGE_TF} — сжатие + объём/OI при стоящей цене, окно {WIN_TXT}, скан каждые {TF_MIN} мин",
+    ]
+    if BTC_CHARGE_ENABLED:
+        start_lines.append(f"🟠 BTC — отдельный ЗАРЯД→ПРОБОЙ на {BTC_CHARGE_TF}, окно {BTC_P['win_txt']}, скан раз в час")
+    start_lines.append("⚡ ПРОБОЙ — по закрытию 5м свечи за уровнем заряда, объём ≥ нормы")
+    if MOMENTUM_ENABLED:
+        start_lines.append(f"🚀 ИМПУЛЬС 5М — только оценка от {MOMENTUM_MIN_SCORE} ({mom_lvl}), скан каждые 5 мин")
+    else:
+        start_lines.append("🚀 ИМПУЛЬС — выключен")
+    start_lines += [
+        "📊 BTC контекст: 1D + 4H + пробой/зарядка 1H + EQH/EQL",
+        f"📒 Лог сигналов и исходов: {os.path.basename(SIGNALS_CSV)}",
+        f"Пар: {len(UPSCALE_PAIRS)} | Часы: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК",
+    ]
+    send_telegram("\n".join(start_lines))
 
     last_signal_count, last_btc = 0, None
     status_sent_hour = -1
@@ -1679,7 +1900,8 @@ def main():
                 # если fast_check затянулся из-за таймаута API, скан не пропадёт на 5 минут
                 if now_msk.minute % SCAN_INTERVAL == 0 and aligned != last_scan_key:
                     last_scan_key = aligned
-                    result = run_scan()
+                    result = run_scan(do_charge=(now_msk.minute % TF_MIN == 0),
+                                      do_btc=(now_msk.minute % BTC_P["tf_min"] == 0))
                     if result:
                         last_signal_count, last_btc = result
                     last_fast = time.time()
