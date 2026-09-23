@@ -639,13 +639,22 @@ def _market_base() -> str:
             elif price > ema50:                               d_bias = "📈 Выше EMA50"
             else:                                             d_bias = "📉 Ниже EMA50"
 
+        # Живая цена (последняя часовая свеча) — для показа и для расчёта EQH/EQL.
+        # Тренд 4H (h4_bias) по-прежнему считаем по ЗАКРЫТОЙ 4H свече — это верно,
+        # тренд не должен дёргаться от текущей цены. А вот "какой уровень ещё
+        # впереди" и "сколько % до него" обязаны быть от текущей цены, иначе после
+        # сильного движения внутри 4H-свечи бот показывает уже пройденный уровень
+        # как цель и врёт с расстоянием до него.
+        live_price = _market_cache.get("btc_price") or price or 0
+
         h4_bias, h4_liq = "❓", ""
         if len(c4h) >= 20:
             cl4 = [c["c"] for c in c4h]
             hi4 = [c["h"] for c in c4h]
             lo4 = [c["l"] for c in c4h]
             p4 = cl4[-1]
-            price = p4
+            if not live_price:
+                live_price = p4
             ema20 = calc_ema_simple(cl4, 20)
             rh = [max(hi4[i-3:i]) for i in range(3, len(hi4))]
             rl = [min(lo4[i-3:i]) for i in range(3, len(lo4))]
@@ -658,7 +667,9 @@ def _market_base() -> str:
             elif p4 > ema20: h4_bias = "↗️ Выше EMA20"
             else:            h4_bias = "↘️ Ниже EMA20"
             sh4, sl4 = find_swings(hi4, lo4, left=2, right=2)
-            h4_liq = format_liq_line(find_eq_levels(sh4, p4, True), find_eq_levels(sl4, p4, False), p4, "4H")
+            h4_liq = format_liq_line(find_eq_levels(sh4, live_price, True),
+                                      find_eq_levels(sl4, live_price, False), live_price, "4H")
+        price = live_price or price
 
         lines = [f"📊 BTC: {price:,.0f} USDT" if price else "📊 BTC: —",
                  f"   1D: {d_bias}", f"   4H: {h4_bias}"]
