@@ -1874,12 +1874,36 @@ def main():
     # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
     if os.environ.get("RUN_BACKTEST") == "1":
+        # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
+        # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
+        mark = os.path.join(LOG_DIR, "backtest_done.txt")
+        today = datetime.now(MSK).strftime("%Y-%m-%d")
+        done = ""
         try:
-            import backtest
-            backtest.main()
-        except Exception as e:
-            traceback.print_exc()
-            send_telegram(f"⚠️ Бэктест не отработал: {esc(str(e))}\nБот продолжает работу в обычном режиме.")
+            with open(mark, encoding="utf-8") as f:
+                done = f.read().strip()
+        except Exception:
+            pass
+        if done == today:
+            print(f"[BACKTEST] сегодня уже запускался ({done}) — пропуск")
+            send_telegram("ℹ️ Бэктест сегодня уже отрабатывал — повторно не запускаю.\n"
+                          "Если нужен ещё один прогон, убери и снова добавь RUN_BACKTEST.")
+        else:
+            try:
+                with open(mark, "w", encoding="utf-8") as f:
+                    f.write(today)
+            except Exception:
+                pass
+            try:
+                import backtest
+                backtest.main()
+            except MemoryError:
+                traceback.print_exc()
+                send_telegram("⚠️ Бэктесту не хватило памяти. Уменьши BT_PAIRS (например 30) "
+                              "или BT_DAYS.\nБот работает в обычном режиме.")
+            except Exception as e:
+                traceback.print_exc()
+                send_telegram(f"⚠️ Бэктест не отработал: {esc(str(e))}\nБот продолжает работу в обычном режиме.")
 
     mom_lvl = "🟢" if MOMENTUM_MIN_SCORE >= 8 else "🟡/🟢"
     start_lines = [

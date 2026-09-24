@@ -25,6 +25,7 @@ import time
 import statistics
 import itertools
 import threading
+import gc
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -34,7 +35,7 @@ import requests
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
 DAYS           = int(os.environ.get("BT_DAYS", "45"))
-N_PAIRS        = int(os.environ.get("BT_PAIRS", "40"))
+N_PAIRS        = int(os.environ.get("BT_PAIRS", "40"))    # BT_PAIRS=103 — все пары (памяти хватает, пары считаются по очереди)
 CONFIRM_TF     = os.environ.get("BT_CONFIRM_TF", "5m")     # 1m — точнее, но тяжелее
 FEE_PCT        = 0.10        # комиссия вход+выход, % от объёма (Gate taker ~0.05% × 2)
 MSK            = timezone(timedelta(hours=3))
@@ -77,6 +78,7 @@ SWING_LOOKBACK  = 144     # свечей для процентиля BB и св�
 BREAK_BUFFER    = 0.001   # 0.1% за уровень
 STOP_MIN, STOP_MAX = 0.8, 3.0      # % границы стопа
 HOLD_BARS_MAX   = 48      # сколько свечей подтверждения держим сделку (48×5м = 4ч)
+TP_MAX_R        = 4.0     # цель не дальше 4 стопов (ограничение на дальние свинги)
 WATCH_TTL_MULT  = 16      # заряд живёт N свечей своего ТФ
 
 SESSIONS = {
@@ -296,9 +298,13 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
                 mm2 = level + 2 * h if up else level - 2 * h
                 pool = (cands + [mm1, mm2]) if up else (cands + [mm1, mm2])
                 pool = sorted(pool) if up else sorted(pool, reverse=True)
+                # цель не дальше TP_MAX_R стопов — иначе бэктест «высиживает» дальние свинги,
+                # чего в реальной торговле не делают
+                lim1 = entry * (1 + TP_MAX_R * dist / 100) if up else entry * (1 - TP_MAX_R * dist / 100)
+                pool = [p for p in pool if (p <= lim1 if up else p >= lim1)]
                 tp1 = pool[0] if pool else (entry * (1 + dist / 100) if up else entry * (1 - dist / 100))
                 nxt = [p for p in pool if (p > tp1 * 1.002 if up else p < tp1 * 0.998)]
-                tp2 = nxt[0] if nxt else (tp1 * 1.005 if up else tp1 * 0.995)
+                tp2 = nxt[0] if nxt else (entry * (1 + 2 * dist / 100) if up else entry * (1 - 2 * dist / 100))
             else:
                 r1, r2 = (1.0, 2.0) if cfg["targets"] == "1R/2R" else (1.5, 3.0)
                 tp1 = entry * (1 + r1 * dist / 100) if up else entry * (1 - r1 * dist / 100)
@@ -333,20 +339,42 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
 
 # ─── ОТЧЁТ ────────────────────────────────────────────────────────────────────
 
-def stats(trades):
-    if not trades:
-        return None
-    n = len(trades)
-    wins = [t for t in trades if t["pnl"] > 0]
-    pnl = [t["pnl"] for t in trades]
-    total = sum(pnl)
-    eq, peak, dd = 0, 0, 0
-    for p in pnl:
-        eq += p; peak = max(peak, eq); dd = min(dd, eq - peak)
-    gross_p = sum(p for p in pnl if p > 0)
-    gross_l = -sum(p for p in pnl if p < 0)
-    return {"n": n, "wr": len(wins) / n * 100, "avg": total / n, "total": total,
-            "dd": dd, "pf": (gross_p / gross_l) if gross_l else float("inf")}
+class Agg:
+    """Счётчики по одной комбинации. Сделки не храним — иначе на 648 комбинациях
+    и сотне пар память уходит в сотни мегабайт, и Render убивает процесс."""
+    __slots__ = ("n", "wins", "total", "gp", "gl", "eq", "peak", "dd", "dists", "side", "hour")
+
+    def __init__(self):
+        self.n = self.wins = 0
+        self.total = self.gp = self.gl = self.eq = self.peak = self.dd = 0.0
+        self.dists = []          # только для медианы стопа, режем до 2000 значений
+        self.side = {}           # сторона -> [n, сумма]
+        self.hour = {}           # час МСК -> [n, сумма]
+
+    def add(self, t):
+        p = t["pnl"]
+        self.n += 1
+        if p > 0:
+            self.wins += 1; self.gp += p
+        else:
+            self.gl -= p
+        self.total += p
+        self.eq += p
+        self.peak = max(self.peak, self.eq)
+        self.dd = min(self.dd, self.eq - self.peak)
+        if len(self.dists) < 2000:
+            self.dists.append(t["dist"])
+        s = self.side.setdefault(t["side"], [0, 0.0]); s[0] += 1; s[1] += p
+        h = self.hour.setdefault(t["hour"], [0, 0.0]); h[0] += 1; h[1] += p
+
+    def result(self):
+        if not self.n:
+            return None
+        return {"n": self.n, "wr": self.wins / self.n * 100, "avg": self.total / self.n,
+                "total": self.total, "dd": self.dd,
+                "pf": (self.gp / self.gl) if self.gl else float("inf"),
+                "stop": statistics.median(self.dists) if self.dists else 0,
+                "side": self.side, "hour": self.hour}
 
 def send_telegram(text):
     print(text)
@@ -367,76 +395,82 @@ def main():
     pairs = ALL_PAIRS[:N_PAIRS]
     now = int(time.time())
     frm = now - DAYS * 86400
-    print(f"Бэктест: {len(pairs)} пар, {DAYS} дней, подтверждение по {CONFIRM_TF}, комиссия {FEE_PCT}%")
-    send_telegram(f"🔬 <b>Бэктест запущен</b>\nПар: {len(pairs)} | дней: {DAYS} | "
-                  f"подтверждение: {CONFIRM_TF} | комиссия {FEE_PCT}%\nЭто займёт 10–30 минут…")
-
+    keys = list(GRID)
+    combos = list(itertools.product(*[GRID[k] for k in keys]))
     tfs = sorted(set(GRID["charge_tf"]))
-    data = {}          # sym -> {tf: candles}
-    t0 = time.time()
+    print(f"Бэктест: {len(pairs)} пар, {DAYS} дней, подтверждение {CONFIRM_TF}, "
+          f"комбинаций {len(combos)}, комиссия {FEE_PCT}%")
+    send_telegram(f"🔬 <b>Бэктест запущен</b>\nПар: {len(pairs)} | дней: {DAYS} | "
+                  f"подтверждение: {CONFIRM_TF} | комбинаций: {len(combos)}\n"
+                  f"Пары считаются по очереди, память не копится. Это займёт 20–60 минут…")
+
+    # Пары обрабатываем по одной и сразу освобождаем память — иначе 100 пар × месяц
+    # пятиминуток не помещаются в память Render.
+    acc = [Agg() for _ in range(len(combos))]
+    used, skipped, t0 = 0, [], time.time()
     for idx, sym in enumerate(pairs, 1):
-        d = {}
-        ok = True
-        depth = {}
+        d, ok, depth = {}, True, {}
         for tf in tfs + [CONFIRM_TF]:
             cs = get_candles(sym, tf, frm, now)
             if len(cs) < 200:
-                ok = False
-                depth[tf] = len(cs)
-                break
+                ok = False; break
             d[tf] = cs
             depth[tf] = round((cs[-1][0] - cs[0][0]) / 86400, 1)
-        if ok:
-            data[sym] = d
-        print(f"  [{idx}/{len(pairs)}] {sym}: {'ok' if ok else 'мало данных'} "
-              f"| дней по ТФ: {depth} ({int(time.time() - t0)}с)")
-    print(f"Данные загружены за {int(time.time() - t0)}с, пар в работе: {len(data)}")
-
-    # заряды считаем один раз на каждую пару/ТФ/порог сжатия
-    charges = {}
-    for sym, d in data.items():
+        if not ok:
+            skipped.append(sym)
+            print(f"  [{idx}/{len(pairs)}] {sym}: мало данных, пропуск")
+            continue
+        used += 1
+        ch_cache, sw_cache = {}, {}
         for tf in tfs:
+            sw_cache[tf] = swings(d[tf])
             for sq in GRID["squeeze_pctl"]:
-                charges[(sym, tf, sq)] = find_charges(d[tf], sq)
-    tot_ch = sum(len(v) for v in charges.values())
-    print(f"Зарядов найдено (по всем комбинациям): {tot_ch}")
-
-    keys = list(GRID)
-    results = []
-    combos = list(itertools.product(*[GRID[k] for k in keys]))
-    for ci, combo in enumerate(combos, 1):
-        cfg = dict(zip(keys, combo))
-        trades = []
-        for sym, d in data.items():
-            tf = cfg["charge_tf"]
-            ch = charges[(sym, tf, cfg["squeeze_pctl"])]
+                ch_cache[(tf, sq)] = find_charges(d[tf], sq)
+        n_tr = 0
+        for ci, combo in enumerate(combos):
+            cfg = dict(zip(keys, combo))
+            ch = ch_cache[(cfg["charge_tf"], cfg["squeeze_pctl"])]
             if not ch:
                 continue
-            sw_hi, sw_lo = swings(d[tf])
-            trades += simulate(ch, d[CONFIRM_TF], cfg, TF_SEC[tf], sw_hi, sw_lo, d[tf])
-        st = stats(trades)
-        if st:
-            results.append((cfg, st, trades))
-        if ci % 20 == 0:
-            print(f"  протестировано комбинаций: {ci}/{len(combos)}")
+            sw_hi, sw_lo = sw_cache[cfg["charge_tf"]]
+            tr = simulate(ch, d[CONFIRM_TF], cfg, TF_SEC[cfg["charge_tf"]], sw_hi, sw_lo, d[cfg["charge_tf"]])
+            for t in tr:
+                acc[ci].add(t)
+            n_tr += len(tr)
+        d.clear(); ch_cache.clear(); sw_cache.clear(); gc.collect()
+        el = int(time.time() - t0)
+        left = int(el / idx * (len(pairs) - idx))
+        print(f"  [{idx}/{len(pairs)}] {sym}: дней {depth} | сделок по всем комбинациям {n_tr} "
+              f"| прошло {el}с, осталось ~{left}с")
 
+    results = []
+    for ci, combo in enumerate(combos):
+        st = acc[ci].result()
+        if st and st["n"] >= 30:          # комбинации с горсткой сделок не показываем
+            results.append((dict(zip(keys, combo)), st))
+    if not results:
+        send_telegram("🔬 Бэктест: не набралось сделок для выводов. "
+                      "Попробуй увеличить BT_DAYS или снизить пороги.")
+        return
     results.sort(key=lambda r: -r[1]["avg"])
-    lines = [f"🔬 <b>Бэктест готов</b> — {len(data)} пар, {DAYS} дней, подтверждение {CONFIRM_TF}",
-             f"Комбинаций: {len(results)}\n",
-             "<b>Лучшие 12 (по прибыли на сделку, после комиссии):</b>"]
-    for cfg, st, _ in results[:12]:
+
+    lines = ["🔬 <b>Бэктест готов</b>",
+             f"Пар: {used} (пропущено {len(skipped)}) | дней: {DAYS} | подтверждение: {CONFIRM_TF}",
+             f"Комбинаций с ≥30 сделками: {len(results)} из {len(combos)}\n",
+             "<b>Лучшие 12 (прибыль на сделку, после комиссии):</b>"]
+    for cfg, st in results[:12]:
         lines.append(f"{cfg['charge_tf']:>3} | сжатие {cfg['squeeze_pctl']:>2} | {cfg['confirm']:>5} | "
                      f"объём {cfg['min_bar_rvol']:.1f}× | стоп {cfg['stop_atr']}ATR | {cfg['targets']:>7} | "
                      f"{cfg['session']:>3} → n={st['n']:<5} winrate {st['wr']:.0f}% "
-                     f"на сделку {st['avg']:+.3f}% всего {st['total']:+.0f}% PF {st['pf']:.2f}")
+                     f"на сделку {st['avg']:+.3f}% | стоп {st['stop']:.2f}% | PF {st['pf']:.2f}")
     lines.append("\n<b>Худшие 3:</b>")
-    for cfg, st, _ in results[-3:]:
+    for cfg, st in results[-3:]:
         lines.append(f"{cfg['charge_tf']} | {cfg['confirm']} | {cfg['targets']} | {cfg['session']} → "
                      f"n={st['n']} на сделку {st['avg']:+.3f}%")
 
     def summarize(param):
         agg = {}
-        for cfg, st, _ in results:
+        for cfg, st in results:
             agg.setdefault(cfg[param], []).append(st)
         out = [f"\n<b>Влияние «{param}»</b> (среднее по остальным настройкам):"]
         for val, sts in sorted(agg.items(), key=lambda x: -sum(s["avg"] for s in x[1]) / len(x[1])):
@@ -448,16 +482,12 @@ def main():
     for p in keys:
         lines += summarize(p)
 
-    best_cfg, best_st, best_tr = results[0]
-    by_side, by_hour = {}, {}
-    for t in best_tr:
-        by_side.setdefault(t["side"], []).append(t["pnl"])
-        by_hour.setdefault(t["hour"], []).append(t["pnl"])
+    best_cfg, best_st = results[0]
     lines.append("\n<b>Лучшая комбинация — детали:</b>")
-    for s, v in by_side.items():
-        lines.append(f"   {s}: n={len(v)}, на сделку {sum(v)/len(v):+.3f}%, всего {sum(v):+.0f}%")
+    for s, (n, tot) in best_st["side"].items():
+        lines.append(f"   {s}: n={n}, на сделку {tot/n:+.3f}%, всего {tot:+.0f}%")
     lines.append("   по часам МСК: " + ", ".join(
-        f"{h}ч {sum(v)/len(v):+.2f}%" for h, v in sorted(by_hour.items())))
+        f"{h}ч {tot/n:+.2f}%" for h, (n, tot) in sorted(best_st["hour"].items())))
     lines.append(f"\nПросадка лучшей: {best_st['dd']:.0f}% | Profit factor {best_st['pf']:.2f}")
     lines.append("\n⚠️ OI, фандинг, taker L/S и дельта в бэктесте НЕ участвуют — Gate не отдаёт их историю.")
     send_telegram("\n".join(lines))
