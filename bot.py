@@ -1870,6 +1870,17 @@ def send_status(signal_count=0, btc_chg=None):
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 
 def main():
+    # Разовый прогон бэктеста: в Render добавить переменную окружения RUN_BACKTEST=1,
+    # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
+    # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
+    if os.environ.get("RUN_BACKTEST") == "1":
+        try:
+            import backtest
+            backtest.main()
+        except Exception as e:
+            traceback.print_exc()
+            send_telegram(f"⚠️ Бэктест не отработал: {esc(str(e))}\nБот продолжает работу в обычном режиме.")
+
     mom_lvl = "🟢" if MOMENTUM_MIN_SCORE >= 8 else "🟡/🟢"
     start_lines = [
         f"🚀 <b>Upscale Bot {BOT_VERSION} запущен</b>",
