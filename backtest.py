@@ -89,7 +89,7 @@ SESSIONS = {
 _lock = threading.Lock()
 _last = [0.0]
 
-def api_get(path, params, tries=3):
+def api_get(path, params, tries=3, quiet=False):
     url = f"https://api.gateio.ws/api/v4/futures/usdt/{path}"
     for a in range(tries):
         with _lock:                       # не чаще 10 запросов в секунду
@@ -101,37 +101,49 @@ def api_get(path, params, tries=3):
             r = requests.get(url, params=params, timeout=20)
             if r.status_code == 429:
                 time.sleep(2 * (a + 1)); continue
+            if r.status_code == 400:      # глубже история не отдаётся — это не сбой
+                if not quiet:
+                    print(f"  [400] {params.get('contract')} {params.get('interval')}: {r.text[:120]}")
+                return None
             r.raise_for_status()
             return r.json()
         except Exception as e:
             if a == tries - 1:
-                print(f"  [ERR] {path} {params.get('contract')}: {e}")
+                if not quiet:
+                    print(f"  [ERR] {path} {params.get('contract')}: {e}")
                 return None
             time.sleep(1 + a)
     return None
 
 def get_candles(sym, tf, frm, to):
-    """Свечи за период с постраничной догрузкой (Gate отдаёт максимум 2000 за раз)."""
+    """Свечи за период. Идём страницами НАЗАД от текущего момента (to + limit) —
+    Gate не отдаёт глубокую историю по from/to для мелких таймфреймов."""
     step = TF_SEC[tf]
-    out, cur = [], frm
-    while cur < to:
-        chunk_to = min(cur + step * 1900, to)
+    out, seen = [], set()
+    cur_to = int(to)
+    for _ in range(40):                       # максимум 40 страниц = до 80 000 свечей
         raw = api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": tf,
-                                       "from": int(cur), "to": int(chunk_to)})
+                                       "to": cur_to, "limit": 1999}, quiet=True)
         if not raw:
             break
+        page = []
         for c in raw:
-            out.append((int(c["t"]), float(c["o"]), float(c["h"]), float(c["l"]),
-                        float(c["c"]), float(c["v"])))
-        cur = chunk_to + step
-        if len(raw) < 2:
+            t = int(c["t"])
+            if t in seen:
+                continue
+            seen.add(t)
+            page.append((t, float(c["o"]), float(c["h"]), float(c["l"]),
+                         float(c["c"]), float(c["v"])))
+        if not page:
             break
+        out.extend(page)
+        oldest = min(p[0] for p in page)
+        if oldest <= frm or len(raw) < 100:    # дошли до нужной даты или история кончилась
+            break
+        cur_to = oldest - step
+    out = [c for c in out if c[0] >= frm]
     out.sort()
-    ded, seen = [], set()
-    for c in out:
-        if c[0] not in seen:
-            seen.add(c[0]); ded.append(c)
-    return ded
+    return out
 
 # ─── ВСПОМОГАТЕЛЬНОЕ ──────────────────────────────────────────────────────────
 
@@ -365,15 +377,19 @@ def main():
     for idx, sym in enumerate(pairs, 1):
         d = {}
         ok = True
+        depth = {}
         for tf in tfs + [CONFIRM_TF]:
             cs = get_candles(sym, tf, frm, now)
             if len(cs) < 200:
-                ok = False; break
+                ok = False
+                depth[tf] = len(cs)
+                break
             d[tf] = cs
+            depth[tf] = round((cs[-1][0] - cs[0][0]) / 86400, 1)
         if ok:
             data[sym] = d
         print(f"  [{idx}/{len(pairs)}] {sym}: {'ok' if ok else 'мало данных'} "
-              f"({int(time.time() - t0)}с)")
+              f"| дней по ТФ: {depth} ({int(time.time() - t0)}с)")
     print(f"Данные загружены за {int(time.time() - t0)}с, пар в работе: {len(data)}")
 
     # заряды считаем один раз на каждую пару/ТФ/порог сжатия
