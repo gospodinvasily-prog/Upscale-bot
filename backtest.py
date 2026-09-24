@@ -35,7 +35,7 @@ import requests
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
 DAYS           = int(os.environ.get("BT_DAYS", "45"))
-N_PAIRS        = int(os.environ.get("BT_PAIRS", "40"))    # BT_PAIRS=103 — все пары (памяти хватает, пары считаются по очереди)
+N_PAIRS        = int(os.environ.get("BT_PAIRS", "103"))   # все пары; пары считаются по очереди, память не копится
 CONFIRM_TF     = os.environ.get("BT_CONFIRM_TF", "5m")     # 1m — точнее, но тяжелее
 FEE_PCT        = 0.10        # комиссия вход+выход, % от объёма (Gate taker ~0.05% × 2)
 MSK            = timezone(timedelta(hours=3))
@@ -79,6 +79,8 @@ BREAK_BUFFER    = 0.001   # 0.1% за уровень
 STOP_MIN, STOP_MAX = 0.8, 3.0      # % границы стопа
 HOLD_BARS_MAX   = 48      # сколько свечей подтверждения держим сделку (48×5м = 4ч)
 TP_MAX_R        = 4.0     # цель не дальше 4 стопов (ограничение на дальние свинги)
+HALF_TS         = [0]     # середина периода — заполняется в main()
+SYM_NOW         = [""]    # какая пара считается сейчас
 WATCH_TTL_MULT  = 16      # заряд живёт N свечей своего ТФ
 
 SESSIONS = {
@@ -333,7 +335,8 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
                 chg = (last - entry) / entry * 100 * (1 if up else -1)
                 res = (abs(tp1 - entry) / entry * 50 + chg * 0.5) if hit1 else chg
             trades.append({"side": side, "pnl": res - FEE_PCT, "hour": datetime.fromtimestamp(c[T], MSK).hour,
-                           "dist": dist, "hit1": hit1})
+                           "dist": dist, "hit1": hit1, "half": 0 if c[T] < HALF_TS[0] else 1,
+                           "sym": SYM_NOW[0]})
             break       # один заряд — одна сделка
     return trades
 
@@ -342,7 +345,7 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
 class Agg:
     """Счётчики по одной комбинации. Сделки не храним — иначе на 648 комбинациях
     и сотне пар память уходит в сотни мегабайт, и Render убивает процесс."""
-    __slots__ = ("n", "wins", "total", "gp", "gl", "eq", "peak", "dd", "dists", "side", "hour")
+    __slots__ = ("n", "wins", "total", "gp", "gl", "eq", "peak", "dd", "dists", "side", "hour", "half", "pair")
 
     def __init__(self):
         self.n = self.wins = 0
@@ -350,6 +353,8 @@ class Agg:
         self.dists = []          # только для медианы стопа, режем до 2000 значений
         self.side = {}           # сторона -> [n, сумма]
         self.hour = {}           # час МСК -> [n, сумма]
+        self.half = {0: [0, 0.0], 1: [0, 0.0]}   # 1-я и 2-я половина периода — проверка на подгонку
+        self.pair = {}           # монета -> [n, сумма, сумма 1-й половины, сумма 2-й]
 
     def add(self, t):
         p = t["pnl"]
@@ -366,6 +371,9 @@ class Agg:
             self.dists.append(t["dist"])
         s = self.side.setdefault(t["side"], [0, 0.0]); s[0] += 1; s[1] += p
         h = self.hour.setdefault(t["hour"], [0, 0.0]); h[0] += 1; h[1] += p
+        q = self.half[t["half"]]; q[0] += 1; q[1] += p
+        pr = self.pair.setdefault(t["sym"], [0, 0.0, 0.0, 0.0])
+        pr[0] += 1; pr[1] += p; pr[2 + t["half"]] += p
 
     def result(self):
         if not self.n:
@@ -374,7 +382,7 @@ class Agg:
                 "total": self.total, "dd": self.dd,
                 "pf": (self.gp / self.gl) if self.gl else float("inf"),
                 "stop": statistics.median(self.dists) if self.dists else 0,
-                "side": self.side, "hour": self.hour}
+                "side": self.side, "hour": self.hour, "half": self.half, "pair": self.pair}
 
 def send_telegram(text):
     print(text)
@@ -395,6 +403,7 @@ def main():
     pairs = ALL_PAIRS[:N_PAIRS]
     now = int(time.time())
     frm = now - DAYS * 86400
+    HALF_TS[0] = frm + DAYS * 86400 // 2      # для проверки «первая половина / вторая»
     keys = list(GRID)
     combos = list(itertools.product(*[GRID[k] for k in keys]))
     tfs = sorted(set(GRID["charge_tf"]))
@@ -421,6 +430,7 @@ def main():
             print(f"  [{idx}/{len(pairs)}] {sym}: мало данных, пропуск")
             continue
         used += 1
+        SYM_NOW[0] = sym
         ch_cache, sw_cache = {}, {}
         for tf in tfs:
             sw_cache[tf] = swings(d[tf])
@@ -463,6 +473,29 @@ def main():
                      f"объём {cfg['min_bar_rvol']:.1f}× | стоп {cfg['stop_atr']}ATR | {cfg['targets']:>7} | "
                      f"{cfg['session']:>3} → n={st['n']:<5} winrate {st['wr']:.0f}% "
                      f"на сделку {st['avg']:+.3f}% | стоп {st['stop']:.2f}% | PF {st['pf']:.2f}")
+    lines.append("\n<b>Проверка на подгонку — лучшие 8 по половинам периода:</b>")
+    lines.append(f"(1-я половина: первые {DAYS//2} дн., 2-я: последние {DAYS - DAYS//2} дн.)")
+    stable = []
+    for cfg, st in results[:8]:
+        h0, h1 = st["half"][0], st["half"][1]
+        a0 = h0[1] / h0[0] if h0[0] else 0
+        a1 = h1[1] / h1[0] if h1[0] else 0
+        ok = "✅ обе" if a0 > 0 and a1 > 0 else ("⚠️ только 1-я" if a0 > 0 else "⚠️ только 2-я")
+        if a0 > 0 and a1 > 0:
+            stable.append((cfg, st, min(a0, a1)))
+        lines.append(f"{cfg['charge_tf']:>3}|{cfg['confirm']:>5}|{cfg['targets']:>7}|об.{cfg['min_bar_rvol']:.1f}× → "
+                     f"1-я {a0:+.3f}% (n={h0[0]}) | 2-я {a1:+.3f}% (n={h1[0]}) {ok}")
+    if stable:
+        stable.sort(key=lambda x: -x[2])
+        cfg, st, worst = stable[0]
+        lines.append(f"\n🏆 <b>Самая устойчивая</b>: {cfg['charge_tf']} | сжатие {cfg['squeeze_pctl']} | "
+                     f"{cfg['confirm']} | объём {cfg['min_bar_rvol']:.1f}× | стоп {cfg['stop_atr']}ATR | "
+                     f"{cfg['targets']} | {cfg['session']}\n   худшая половина {worst:+.3f}% на сделку, "
+                     f"всего {st['total']:+.0f}%, PF {st['pf']:.2f}")
+    else:
+        lines.append("\n⚠️ Ни одна из лучших комбинаций не прибыльна в обеих половинах — "
+                     "это признак подгонки, доверять результату нельзя.")
+
     lines.append("\n<b>Худшие 3:</b>")
     for cfg, st in results[-3:]:
         lines.append(f"{cfg['charge_tf']} | {cfg['confirm']} | {cfg['targets']} | {cfg['session']} → "
@@ -489,6 +522,27 @@ def main():
     lines.append("   по часам МСК: " + ", ".join(
         f"{h}ч {tot/n:+.2f}%" for h, (n, tot) in sorted(best_st["hour"].items())))
     lines.append(f"\nПросадка лучшей: {best_st['dd']:.0f}% | Profit factor {best_st['pf']:.2f}")
+
+    # ── разбор по парам: кто тянет вверх, кто портит ──
+    ref_cfg, ref_st = (stable[0][0], stable[0][1]) if stable else (best_cfg, best_st)
+    pr = [(s, v[0], v[1] / v[0], v[1], v[2], v[3]) for s, v in ref_st["pair"].items() if v[0] >= 5]
+    pr.sort(key=lambda x: -x[2])
+    lines.append(f"\n<b>По парам</b> (комбинация {ref_cfg['charge_tf']}|{ref_cfg['confirm']}|"
+                 f"{ref_cfg['targets']}, только пары с ≥5 сделками):")
+    lines.append("   ЛУЧШИЕ: " + ", ".join(f"{s} {a:+.2f}%({n})" for s, n, a, _, _, _ in pr[:10]))
+    lines.append("   ХУДШИЕ: " + ", ".join(f"{s} {a:+.2f}%({n})" for s, n, a, _, _, _ in pr[-10:]))
+    plus_pairs = [x for x in pr if x[2] > 0]
+    tot_all = sum(x[3] for x in pr)
+    tot_plus = sum(x[3] for x in plus_pairs)
+    lines.append(f"   прибыльных пар {len(plus_pairs)} из {len(pr)} | всего {tot_all:+.0f}% | "
+                 f"только по прибыльным {tot_plus:+.0f}%")
+    # какие пары прибыльны в ОБЕИХ половинах — это не подгонка
+    both = [x for x in pr if x[4] > 0 and x[5] > 0]
+    both.sort(key=lambda x: -x[3])
+    lines.append(f"   прибыльны в обеих половинах периода ({len(both)}): " +
+                 (", ".join(x[0] for x in both[:25]) if both else "нет"))
+    lines.append("   ⚠️ Отбирать пары «по прибыли за прошлое» опасно: половина из них "
+                 "случайна. Ориентируйся на список «в обеих половинах».")
     lines.append("\n⚠️ OI, фандинг, taker L/S и дельта в бэктесте НЕ участвуют — Gate не отдаёт их историю.")
     send_telegram("\n".join(lines))
 
