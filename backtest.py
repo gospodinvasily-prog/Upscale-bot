@@ -311,9 +311,14 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
                 r1, r2 = (1.0, 2.0) if cfg["targets"] == "1R/2R" else (1.5, 3.0)
                 tp1 = entry * (1 + r1 * dist / 100) if up else entry * (1 - r1 * dist / 100)
                 tp2 = entry * (1 + r2 * dist / 100) if up else entry * (1 - r2 * dist / 100)
-            # ведём сделку по свечам подтверждения
+            # Ведём сделку по свечам подтверждения.
+            # При входе «по касанию» сделка открылась ВНУТРИ свечи j, поэтому её остаток
+            # тоже проверяем (консервативно: если в этой же свече есть и стоп, и цель —
+            # считаем стоп). Без этого бэктест не видел разворотов сразу после касания
+            # и завышал результат именно у лучшей комбинации.
+            first_q = j if cfg["confirm"] == "touch" else j + 1
             res, hit1 = None, False
-            for q in range(j + 1, min(j + 1 + HOLD_BARS_MAX, len(conf))):
+            for q in range(first_q, min(first_q + HOLD_BARS_MAX, len(conf))):
                 b = conf[q]
                 stop_hit = b[L] <= stop if up else b[H] >= stop
                 t1_hit   = b[H] >= tp1 if up else b[L] <= tp1
