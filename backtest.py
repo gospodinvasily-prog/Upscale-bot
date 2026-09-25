@@ -62,13 +62,16 @@ TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 # Каждая комбинация прогоняется по всем парам и всей истории.
 
 GRID = {
-    "charge_tf":    ["15m", "30m", "1h"],      # таймфрейм заряда
-    "squeeze_pctl": [25, 35, 50],              # порог сжатия (процентиль ширины BB)
-    "confirm":      ["touch", "close"],        # касание цены или закрытие свечи подтверждения
-    "min_bar_rvol": [0.0, 1.2, 2.0],           # объём свечи пробоя к норме
-    "stop_atr":     [1.0, 1.5],                # стоп = N × ATR за уровнем
-    "targets":      ["1R/2R", "1.5R/3R", "struct"],  # цели
-    "session":      ["all", "v82"],            # всё время или окна 10:00–11:30 и 14:30–21:00 МСК
+    "charge_tf":    ["30m", "1h"],             # 15м в трёх прогонах был худшим — убран
+    "squeeze_pctl": [25, 35],
+    "confirm":      ["touch", "close"],        # касание уровня или закрытие свечи подтверждения
+    "min_bar_rvol": [1.2, 2.0],
+    "stop_atr":     [1.0, 1.5],
+    "targets":      ["struct", "1.5R/3R"],
+    "session":      ["all", "v82"],
+    # фильтр по состоянию BTC: off — без фильтра; trend12 — только по движению за 12ч;
+    # fast1 — только по движению за 1ч (ловит разворот рано); combo — по 1ч, но не против 12ч
+    "btc_filter":   ["off", "trend12", "fast1", "combo"],
 }
 
 ACC_WINDOW      = 12      # свечей в окне заряда
@@ -189,6 +192,54 @@ def swings(cs, left=2, right=2):
             lo.append((i, cs[i][L]))
     return hi, lo
 
+BTC = {"h1": [], "fast": [], "t0h": 0, "t0f": 0, "stepf": 300}
+
+def load_btc(frm, now):
+    """Часовой ряд BTC (для 12ч и 1ч) и ряд подтверждения (для получаса)."""
+    BTC["h1"] = get_candles("BTC", "1h", frm, now)
+    BTC["fast"] = get_candles("BTC", CONFIRM_TF, frm, now)
+    BTC["t0h"] = BTC["h1"][0][T] if BTC["h1"] else 0
+    BTC["t0f"] = BTC["fast"][0][T] if BTC["fast"] else 0
+    BTC["stepf"] = TF_SEC[CONFIRM_TF]
+    return bool(BTC["h1"])
+
+def btc_state(ts):
+    """Изменение BTC за 12ч, 1ч и 30 минут на момент ts (в процентах)."""
+    h = BTC["h1"]
+    if not h:
+        return 0.0, 0.0, 0.0
+    i = min(max(int((ts - BTC["t0h"]) // 3600), 0), len(h) - 1)
+    c_now = h[i][C]
+    c12 = h[max(i - 12, 0)][C]
+    c1 = h[max(i - 1, 0)][C]
+    chg12 = (c_now - c12) / c12 * 100 if c12 else 0.0
+    chg1 = (c_now - c1) / c1 * 100 if c1 else 0.0
+    chg30 = 0.0
+    f = BTC["fast"]
+    if f:
+        j = int((ts - BTC["t0f"]) // BTC["stepf"])
+        back = max(1, 1800 // BTC["stepf"])
+        if 0 <= j < len(f) and j - back >= 0 and f[j - back][C]:
+            chg30 = (f[j][C] - f[j - back][C]) / f[j - back][C] * 100
+    return chg12, chg1, chg30
+
+def btc_allows(ts, is_long, mode):
+    """Пускать ли сделку при текущем состоянии BTC."""
+    if mode == "off":
+        return True
+    chg12, chg1, chg30 = btc_state(ts)
+    sgn = 1 if is_long else -1
+    if mode == "trend12":
+        return chg12 * sgn > 0.5
+    if mode == "fast1":
+        # быстрое окно: ловит разворот, пока 12ч ещё показывает старое направление
+        return (chg1 * sgn > 0.15) or (chg30 * sgn > 0.25)
+    if mode == "combo":
+        fast_ok = (chg1 * sgn > 0.1) or (chg30 * sgn > 0.2)
+        hard_against = chg12 * sgn < -1.5 and chg1 * sgn < 0      # против сильного тренда — нет
+        return fast_ok and not hard_against
+    return True
+
 def in_session(ts, sess):
     if sess is None:
         return True
@@ -284,6 +335,8 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
             if cfg["min_bar_rvol"] and base_bar > 0 and c[V] / base_bar < cfg["min_bar_rvol"]:
                 j += 1; continue
             if not in_session(c[T], SESSIONS[cfg["session"]]):
+                j += 1; continue
+            if not btc_allows(c[T], up, cfg.get("btc_filter", "off")):
                 j += 1; continue
             side = "long" if up else "short"
             level = hi if up else lo
@@ -424,6 +477,11 @@ def main():
                   f"подтверждение: {CONFIRM_TF} | комбинаций: {len(combos)}\n"
                   f"Пары считаются по очереди, память не копится. Это займёт 20–60 минут…")
 
+    if not load_btc(frm, now):
+        print("[BTC] не удалось загрузить — фильтры по BTC работать не будут")
+    else:
+        print(f"[BTC] загружено {len(BTC['h1'])} часовых свечей для фильтров")
+
     # Пары обрабатываем по одной и сразу освобождаем память — иначе 100 пар × месяц
     # пятиминуток не помещаются в память Render.
     acc = [Agg() for _ in range(len(combos))]
@@ -526,6 +584,22 @@ def main():
         return out
     for p in keys:
         lines += summarize(p)
+
+    # ── сравнение фильтров BTC при прочих равных (лучшие настройки) ──
+    base = {"charge_tf": "1h", "squeeze_pctl": 25, "confirm": "touch",
+            "min_bar_rvol": 2.0, "stop_atr": 1.0, "targets": "struct", "session": "v82"}
+    lines.append("\n<b>Фильтр BTC при прочих равных</b> (1h|25|touch|2.0×|1.0ATR|struct|v82):")
+    for cfg, st in results:
+        if all(cfg[k] == v for k, v in base.items()):
+            h0, h1 = st["half"][0], st["half"][1]
+            a0 = h0[1] / h0[0] if h0[0] else 0
+            a1 = h1[1] / h1[0] if h1[0] else 0
+            sh = st["side"].get("short", [0, 0]); lo = st["side"].get("long", [0, 0])
+            lines.append(f"   {cfg['btc_filter']:>7}: n={st['n']:<5} на сделку {st['avg']:+.3f}% | "
+                         f"WR {st['wr']:.0f}% | PF {st['pf']:.2f} | просадка {st['dd']:.0f}%")
+            lines.append(f"            половины: {a0:+.3f}% / {a1:+.3f}% | "
+                         f"лонг {lo[1]/lo[0]:+.3f}% ({lo[0]}) | шорт {sh[1]/sh[0]:+.3f}% ({sh[0]})"
+                         if lo[0] and sh[0] else "")
 
     best_cfg, best_st = results[0]
     lines.append("\n<b>Лучшая комбинация — детали:</b>")
