@@ -243,7 +243,8 @@ def run_trade(ex, j, side, entry, stop, tp1, tp2, day_key):
         chg = (last - entry) / entry * 100 * (1 if up else -1)
         res = (abs(tp1 - entry) / entry * 50 + chg * 0.5) if hit1 else chg
     return {"pnl": res - COST_PCT, "gross": res, "dist": dist, "side": side,
-            "hour": datetime.fromtimestamp(ex[j][T], MSK).hour, "day": day_key}
+            "hour": datetime.fromtimestamp(ex[j][T], MSK).hour, "day": day_key,
+            "ts": ex[j][T]}
 
 def targets_struct(entry, level, height, dist, up, sw_hi, sw_lo):
     lim = entry * (1 + TP_MAX_R * dist / 100) if up else entry * (1 - TP_MAX_R * dist / 100)
@@ -263,6 +264,8 @@ def strat_ours(sym, ex, h1, cfg):
     trades = []
     if len(h1) < BASE_FROM + ACC_WINDOW + 5 or not ex:
         return trades
+    vw = day_vwap(ex)
+    atrs_ex = atr_series(ex, 14)
     trs, bbw = true_ranges(h1), bb_width(h1)
     sw_hi, sw_lo = swings(h1)
     ex_ts = {c[T]: i for i, c in enumerate(ex)}
@@ -320,6 +323,11 @@ def strat_ours(sym, ex, h1, cfg):
             tp1, tp2 = targets_struct(entry, level, hi - lo, dist, up, sw_hi, sw_lo)
             t = run_trade(ex, j, "long" if up else "short", entry, stop, tp1, tp2, msk_day(c[T]))
             if t:
+                v, a_ex = vw[j], atrs_ex[j]
+                t["vwap_side"] = (entry >= v) if up else (entry <= v)     # вход по «правильную» сторону VWAP
+                t["vwap_atr"] = abs(entry - v) / a_ex if a_ex else 0      # насколько далеко ушли от VWAP
+                t["btc_abs"] = abs(btc_chg12(c[T]))
+                t["sym"] = sym
                 trades.append(t)
             break
     return trades
@@ -522,6 +530,82 @@ def corr(a, b):
         return None
     return sum((x[i] - mx) * (y[i] - my) for i in range(len(x))) / (sx * sy)
 
+def filter_lab(trades):
+    """Прогоняет уже собранные сделки через разные фильтры и сравнивает итог.
+    Сделки не пересчитываются — меняется только то, какие из них мы берём."""
+    trades = sorted(trades, key=lambda t: t["ts"])
+
+    def run(keep, cap_day=None, stop_after_losses=None, one_per_sym=False, max_side_30m=None):
+        taken, per_day, losses_day, sym_day, recent = [], {}, {}, set(), []
+        for t in trades:
+            if not keep(t):
+                continue
+            d = t["day"]
+            if one_per_sym and (t["sym"], d) in sym_day:
+                continue
+            if cap_day and per_day.get(d, 0) >= cap_day:
+                continue
+            if stop_after_losses and losses_day.get(d, 0) >= stop_after_losses:
+                continue
+            if max_side_30m:
+                recent = [r for r in recent if t["ts"] - r[0] <= 1800]
+                if sum(1 for r in recent if r[1] == t["side"]) >= max_side_30m:
+                    continue
+                recent.append((t["ts"], t["side"]))
+            taken.append(t)
+            per_day[d] = per_day.get(d, 0) + 1
+            sym_day.add((t["sym"], d))
+            if t["pnl"] <= 0:
+                losses_day[d] = losses_day.get(d, 0) + 1
+        if len(taken) < 50:
+            return None
+        pnl = [t["pnl"] for t in taken]
+        eq = peak = dd = 0.0
+        day_pnl = {}
+        for t in taken:
+            eq += t["pnl"]; peak = max(peak, eq); dd = min(dd, eq - peak)
+            day_pnl[t["day"]] = day_pnl.get(t["day"], 0) + t["pnl"]
+        wr = sum(1 for p in pnl if p > 0) / len(pnl) * 100
+        worst_day = min(day_pnl.values()) if day_pnl else 0
+        return {"n": len(taken), "wr": wr, "avg": sum(pnl) / len(pnl), "total": sum(pnl),
+                "dd": dd, "worst_day": worst_day, "per_day": len(taken) / max(len(day_pnl), 1)}
+
+    tests = [
+        ("без фильтров (как есть)", dict(keep=lambda t: True)),
+        ("вход по нужную сторону VWAP", dict(keep=lambda t: t.get("vwap_side", True))),
+        ("не дальше 2 ATR от VWAP", dict(keep=lambda t: t.get("vwap_atr", 0) <= 2)),
+        ("VWAP: сторона + не дальше 2 ATR", dict(keep=lambda t: t.get("vwap_side", True) and t.get("vwap_atr", 0) <= 2)),
+        ("BTC двигался сильно (≥1.5% за 12ч)", dict(keep=lambda t: t.get("btc_abs", 0) >= 1.5)),
+        ("одна сделка на монету в день", dict(keep=lambda t: True, one_per_sym=True)),
+        ("не больше 2 в одну сторону за 30 мин", dict(keep=lambda t: True, max_side_30m=2)),
+        ("максимум 8 сделок в день", dict(keep=lambda t: True, cap_day=8)),
+        ("стоп дня: после 3 убытков не торгуем", dict(keep=lambda t: True, stop_after_losses=3)),
+        ("8 в день + одна на монету", dict(keep=lambda t: True, cap_day=8, one_per_sym=True)),
+        ("8 в день + одна на монету + стоп дня 3", dict(keep=lambda t: True, cap_day=8, one_per_sym=True, stop_after_losses=3)),
+        ("VWAP-сторона + 8 в день + одна на монету", dict(keep=lambda t: t.get("vwap_side", True), cap_day=8, one_per_sym=True)),
+        ("всё вместе (VWAP + 8/день + 1/монету + стоп дня)",
+         dict(keep=lambda t: t.get("vwap_side", True), cap_day=8, one_per_sym=True, stop_after_losses=3)),
+    ]
+    out = ["\n<b>ЛАБОРАТОРИЯ ФИЛЬТРОВ (наша стратегия)</b>",
+           "Что будет с просадкой и прибылью, если отбирать сделки по-разному:"]
+    base = None
+    for name, kw in tests:
+        r = run(**kw)
+        if not r:
+            out.append(f"   {name}: сделок мало"); continue
+        if base is None:
+            base = r
+        d_avg = r["avg"] - base["avg"]
+        d_dd = r["dd"] - base["dd"]
+        mark = "✅" if (r["dd"] > base["dd"] * 0.75 and r["avg"] >= base["avg"] - 0.02) else (
+                "🟡" if r["dd"] > base["dd"] else "⚪")
+        out.append(f"   {mark} {name}")
+        out.append(f"        n={r['n']:<5} ({r['per_day']:.1f}/день) | WR {r['wr']:.0f}% | "
+                   f"на сделку {r['avg']:+.3f}% ({d_avg:+.3f}) | всего {r['total']:+.0f}% | "
+                   f"просадка {r['dd']:.0f}% ({d_dd:+.0f}) | худший день {r['worst_day']:.1f}%")
+    out.append("   ✅ — просадка заметно меньше без потери прибыли на сделку")
+    return out
+
 def send_telegram(text):
     print(text)
     if not (TELEGRAM_TOKEN and CHAT_ID):
@@ -551,6 +635,7 @@ def main():
     if not load_btc(frm, now):
         print("[BTC] не загружен — фильтр BTC работать не будет")
 
+    ours_trades = []
     used, depth_note, t0 = 0, "", time.time()
     for idx, sym in enumerate(pairs, 1):
         ex = get_candles(sym, EXEC_TF, frm, now)
@@ -572,6 +657,8 @@ def main():
             for t in trs:
                 ts_day = datetime.strptime(t["day"], "%Y-%m-%d").replace(tzinfo=MSK).timestamp()
                 acc[(name, i)].add(t, sym, 0 if ts_day < half_ts else 1)
+            if name == "OURS" and i == 0:          # сделки основного варианта — для лаборатории фильтров
+                ours_trades.extend(trs)
             n_all += len(trs)
         del ex, h1; gc.collect()
         el = int(time.time() - t0)
@@ -626,6 +713,8 @@ def main():
         lines.append("\n<b>По часам МСК (лучшая стратегия)</b>:")
         bn, (bc, bst) = order[0]
         lines.append(f"   {bn}: " + ", ".join(f"{h}ч {v[1]/v[0]:+.2f}%" for h, v in sorted(bst["hour"].items())))
+    if ours_trades:
+        lines += filter_lab(ours_trades)
     lines.append("\n⚠️ OI, фандинг и дельта не участвуют — у Gate нет их истории. "
                  "Все стратегии считаны одним движком с одинаковыми издержками.")
     send_telegram("\n".join(lines))
