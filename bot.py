@@ -34,6 +34,13 @@ TRADING_END_MSK   = 21
 # заряды копятся, watchlist живёт, но сигналы не создаются и в csv не пишутся.
 SIGNAL_WINDOWS    = [(10, 0, 11, 30), (14, 30, 21, 0)]
 SUMMARY_HHMM      = (21, 30)   # сводка дня + csv-файлы в Telegram
+
+# ── Риск на сделку (Upscale: счёт $5000, лимит −$150 в день и −6% = −$300 всего) ──
+# Худшая просадка по бэктесту ≈ 36 стопов подряд: при риске $5 это −$180 из −$300.
+ACCOUNT_USD   = float(os.environ.get("ACCOUNT_USD", "5000"))
+RISK_USD      = float(os.environ.get("RISK_USD", "5"))      # сколько теряем, если сработал стоп
+MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "1500"))  # потолок размера позиции
+DAY_LOSS_USD  = float(os.environ.get("DAY_LOSS_USD", "150"))  # дневной лимит пропфёрма
 MSK = timezone(timedelta(hours=3))
 
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
@@ -949,6 +956,18 @@ def send_daily_summary():
 
 # ─── ОБЩИЕ РАСЧЁТЫ СТОПОВ И ЦЕЛЕЙ ────────────────────────────────────────────
 
+def position_line(price: float, stop_pct: float) -> str:
+    """Размер позиции под фиксированный риск в деньгах: позиция = риск / стоп%."""
+    if stop_pct <= 0 or price <= 0:
+        return ""
+    pos = min(RISK_USD / (stop_pct / 100), MAX_POS_USD)
+    qty = pos / price
+    qty_txt = f"{qty:,.0f}" if qty >= 100 else (f"{qty:.2f}" if qty >= 1 else f"{qty:.4g}")
+    capped = " (упёрлись в потолок)" if pos >= MAX_POS_USD else ""
+    return (f"   💰 Позиция: <b>${pos:,.0f}</b> ≈ {qty_txt} монет{capped}\n"
+            f"      риск ${RISK_USD:,.0f} при стопе {stop_pct:.2f}% | "
+            f"стопов до дневного лимита: {int(DAY_LOSS_USD // max(RISK_USD, 1))}")
+
 def calc_dynamic_stop_pct(atr: float, price: float) -> float:
     """Стоп = max(базовый 1.5%, ATR%), но не дальше аварийного потолка 3%."""
     if price <= 0:
@@ -1339,6 +1358,7 @@ def format_breakout(b: dict, score: int, verdict: str, plus: list, minus: list) 
         f"Фандинг: {b['funding']:+.3f}% | 24ч: {b['change_24h']:+.1f}%",
         f"   Вход: <b>{b['price']:.6g}</b>",
         f"   Стоп: {b['stop']:.6g} ({sign}{b['stop_pct']:.2f}%) — за уровнем",
+        position_line(b["price"], b["stop_pct"]).rstrip(),
         f"   TP1: {b['tp1_price']:.6g} ({b['tp1_pct']:+.1f}%) — {b['tp1_label']} — 50%",
         f"   TP2: {b['tp2_price']:.6g} ({b['tp2_pct']:+.1f}%) — {b['tp2_label']} — 50%",
         f"📊 Оценка: <b>{score}</b> — {verdict}",
@@ -1676,6 +1696,7 @@ def format_momentum(s: dict, i: int, is_long: bool, score: int, verdict: str, pl
         f"   Комната до {'хая' if is_long else 'лоя'}: {s['room_pct']:.2f}%",
         f"   Вход: <b>{s['price']:.6g}</b>",
         f"   Стоп: {s['stop']:.6g} ({sign}{s['stop_pct']:.2f}%)",
+        position_line(s["price"], s["stop_pct"]).rstrip(),
         f"   TP1: {s['tp1_price']:.6g} ({s['tp1_pct']:+.1f}%) — {s['tp1_label']} — 50%",
         f"   TP2: {s['tp2_price']:.6g} ({s['tp2_pct']:+.1f}%) — {s['tp2_label']} — 50%",
         f"   📊 Оценка: <b>{score}</b>",
@@ -1873,7 +1894,7 @@ def main():
     # Разовый прогон бэктеста: в Render добавить переменную окружения RUN_BACKTEST=1,
     # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
-    if os.environ.get("RUN_BACKTEST") == "1":
+    if os.environ.get("RUN_BACKTEST") in ("1", "compare"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -1895,8 +1916,12 @@ def main():
             except Exception:
                 pass
             try:
-                import backtest
-                backtest.main()
+                if os.environ.get("RUN_BACKTEST") == "compare":
+                    import bt_compare
+                    bt_compare.main()      # сравнение стратегий
+                else:
+                    import backtest
+                    backtest.main()        # перебор настроек нашей стратегии
             except MemoryError:
                 traceback.print_exc()
                 send_telegram("⚠️ Бэктесту не хватило памяти. Уменьши BT_PAIRS (например 30) "
