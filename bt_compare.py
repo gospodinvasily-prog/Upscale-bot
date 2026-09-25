@@ -214,37 +214,38 @@ def run_trade(ex, j, side, entry, stop, tp1, tp2, day_key):
     dist = abs(entry - stop) / entry * 100
     if dist <= 0:
         return None
-    hit1, res = False, None
+    hit1, res, exit_ts = False, None, ex[-1][T]
     for q in range(j, len(ex)):
         b = ex[q]
         if msk_day(b[T]) != day_key or msk_min(b[T]) >= DAY_END_MIN:
             last = ex[q - 1][C] if q else entry
             chg = (last - entry) / entry * 100 * (1 if up else -1)
             res = (abs(tp1 - entry) / entry * 50 + chg * 0.5) if hit1 else chg
+            exit_ts = b[T]
             break
         stop_hit = b[L] <= stop if up else b[H] >= stop
         t1 = b[H] >= tp1 if up else b[L] <= tp1
         t2 = b[H] >= tp2 if up else b[L] <= tp2
         if not hit1:
             if stop_hit:
-                res = -dist; break          # стоп раньше цели (консервативно)
+                res = -dist; exit_ts = b[T]; break   # стоп раньше цели (консервативно)
             if t1:
                 hit1 = True
                 if t2:
-                    res = abs(tp1 - entry) / entry * 50 + abs(tp2 - entry) / entry * 50; break
+                    res = abs(tp1 - entry) / entry * 50 + abs(tp2 - entry) / entry * 50; exit_ts = b[T]; break
                 continue
         else:
             if t2:
-                res = abs(tp1 - entry) / entry * 50 + abs(tp2 - entry) / entry * 50; break
+                res = abs(tp1 - entry) / entry * 50 + abs(tp2 - entry) / entry * 50; exit_ts = b[T]; break
             if stop_hit:
-                res = abs(tp1 - entry) / entry * 50; break     # половина взята, остаток в ноль
+                res = abs(tp1 - entry) / entry * 50; exit_ts = b[T]; break   # половина взята, остаток в ноль
     if res is None:
         last = ex[-1][C]
         chg = (last - entry) / entry * 100 * (1 if up else -1)
         res = (abs(tp1 - entry) / entry * 50 + chg * 0.5) if hit1 else chg
     return {"pnl": res - COST_PCT, "gross": res, "dist": dist, "side": side,
             "hour": datetime.fromtimestamp(ex[j][T], MSK).hour, "day": day_key,
-            "ts": ex[j][T]}
+            "ts": ex[j][T], "exit_ts": exit_ts}
 
 def targets_struct(entry, level, height, dist, up, sw_hi, sw_lo):
     lim = entry * (1 + TP_MAX_R * dist / 100) if up else entry * (1 - TP_MAX_R * dist / 100)
@@ -536,16 +537,21 @@ def filter_lab(trades):
     trades = sorted(trades, key=lambda t: t["ts"])
 
     def run(keep, cap_day=None, stop_after_losses=None, one_per_sym=False, max_side_30m=None):
-        taken, per_day, losses_day, sym_day, recent = [], {}, {}, set(), []
+        taken, per_day, sym_day, recent = [], {}, set(), []
+        closed = []          # (время закрытия, день, убыток?) — только уже известные на момент входа
         for t in trades:
             if not keep(t):
                 continue
             d = t["day"]
+            # ВАЖНО: убытки дня считаем по времени ЗАКРЫТИЯ сделок, а не открытия —
+            # иначе получилось бы подглядывание в будущее (исход ещё не известен).
+            losses_known = sum(1 for (ets, dd, lost) in closed
+                               if lost and dd == d and ets <= t["ts"])
             if one_per_sym and (t["sym"], d) in sym_day:
                 continue
             if cap_day and per_day.get(d, 0) >= cap_day:
                 continue
-            if stop_after_losses and losses_day.get(d, 0) >= stop_after_losses:
+            if stop_after_losses and losses_known >= stop_after_losses:
                 continue
             if max_side_30m:
                 recent = [r for r in recent if t["ts"] - r[0] <= 1800]
@@ -555,8 +561,7 @@ def filter_lab(trades):
             taken.append(t)
             per_day[d] = per_day.get(d, 0) + 1
             sym_day.add((t["sym"], d))
-            if t["pnl"] <= 0:
-                losses_day[d] = losses_day.get(d, 0) + 1
+            closed.append((t.get("exit_ts", t["ts"]), d, t["pnl"] <= 0))
         if len(taken) < 50:
             return None
         pnl = [t["pnl"] for t in taken]
@@ -583,8 +588,16 @@ def filter_lab(trades):
         ("8 в день + одна на монету", dict(keep=lambda t: True, cap_day=8, one_per_sym=True)),
         ("8 в день + одна на монету + стоп дня 3", dict(keep=lambda t: True, cap_day=8, one_per_sym=True, stop_after_losses=3)),
         ("VWAP-сторона + 8 в день + одна на монету", dict(keep=lambda t: t.get("vwap_side", True), cap_day=8, one_per_sym=True)),
-        ("всё вместе (VWAP + 8/день + 1/монету + стоп дня)",
-         dict(keep=lambda t: t.get("vwap_side", True), cap_day=8, one_per_sym=True, stop_after_losses=3)),
+        ("≤2 ATR от VWAP + одна на монету", dict(keep=lambda t: t.get("vwap_atr", 0) <= 2, one_per_sym=True)),
+        ("≤2 ATR от VWAP + 8 в день", dict(keep=lambda t: t.get("vwap_atr", 0) <= 2, cap_day=8)),
+        ("≤2 ATR + 8/день + 1/монету", dict(keep=lambda t: t.get("vwap_atr", 0) <= 2, cap_day=8, one_per_sym=True)),
+        ("≤2 ATR + 8/день + 1/монету + ≤2 в сторону/30мин",
+         dict(keep=lambda t: t.get("vwap_atr", 0) <= 2, cap_day=8, one_per_sym=True, max_side_30m=2)),
+        ("≤2 ATR + 8/день + 1/монету + стоп дня 3",
+         dict(keep=lambda t: t.get("vwap_atr", 0) <= 2, cap_day=8, one_per_sym=True, stop_after_losses=3)),
+        ("ВСЁ: ≤2 ATR + 8/день + 1/монету + ≤2/30мин + стоп дня 3",
+         dict(keep=lambda t: t.get("vwap_atr", 0) <= 2, cap_day=8, one_per_sym=True,
+              max_side_30m=2, stop_after_losses=3)),
     ]
     out = ["\n<b>ЛАБОРАТОРИЯ ФИЛЬТРОВ (наша стратегия)</b>",
            "Что будет с просадкой и прибылью, если отбирать сделки по-разному:"]
