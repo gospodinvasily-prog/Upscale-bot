@@ -38,6 +38,8 @@ DAYS           = int(os.environ.get("BT_DAYS", "45"))
 N_PAIRS        = int(os.environ.get("BT_PAIRS", "103"))   # все пары; пары считаются по очереди, память не копится
 CONFIRM_TF     = os.environ.get("BT_CONFIRM_TF", "5m")     # 1m — точнее, но тяжелее
 FEE_PCT        = 0.10        # комиссия вход+выход, % от объёма (Gate taker ~0.05% × 2)
+SLIP_PCT       = float(os.environ.get("BT_SLIP", "0.05"))   # проскальзывание на КАЖДОЙ стороне, %
+COST_PCT       = FEE_PCT + 2 * SLIP_PCT                     # полные издержки на сделку
 MSK            = timezone(timedelta(hours=3))
 
 ALL_PAIRS = [
@@ -339,7 +341,8 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
                 last = conf[min(j + HOLD_BARS_MAX, len(conf) - 1)][C]
                 chg = (last - entry) / entry * 100 * (1 if up else -1)
                 res = (abs(tp1 - entry) / entry * 50 + chg * 0.5) if hit1 else chg
-            trades.append({"side": side, "pnl": res - FEE_PCT, "hour": datetime.fromtimestamp(c[T], MSK).hour,
+            trades.append({"side": side, "pnl": res - COST_PCT, "gross": res,
+                           "hour": datetime.fromtimestamp(c[T], MSK).hour,
                            "dist": dist, "hit1": hit1, "half": 0 if c[T] < HALF_TS[0] else 1,
                            "sym": SYM_NOW[0]})
             break       # один заряд — одна сделка
@@ -350,7 +353,7 @@ def simulate(charges, conf, cfg, tf_sec, sw_hi, sw_lo, cs_tf):
 class Agg:
     """Счётчики по одной комбинации. Сделки не храним — иначе на 648 комбинациях
     и сотне пар память уходит в сотни мегабайт, и Render убивает процесс."""
-    __slots__ = ("n", "wins", "total", "gp", "gl", "eq", "peak", "dd", "dists", "side", "hour", "half", "pair")
+    __slots__ = ("n", "wins", "total", "gp", "gl", "eq", "peak", "dd", "dists", "side", "hour", "half", "pair", "gross")
 
     def __init__(self):
         self.n = self.wins = 0
@@ -360,9 +363,11 @@ class Agg:
         self.hour = {}           # час МСК -> [n, сумма]
         self.half = {0: [0, 0.0], 1: [0, 0.0]}   # 1-я и 2-я половина периода — проверка на подгонку
         self.pair = {}           # монета -> [n, сумма, сумма 1-й половины, сумма 2-й]
+        self.gross = 0.0         # сумма до издержек — для проверки разных проскальзываний
 
     def add(self, t):
         p = t["pnl"]
+        self.gross += t.get("gross", p)
         self.n += 1
         if p > 0:
             self.wins += 1; self.gp += p
@@ -387,7 +392,8 @@ class Agg:
                 "total": self.total, "dd": self.dd,
                 "pf": (self.gp / self.gl) if self.gl else float("inf"),
                 "stop": statistics.median(self.dists) if self.dists else 0,
-                "side": self.side, "hour": self.hour, "half": self.half, "pair": self.pair}
+                "side": self.side, "hour": self.hour, "half": self.half, "pair": self.pair,
+                "gross_avg": self.gross / self.n}
 
 def send_telegram(text):
     print(text)
@@ -471,6 +477,7 @@ def main():
 
     lines = ["🔬 <b>Бэктест готов</b>",
              f"Пар: {used} (пропущено {len(skipped)}) | дней: {DAYS} | подтверждение: {CONFIRM_TF}",
+             f"Издержки: комиссия {FEE_PCT}% + проскальзывание {SLIP_PCT}%×2 = {COST_PCT}% на сделку",
              f"Комбинаций с ≥30 сделками: {len(results)} из {len(combos)}\n",
              "<b>Лучшие 12 (прибыль на сделку, после комиссии):</b>"]
     for cfg, st in results[:12]:
@@ -527,6 +534,16 @@ def main():
     lines.append("   по часам МСК: " + ", ".join(
         f"{h}ч {tot/n:+.2f}%" for h, (n, tot) in sorted(best_st["hour"].items())))
     lines.append(f"\nПросадка лучшей: {best_st['dd']:.0f}% | Profit factor {best_st['pf']:.2f}")
+
+    # ── насколько результат держится при разном проскальзывании ──
+    ref = stable[0][1] if stable else best_st
+    lines.append("\n<b>Чувствительность к проскальзыванию</b> (устойчивая комбинация, "
+                 f"{ref['n']} сделок, до издержек {ref['gross_avg']:+.3f}%):")
+    for slip in (0.0, 0.03, 0.05, 0.10, 0.15):
+        net = ref["gross_avg"] - (FEE_PCT + 2 * slip)
+        mark = "✅" if net > 0.1 else ("⚠️" if net > 0 else "❌")
+        lines.append(f"   {mark} проскальзывание {slip:.2f}% → на сделку {net:+.3f}% | "
+                     f"за период {net * ref['n']:+.0f}%")
 
     # ── разбор по парам: кто тянет вверх, кто портит ──
     ref_cfg, ref_st = (stable[0][0], stable[0][1]) if stable else (best_cfg, best_st)
