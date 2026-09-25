@@ -435,8 +435,9 @@ class Agg:
         s = self.side.setdefault(t["side"], [0, 0.0]); s[0] += 1; s[1] += p
         h = self.hour.setdefault(t["hour"], [0, 0.0]); h[0] += 1; h[1] += p
         q = self.half[t["half"]]; q[0] += 1; q[1] += p
-        pr = self.pair.setdefault(t["sym"], [0, 0.0, 0.0, 0.0])
-        pr[0] += 1; pr[1] += p; pr[2 + t["half"]] += p
+        pr = self.pair.setdefault(t["sym"], [0, 0.0, 0, 0.0, 0, 0.0])
+        pr[0] += 1; pr[1] += p
+        pr[2 + 2 * t["half"]] += 1; pr[3 + 2 * t["half"]] += p
 
     def result(self):
         if not self.n:
@@ -539,9 +540,9 @@ def main():
              f"Комбинаций с ≥30 сделками: {len(results)} из {len(combos)}\n",
              "<b>Лучшие 12 (прибыль на сделку, после комиссии):</b>"]
     for cfg, st in results[:12]:
-        lines.append(f"{cfg['charge_tf']:>3} | сжатие {cfg['squeeze_pctl']:>2} | {cfg['confirm']:>5} | "
-                     f"объём {cfg['min_bar_rvol']:.1f}× | стоп {cfg['stop_atr']}ATR | {cfg['targets']:>7} | "
-                     f"{cfg['session']:>3} → n={st['n']:<5} winrate {st['wr']:.0f}% "
+        lines.append(f"{cfg['charge_tf']:>3} | сж{cfg['squeeze_pctl']:>2} | {cfg['confirm']:>5} | "
+                     f"об.{cfg['min_bar_rvol']:.1f}× | {cfg['stop_atr']}ATR | {cfg['targets']:>7} | "
+                     f"{cfg['session']:>3} | BTC:{cfg.get('btc_filter','off'):>7} → n={st['n']:<5} WR {st['wr']:.0f}% "
                      f"на сделку {st['avg']:+.3f}% | стоп {st['stop']:.2f}% | PF {st['pf']:.2f}")
     lines.append("\n<b>Проверка на подгонку — лучшие 8 по половинам периода:</b>")
     lines.append(f"(1-я половина: первые {DAYS//2} дн., 2-я: последние {DAYS - DAYS//2} дн.)")
@@ -553,14 +554,15 @@ def main():
         ok = "✅ обе" if a0 > 0 and a1 > 0 else ("⚠️ только 1-я" if a0 > 0 else "⚠️ только 2-я")
         if a0 > 0 and a1 > 0:
             stable.append((cfg, st, min(a0, a1)))
-        lines.append(f"{cfg['charge_tf']:>3}|{cfg['confirm']:>5}|{cfg['targets']:>7}|об.{cfg['min_bar_rvol']:.1f}× → "
+        lines.append(f"{cfg['charge_tf']}|{cfg['confirm']}|{cfg['targets']}|об.{cfg['min_bar_rvol']:.1f}×|"
+                     f"BTC:{cfg.get('btc_filter','off')} → "
                      f"1-я {a0:+.3f}% (n={h0[0]}) | 2-я {a1:+.3f}% (n={h1[0]}) {ok}")
     if stable:
         stable.sort(key=lambda x: -x[2])
         cfg, st, worst = stable[0]
         lines.append(f"\n🏆 <b>Самая устойчивая</b>: {cfg['charge_tf']} | сжатие {cfg['squeeze_pctl']} | "
                      f"{cfg['confirm']} | объём {cfg['min_bar_rvol']:.1f}× | стоп {cfg['stop_atr']}ATR | "
-                     f"{cfg['targets']} | {cfg['session']}\n   худшая половина {worst:+.3f}% на сделку, "
+                     f"{cfg['targets']} | {cfg['session']} | BTC-фильтр {cfg.get('btc_filter','off')}\n   худшая половина {worst:+.3f}% на сделку, "
                      f"всего {st['total']:+.0f}%, PF {st['pf']:.2f}")
     else:
         lines.append("\n⚠️ Ни одна из лучших комбинаций не прибыльна в обеих половинах — "
@@ -621,7 +623,7 @@ def main():
 
     # ── разбор по парам: кто тянет вверх, кто портит ──
     ref_cfg, ref_st = (stable[0][0], stable[0][1]) if stable else (best_cfg, best_st)
-    pr = [(s, v[0], v[1] / v[0], v[1], v[2], v[3]) for s, v in ref_st["pair"].items() if v[0] >= 5]
+    pr = [(s, v[0], v[1] / v[0], v[1], v[3], v[5]) for s, v in ref_st["pair"].items() if v[0] >= 5]
     pr.sort(key=lambda x: -x[2])
     lines.append(f"\n<b>По парам</b> (комбинация {ref_cfg['charge_tf']}|{ref_cfg['confirm']}|"
                  f"{ref_cfg['targets']}, только пары с ≥5 сделками):")
@@ -633,12 +635,30 @@ def main():
     lines.append(f"   прибыльных пар {len(plus_pairs)} из {len(pr)} | всего {tot_all:+.0f}% | "
                  f"только по прибыльным {tot_plus:+.0f}%")
     # какие пары прибыльны в ОБЕИХ половинах — это не подгонка
-    both = [x for x in pr if x[4] > 0 and x[5] > 0]
-    both.sort(key=lambda x: -x[3])
-    lines.append(f"   прибыльны в обеих половинах периода ({len(both)}): " +
-                 (", ".join(x[0] for x in both[:25]) if both else "нет"))
+
     lines.append("   ⚠️ Отбирать пары «по прибыли за прошлое» опасно: половина из них "
-                 "случайна. Ориентируйся на список «в обеих половинах».")
+                 "случайна. Ниже — честная проверка такого отбора.")
+
+    # ── ОТБОР ПАР ВСЛЕПУЮ: выбираем по 1-й половине, считаем результат на 2-й ──
+    lines.append("\n<b>Проверка отбора пар</b> (выбрали по первым "
+                 f"{DAYS//2} дн., проверили на последних {DAYS - DAYS//2} дн.):")
+    for min_tr in (2, 3, 5):
+        sel = [s for s, v in ref_st["pair"].items() if v[2] >= min_tr and v[3] > 0]
+        h2_sel_n = sum(ref_st["pair"][s][4] for s in sel)
+        h2_sel_p = sum(ref_st["pair"][s][5] for s in sel)
+        h2_all_n = sum(v[4] for v in ref_st["pair"].values())
+        h2_all_p = sum(v[5] for v in ref_st["pair"].values())
+        if h2_sel_n and h2_all_n:
+            a_sel, a_all = h2_sel_p / h2_sel_n, h2_all_p / h2_all_n
+            verdict = "✅ отбор помог" if a_sel > a_all + 0.05 else (
+                      "≈ без разницы" if a_sel > a_all - 0.05 else "❌ отбор навредил")
+            lines.append(f"   отобрано {len(sel)} пар (≥{min_tr} сделок и плюс в 1-й половине) → "
+                         f"2-я половина: {a_sel:+.3f}% на сделку ({h2_sel_n} сд.) "
+                         f"против {a_all:+.3f}% по всем ({h2_all_n} сд.) {verdict}")
+    # полный список устойчивых пар — для списка бота
+    both_all = sorted([s for s, v in ref_st["pair"].items() if v[3] > 0 and v[5] > 0 and v[0] >= 5])
+    lines.append(f"\n<b>Пары в плюсе в ОБЕИХ половинах ({len(both_all)})</b>, полный список:")
+    lines.append("   " + ", ".join(both_all))
     lines.append("\n⚠️ OI, фандинг, taker L/S и дельта в бэктесте НЕ участвуют — Gate не отдаёт их историю.")
     send_telegram("\n".join(lines))
 
