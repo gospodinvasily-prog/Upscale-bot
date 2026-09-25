@@ -1894,7 +1894,12 @@ def main():
     # Разовый прогон бэктеста: в Render добавить переменную окружения RUN_BACKTEST=1,
     # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
-    if os.environ.get("RUN_BACKTEST") in ("1", "compare"):
+    bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
+    print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
+          ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
+           else "не запускаю"))
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -1916,7 +1921,7 @@ def main():
             except Exception:
                 pass
             try:
-                if os.environ.get("RUN_BACKTEST") == "compare":
+                if bt_mode in ("compare", "2", "cmp"):
                     import bt_compare
                     bt_compare.main()      # сравнение стратегий
                 else:
