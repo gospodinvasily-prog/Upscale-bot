@@ -164,6 +164,7 @@ CHARGE_OUTCOMES_CSV  = os.path.join(LOG_DIR, "charge_outcomes_v8.csv")
 CHARGE_EVAL_WINDOW   = 24 * TF_MIN * 60   # заряд оцениваем по ценам за это время после алерта (15м → 6ч)
 CHARGE_FOLLOW_MIN    = 12 * TF_MIN        # насколько ушла цена после выхода из диапазона (15м → 3ч)
 CHARGE_RETURN_MIN    = 15      # возврат внутрь диапазона за 15 мин = ложный выход
+TRADES_CSV           = os.path.join(LOG_DIR, "my_trades_v8.csv")   # мои реальные сделки (команды в чате)
 ALT_P = tf_profile(CHARGE_TF)
 BTC_P = tf_profile(BTC_CHARGE_TF)
 MOM_P = tf_profile("5m")        # ИМПУЛЬС всегда на 5м — его горизонт оценки 1ч
@@ -194,6 +195,10 @@ PENDING_OUTCOMES: list = []
 DAY_RESULTS: list = []
 CHARGE_PENDING: list = []     # эпизоды зарядов, ждущие оценки
 CHARGE_ACTIVE: dict = {}      # sym -> текущий эпизод заряда (для пометки «бот прислал пробой»)
+SENT_SIGNALS: list = []       # последние отправленные сигналы — для команд /fill, /out
+MY_TRADES: dict = {}          # sym -> моя открытая сделка (из команд в чате)
+SLIPPAGE: list = []           # проскальзывание по каждой сделке, %
+TG_OFFSET = [0]               # id последнего прочитанного сообщения
 
 # ─── УТИЛИТЫ ──────────────────────────────────────────────────────────────────
 
@@ -756,6 +761,10 @@ def log_signal(kind: str, s: dict, side: str, score: int):
         "btc12_chg": _market_cache.get("btc12_chg", ""), "btc12_oi": _market_cache.get("btc12_oi", ""),
     }
     _append_csv(SIGNALS_CSV, row)
+    SENT_SIGNALS.append({"symbol": s["symbol"], "side": side, "price": s["price"], "stop": s["stop"],
+                         "tp1": s["tp1_price"], "tp2": s["tp2_price"],
+                         "stop_pct": abs(s.get("stop_pct", STOP_MIN_PCT)), "ts": now_ts, "score": score})
+    del SENT_SIGNALS[:-60]                     # держим последние 60
     PENDING_OUTCOMES.append({"id": sid, "kind": kind, "symbol": s["symbol"], "side": side,
                              "score": score, "entry": s["price"], "stop": s["stop"],
                              "tp1": s["tp1_price"], "tp2": s["tp2_price"], "ts": now_ts,
@@ -1991,8 +2000,12 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
         print(f"[CHARGE] {c['symbol']} {c['side']} score={c['score']}")
         if in_signal_window():
             send_blocks(format_charge(c).split("\n"))
+            WATCHLIST[c["symbol"]]["alerted"] = True
         else:
-            print(f"[CHARGE] {c['symbol']}: вне окна отправки — сообщение не шлём")
+            # вне окна сообщение не шлём, но помечаем: как окно откроется — дошлём,
+            # иначе пробой прилетит по заряду, под который ордера не выставлены
+            WATCHLIST[c["symbol"]]["alerted"] = False
+            print(f"[CHARGE] {c['symbol']}: вне окна — дошлю при открытии окна")
 
     # ── 🚀 ИМПУЛЬС ── (только в окно отправки: вне окна сигнал не создаётся и не логируется)
     if not in_signal_window():
@@ -2049,6 +2062,221 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
     print(f"[SCAN] Лонгов: {len(longs)} | Шортов: {len(shorts)} | Зарядов: {len(charges)} | Watchlist: {len(WATCHLIST)}")
     return sent + len(alerts), btc_chg_15
 
+# ─── КОМАНДЫ В ЧАТЕ ───────────────────────────────────────────────────────────
+# Бот читает сообщения в том же чате, чтобы сравнить «что обещал сигнал»
+# с «что реально получилось»: цену исполнения, факт входа и результат.
+
+TG_READ = {"fails": 0, "quiet_until": 0.0}
+
+def tg_updates():
+    """Новые сообщения из чата (короткий опрос, никаких доп. настроек не нужно)."""
+    if not TELEGRAM_TOKEN or time.time() < TG_READ["quiet_until"]:
+        return []
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        r = requests.get(url, params={"offset": TG_OFFSET[0] + 1, "timeout": 0, "limit": 20}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        TG_READ["fails"] = 0
+        out = []
+        for u in data.get("result", []) if data.get("ok") else []:
+            TG_OFFSET[0] = max(TG_OFFSET[0], u.get("update_id", 0))
+            msg = u.get("message") or u.get("channel_post") or {}
+            text = (msg.get("text") or "").strip()
+            if text and str(msg.get("chat", {}).get("id")) == str(CHAT_ID):
+                out.append(text)
+        return out
+    except Exception as e:
+        # не спамим логом: после трёх неудач подряд молчим 10 минут
+        TG_READ["fails"] += 1
+        if TG_READ["fails"] <= 3:
+            print(f"[TG READ ERROR] {e}")
+        else:
+            TG_READ["quiet_until"] = time.time() + 600
+            TG_READ["fails"] = 0
+            print("[TG READ] команды временно отключены на 10 мин (ошибки чтения)")
+        return []
+
+def last_signal_for(sym: str):
+    best = None
+    for s in SENT_SIGNALS:
+        if s["symbol"] == sym.upper() and (best is None or s["ts"] > best["ts"]):
+            best = s
+    return best
+
+MY_TRADE_COLS = ("symbol", "side", "score", "how", "fill", "sig_price", "slip_pct",
+                 "exit", "tp1_done", "pnl_pct", "pnl_usd", "pos_usd", "note")
+
+def log_my_trade(row: dict):
+    """Набор столбцов фиксирован: иначе строка с лишним полем (например, причина
+    пропуска) заставляет файл пересоздаться, и прежние сделки уезжают в архив."""
+    full = {k: row.get(k, "") for k in MY_TRADE_COLS}
+    full["ver"] = BOT_VERSION
+    full["time_msk"] = msk_time_str()
+    full["date"] = datetime.now(MSK).strftime("%Y-%m-%d")
+    _append_csv(TRADES_CSV, full)
+
+def cmd_fill(sym, price):
+    sig = last_signal_for(sym)
+    if not sig:
+        return f"Не нашёл сигнала по {sym.upper()} — команда работает после ⚡ПРОБОЯ."
+    slip = (price - sig["price"]) / sig["price"] * 100 * (1 if sig["side"] == "long" else -1)
+    MY_TRADES[sym.upper()] = {"sym": sym.upper(), "side": sig["side"], "fill": price,
+                              "sig_price": sig["price"], "stop": sig["stop"], "tp1": sig["tp1"],
+                              "tp2": sig["tp2"], "stop_pct": sig["stop_pct"], "slip": slip,
+                              "score": sig["score"], "ts": time.time(), "tp1_done": False}
+    SLIPPAGE.append(slip)
+    avg = sum(SLIPPAGE) / len(SLIPPAGE)
+    worse = " (хуже, чем в сигнале)" if slip > 0 else ""
+    return (f"✅ <b>{sym.upper()}</b>: в сигнале {sig['price']:.6g}, у тебя {price:.6g}\n"
+            f"Проскальзывание {slip:+.3f}%{worse}\n"
+            f"Среднее за {len(SLIPPAGE)} сделок: {avg:+.3f}% | в бэктест заложено 0.050%")
+
+def close_my_trade(sym, exit_price=None, how="out"):
+    t = MY_TRADES.pop(sym.upper(), None)
+    if not t:
+        return f"По {sym.upper()} нет открытой сделки — сначала /fill."
+    if exit_price is None:
+        exit_price = t["stop"] if how == "stop" else t["tp1"]
+    sign = 1 if t["side"] == "long" else -1
+    part = (exit_price - t["fill"]) / t["fill"] * 100 * sign
+    if t["tp1_done"]:
+        tp1_pct = (t["tp1"] - t["fill"]) / t["fill"] * 100 * sign
+        pnl_pct = tp1_pct * 0.5 + (0.0 if how == "stop" else part * 0.5)
+    else:
+        pnl_pct = part
+    pos = min(RISK_USD / (t["stop_pct"] / 100), MAX_POS_USD) if t["stop_pct"] else 0
+    pnl_usd = pos * pnl_pct / 100
+    log_my_trade({"symbol": t["sym"], "side": t["side"], "score": t["score"], "fill": t["fill"],
+                  "sig_price": t["sig_price"], "slip_pct": round(t["slip"], 3), "exit": exit_price,
+                  "how": how, "tp1_done": t["tp1_done"], "pnl_pct": round(pnl_pct, 3),
+                  "pnl_usd": round(pnl_usd, 2), "pos_usd": round(pos)})
+    if pnl_usd <= 0:
+        gate_loss()
+    mark = "🟢" if pnl_usd > 0 else "🔴"
+    return (f"{mark} <b>{t['sym']}</b> закрыта по {exit_price:.6g}\n"
+            f"{pnl_pct:+.2f}% от входа ≈ <b>${pnl_usd:+.2f}</b> (позиция ${pos:,.0f})")
+
+def cmd_stat():
+    rows = []
+    try:
+        with open(TRADES_CSV, encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("how") != "skip"]
+    except Exception:
+        pass
+    skipped = 0
+    try:
+        with open(TRADES_CSV, encoding="utf-8") as f:
+            skipped = sum(1 for r in csv.DictReader(f) if r.get("how") == "skip")
+    except Exception:
+        pass
+    if not rows:
+        return ("Сделок пока нет.\nПосле входа: /fill SEI 0.28462 | после выхода: /out SEI 0.2901"
+                + (f"\nПропущено сигналов: {skipped}" if skipped else ""))
+    today = datetime.now(MSK).strftime("%Y-%m-%d")
+    def block(rs, name):
+        if not rs:
+            return f"{name}: сделок нет"
+        pnl = sum(float(r["pnl_usd"]) for r in rs)
+        win = sum(1 for r in rs if float(r["pnl_usd"]) > 0)
+        return f"{name}: {len(rs)} сд. | в плюс {win} ({win / len(rs) * 100:.0f}%) | итог <b>${pnl:+.2f}</b>"
+    lines = ["📊 <b>Мои сделки</b>",
+             block([r for r in rows if r["date"] == today], "Сегодня"),
+             block(rows, "Всего")]
+    slips = [float(r["slip_pct"]) for r in rows if r.get("slip_pct")]
+    if slips:
+        lines.append(f"Проскальзывание: среднее {sum(slips) / len(slips):+.3f}%, "
+                     f"худшее {max(slips, key=abs):+.3f}% (в бэктесте 0.050%)")
+    if skipped:
+        lines.append(f"Пропущено сигналов: {skipped}")
+    if MY_TRADES:
+        lines.append("Сейчас открыты: " + ", ".join(MY_TRADES))
+    return "\n".join(lines)
+
+def cmd_watch():
+    if not WATCHLIST:
+        return "В зарядке пусто."
+    out = ["⏳ <b>В зарядке:</b>"]
+    for s, w in sorted(WATCHLIST.items(), key=lambda x: -x[1]["score"]):
+        side = {"long": "🟢", "short": "🔴"}.get(w["side"], "⚪")
+        out.append(f"   {side} {s} {w['P']['tf']} | сила {w['score']}/{ACC_MAX_SCORE} | "
+                   f"{w['lo']:.6g}–{w['hi']:.6g}")
+    return "\n".join(out)
+
+HELP_TEXT = ("<b>Команды:</b>\n"
+             "/fill SEI 0.28462 — реальная цена входа\n"
+             "/tp1 SEI — забрал половину по TP1 (стоп в безубыток)\n"
+             "/out SEI 0.2901 — закрыл остаток\n"
+             "/stop SEI — выбило стопом\n"
+             "/skip SEI причина — сигнал пропустил\n"
+             "/stat — мои сделки и проскальзывание\n"
+             "/watch — что сейчас в зарядке")
+
+def handle_command(text: str) -> str:
+    parts = text.replace(",", ".").split()
+    if not parts or not parts[0].startswith("/"):
+        return ""
+    cmd = parts[0].lower().split("@")[0]
+    arg = parts[1].upper() if len(parts) > 1 else ""
+    num = None
+    if len(parts) > 2:
+        try:
+            num = float(parts[2])
+        except ValueError:
+            num = None
+    if cmd == "/fill":
+        return cmd_fill(arg, num) if arg and num is not None else "Формат: /fill SEI 0.28462"
+    if cmd == "/tp1":
+        t = MY_TRADES.get(arg)
+        if not t:
+            return f"По {arg} нет открытой сделки."
+        t["tp1_done"] = True
+        return f"✅ {arg}: половина по TP1 {t['tp1']:.6g}. Стоп в безубыток — {t['fill']:.6g}."
+    if cmd == "/out":
+        return close_my_trade(arg, num, "out") if arg else "Формат: /out SEI 0.2901"
+    if cmd == "/stop":
+        return close_my_trade(arg, num, "stop") if arg else "Формат: /stop SEI"
+    if cmd == "/skip":
+        sig = last_signal_for(arg)
+        log_my_trade({"symbol": arg, "side": sig["side"] if sig else "", "how": "skip",
+                      "score": sig["score"] if sig else "", "pnl_pct": 0, "pnl_usd": 0,
+                      "note": " ".join(parts[2:])})
+        return f"➖ {arg}: отмечен как пропущенный."
+    if cmd == "/stat":
+        return cmd_stat()
+    if cmd == "/watch":
+        return cmd_watch()
+    if cmd in ("/help", "/start"):
+        return HELP_TEXT
+    return ""
+
+def resend_pending_charges():
+    """Заряды, найденные вне окна, досылаются при его открытии — чтобы успеть
+    поставить ордера до пробоя."""
+    if not in_signal_window():
+        return
+    now_ts = time.time()
+    pend = [w for w in WATCHLIST.values()
+            if not w.get("alerted", True) and w["expires"] > now_ts]
+    if not pend:
+        return
+    pend.sort(key=lambda w: -w["score"])
+    send_telegram(f"🔔 <b>Окно открылось</b> — заряды, найденные раньше ({len(pend)} шт.):")
+    for w in pend:
+        send_blocks(format_charge(w).split("\n"))
+        w["alerted"] = True
+
+def poll_commands():
+    for text in tg_updates():
+        try:
+            answer = handle_command(text)
+        except Exception as e:
+            traceback.print_exc()
+            answer = f"Ошибка команды: {esc(str(e))}"
+        if answer:
+            print(f"[CMD] {text}")
+            send_telegram(answer)
+
 # ─── СТАТУС ───────────────────────────────────────────────────────────────────
 
 def send_status(signal_count=0, btc_chg=None):
@@ -2078,7 +2306,8 @@ def send_logs(caption_prefix: str):
     на Render файлы стираются при каждом деплое, иначе статистика теряется."""
     today = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
     for path, cap in ((SIGNALS_CSV, "сигналы"), (OUTCOMES_CSV, "исходы сигналов"),
-                      (CHARGES_CSV, "заряды"), (CHARGE_OUTCOMES_CSV, "исходы зарядов")):
+                      (CHARGES_CSV, "заряды"), (CHARGE_OUTCOMES_CSV, "исходы зарядов"),
+                      (TRADES_CSV, "мои сделки")):
         send_document(path, f"{caption_prefix} {today} — {cap}")
 
 def _on_shutdown(signum, frame):
@@ -2160,6 +2389,7 @@ def main():
         f"📒 Лог сигналов и исходов: {os.path.basename(SIGNALS_CSV)}",
         f"📨 Сигналы шлём: {windows_txt()} МСК (вне окон бот работает молча)",
         f"📒 Сводка и файлы: {SUMMARY_HHMM[0]:02d}:{SUMMARY_HHMM[1]:02d} МСК",
+        "💬 Команды: /fill /tp1 /out /stop /skip /stat /watch (/help — подсказка)",
         f"Пар: {len(UPSCALE_PAIRS)} | Бот активен: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК",
     ]
     send_telegram("\n".join(start_lines))
@@ -2173,6 +2403,7 @@ def main():
 
     while True:
         try:
+            poll_commands()          # команды из чата (/fill, /out, /stat) — в любое время суток
             now_msk = datetime.now(MSK)
 
             # часовой дайджест: пары в зарядке + BTC 12ч (заменил алерты по каждому ЗАРЯДу)
@@ -2197,6 +2428,7 @@ def main():
                         last_signal_count, last_btc = result
                     last_fast = time.time()
                 elif WATCHLIST and time.time() - last_fast >= FAST_INTERVAL_SEC:
+                    resend_pending_charges()     # досылаем заряды, найденные вне окна
                     fast_check()
                     last_fast = time.time()
 
