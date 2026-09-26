@@ -13,6 +13,7 @@ Upscale Bot v8.1 — воронка (Gate.io USDT-фьючерсы):
 
 import os
 import csv
+import signal as _signal
 import html
 import math
 import time
@@ -1050,9 +1051,7 @@ def position_line(price: float, stop_pct: float) -> str:
     qty = pos / price
     qty_txt = f"{qty:,.0f}" if qty >= 100 else (f"{qty:.2f}" if qty >= 1 else f"{qty:.4g}")
     capped = " (упёрлись в потолок)" if pos >= MAX_POS_USD else ""
-    return (f"   💰 Позиция: <b>${pos:,.0f}</b> ≈ {qty_txt} монет{capped}\n"
-            f"      риск ${RISK_USD:,.0f} при стопе {stop_pct:.2f}% | "
-            f"стопов до дневного лимита: {int(DAY_LOSS_USD // max(RISK_USD, 1))}")
+    return f"   💰 Позиция: <b>${pos:,.0f}</b> ≈ {qty_txt} монет{capped} (риск ${RISK_USD:,.0f})"
 
 def calc_dynamic_stop_pct(atr: float, price: float) -> float:
     """Стоп = max(базовый 1.5%, ATR%), но не дальше аварийного потолка 3%."""
@@ -1231,6 +1230,31 @@ def order_trigger(level: float, is_long: bool) -> float:
     иначе ордер срабатывает, а бот молчит (так и вышло в первый день v8.3)."""
     return level * (1 + BREAK_BUFFER) if is_long else level * (1 - BREAK_BUFFER)
 
+def charge_verdict(c: dict) -> str:
+    """Короткий вывод по ЗАРЯДу: ставить ордера или ждать."""
+    s = c["score"]
+    side = {"long": "вверх", "short": "вниз"}.get(c["side"], "в обе стороны")
+    facts = []
+    if c["sq_pct"] is not None and c["sq_pct"] <= 15:
+        facts.append(f"сжатие редкое ({c['sq_pct']:.0f}%)")
+    if c["oi_win"] is not None and c["oi_win"] >= 2:
+        facts.append(f"OI +{c['oi_win']:.1f}%")
+    elif c["oi_win"] is not None and c["oi_win"] <= -1:
+        facts.append(f"OI падает ({c['oi_win']:.1f}%)")
+    if c["rvol_half"] >= 2:
+        facts.append(f"объём {c['rvol_half']:.1f}×")
+    if abs(c["change_24h"]) >= 15:
+        facts.append(f"разогрета ({c['change_24h']:+.0f}% за сутки)")
+    tail = ", ".join(facts[:3])
+    if s >= 9:
+        act = f"Ставлю ордера {side}, полный размер."
+    elif s >= 7:
+        act = f"Ставлю ордера {side}, веду строго по стопу."
+    else:
+        act = ("Слабоват: ордера только если по пути с BTC." if c["side"] != "both"
+               else "Слабый и без направления — можно пропустить.")
+    return f"💬 {act}" + (f" Нравится: {tail}." if tail else "")
+
 def format_charge(c: dict) -> str:
     P = c["P"]; WT, HT = P["win_txt"], P["half_txt"]
     side_txt = {"long": "🟢 ЛОНГ-уклон", "short": "🔴 ШОРТ-уклон", "both": "⚪ Неясно — ждём любой пробой"}[c["side"]]
@@ -1277,22 +1301,16 @@ def format_charge(c: dict) -> str:
         if pl:
             lines.append(pl.rstrip())
     lines.append("🔎 <b>Анализ:</b>")
-    for n in c["plus"]:      lines.append(f"  ✅ {esc(n)}")
-    for n in c["dir_notes"]: lines.append(f"  🧭 {esc(n)}")
-    for n in c["minus"]:     lines.append(f"  ⚠️ {esc(n)}")
-    lines.append("👀 <b>На что смотреть:</b>")
-    lines.append("  • Ордера ставь СЕЙЧАС: по бэктесту вход по уровню прибылен, а вход после сообщения о пробое — нет.")
-    lines.append("  • Stop Market исполняется всегда, но цена может быть чуть хуже показанной — это учтено в расчётах.")
-    lines.append(f"  • Когда сработает, бот пришлёт ⚡ПРОБОЙ — это подтверждение (закрытие {BREAK_CONFIRM_TF} свечи за уровнем и объём ≥{BREAK_MIN_RVOL}×).")
-    lines.append("  • Не сработало до конца жизни заряда — ордера снять.")
-    if c["oi_win"] is not None and c["oi_win"] >= 2:
-        lines.append("  • Если OI продолжит расти, а цена стоять — пружина сжимается сильнее.")
-    lines.append("  • Резкий прокол границы с возвратом внутрь = сбор стопов; настоящий выход часто в обратную сторону.")
+    for n in c["plus"][:3]:      lines.append(f"  ✅ {esc(n)}")
+    for n in c["dir_notes"][:3]: lines.append(f"  🧭 {esc(n)}")
+    for n in c["minus"][:3]:     lines.append(f"  ⚠️ {esc(n)}")
+    lines.append(charge_verdict(c))
+    notes = [f"ордера действуют до {msk_time_str(time.time() + P['watch_ttl_min'] * 60)}"]
     if c["side"] == "both":
-        lines.append("  • Направление покажет первая сторона, куда уйдут объём и дельта.")
+        notes.append("направление неясно — ставь обе стороны")
     if c["symbol"] == "BTC":
-        lines.append("  • Пробой BTC 1h задаёт направление и альтам: лонги по альтам надёжнее после пробоя вверх, и наоборот.")
-    lines.append(f"  • Заряд действует до {msk_time_str(time.time() + P['watch_ttl_min'] * 60)}.")
+        notes.append("пробой BTC задаёт направление альтам")
+    lines.append("👀 " + " | ".join(notes))
     return "\n".join(lines)
 
 def register_charges(charges: list):
@@ -1473,14 +1491,36 @@ def format_breakout(b: dict, score: int, verdict: str, plus: list, minus: list) 
         f"📊 Оценка: <b>{score}</b> — {verdict}",
         "🔎 <b>Анализ:</b>",
     ]
-    lines += [f"  ✅ {esc(n)}" for n in plus]
-    lines += [f"  ⚠️ {esc(n)}" for n in minus]
-    lines.append("👀 <b>На что смотреть:</b>")
-    lines.append(f"  • Следующая {BREAK_CONFIRM_TF} свеча закрылась обратно за {b['level']:.6g} — ложный пробой, выходи.")
-    lines.append(f"  • Ретест {b['level']:.6g} с удержанием — второй шанс входа с коротким стопом.")
+    lines += [f"  ✅ {esc(n)}" for n in plus[:3]]
+    lines += [f"  ⚠️ {esc(n)}" for n in minus[:3]]
+    _hid = max(0, len(plus) - 3) + max(0, len(minus) - 3)
+    if _hid:
+        lines.append(f"  … ещё {_hid} пункт(ов) в журнале")
+    rr = abs(b["tp1_pct"]) / abs(b["stop_pct"]) if b.get("stop_pct") else 0
+    d = b.get("delta")
+    why = []
+    if b["pace"] >= 3:              why.append(f"объём {b['pace']:.1f}×")
+    if d is not None and d >= 0.65: why.append(f"агрессор {d*100:.0f}%")
+    elif d is not None and d < 0.5: why.append(f"агрессор против ({d*100:.0f}%)")
+    if b.get("ext_atr", 0) <= 0.3:  why.append("вход у уровня")
+    elif b.get("ext_atr", 0) > 1.0: why.append("вход далеко")
+    against = (d is not None and d < 0.5) or b.get("ext_atr", 0) > 1.5
+    if score >= 8 and not against:
+        act = "Беру полный размер."
+    elif score >= 4 and not against:
+        act = "Беру половину, добор после закрепления."
+    elif against:
+        act = ("Осторожно: агрессор против — только половина и короткий стоп."
+               if score >= 6 else "Пропускаю: агрессор против пробоя.")
+    else:
+        act = "Пропускаю: слишком много против."
+    lines.append(f"💬 {act} Прибыль к риску {rr:.1f} к 1"
+                 + (f", {', '.join(why[:3])}." if why else "."))
+    notes = ["после TP1 стоп в безубыток",
+             f"возврат 15м свечи за {b['level']:.6g} — повод выйти раньше стопа"]
     if b.get("ext_atr", 0) > 1.0:
-        lines.append("  • Цена уже далеко от уровня: не гонись, лимитка ближе к уровню.")
-    lines.append("  • После TP1 стоп в безубыток.")
+        notes.append("вход далеко от уровня")
+    lines.append("👀 " + " | ".join(notes))
     return "\n".join(lines)
 
 def fast_check():
@@ -2033,7 +2073,28 @@ def send_status(signal_count=0, btc_chg=None):
 
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 
+def send_logs(caption_prefix: str):
+    """Отправляет журналы в Telegram. Вызывается и по сводке, и ПЕРЕД перезапуском —
+    на Render файлы стираются при каждом деплое, иначе статистика теряется."""
+    today = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
+    for path, cap in ((SIGNALS_CSV, "сигналы"), (OUTCOMES_CSV, "исходы сигналов"),
+                      (CHARGES_CSV, "заряды"), (CHARGE_OUTCOMES_CSV, "исходы зарядов")):
+        send_document(path, f"{caption_prefix} {today} — {cap}")
+
+def _on_shutdown(signum, frame):
+    """Render присылает SIGTERM перед перезапуском — успеваем сохранить статистику."""
+    print(f"[SHUTDOWN] сигнал {signum}: отправляю журналы перед остановкой")
+    try:
+        send_telegram("♻️ <b>Бот перезапускается</b> — отправляю журналы, "
+                      "чтобы статистика не потерялась при деплое.")
+        send_logs("перед перезапуском")
+    except Exception as e:
+        print(f"[SHUTDOWN ERROR] {e}")
+    raise SystemExit(0)
+
 def main():
+    _signal.signal(_signal.SIGTERM, _on_shutdown)
+    _signal.signal(_signal.SIGINT, _on_shutdown)
     # Разовый прогон бэктеста: в Render добавить переменную окружения RUN_BACKTEST=1,
     # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
