@@ -2066,7 +2066,20 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
 # Бот читает сообщения в том же чате, чтобы сравнить «что обещал сигнал»
 # с «что реально получилось»: цену исполнения, факт входа и результат.
 
-TG_READ = {"fails": 0, "quiet_until": 0.0}
+TG_READ = {"fails": 0, "quiet_until": 0.0, "conflicts": 0}
+
+def tg_drop_webhook():
+    """Если у бота стоит webhook, getUpdates не работает (ошибка 409).
+    Снимаем его один раз при старте — команды в чате должны читаться."""
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
+                         params={"drop_pending_updates": "false"}, timeout=10)
+        if r.ok and r.json().get("ok"):
+            print("[TG] webhook снят (если был) — команды читаются через getUpdates")
+    except Exception as e:
+        print(f"[TG] не удалось снять webhook: {e}")
 
 def tg_updates():
     """Новые сообщения из чата (короткий опрос, никаких доп. настроек не нужно)."""
@@ -2078,6 +2091,7 @@ def tg_updates():
         r.raise_for_status()
         data = r.json()
         TG_READ["fails"] = 0
+        TG_READ["conflicts"] = 0
         out = []
         for u in data.get("result", []) if data.get("ok") else []:
             TG_OFFSET[0] = max(TG_OFFSET[0], u.get("update_id", 0))
@@ -2086,6 +2100,20 @@ def tg_updates():
             if text and str(msg.get("chat", {}).get("id")) == str(CHAT_ID):
                 out.append(text)
         return out
+    except requests.HTTPError as e:
+        # 409 = сообщения уже читает другой экземпляр бота. При деплое Render
+        # ненадолго держит два контейнера — это нормально и проходит само.
+        if getattr(e.response, "status_code", 0) == 409:
+            TG_READ["conflicts"] += 1
+            TG_READ["quiet_until"] = time.time() + 60
+            if TG_READ["conflicts"] in (1, 5, 20):
+                print(f"[TG] 409: команды читает другой экземпляр бота "
+                      f"(обычно старый контейнер при деплое). Попытка {TG_READ['conflicts']}.")
+            if TG_READ["conflicts"] == 20:
+                send_telegram("⚠️ Команды в чате не читаются уже 20 минут: похоже, "
+                              "запущено два экземпляра бота. Проверь, что в Render "
+                              "работает только один сервис.")
+        return []
     except Exception as e:
         # не спамим логом: после трёх неудач подряд молчим 10 минут
         TG_READ["fails"] += 1
@@ -2322,6 +2350,7 @@ def _on_shutdown(signum, frame):
     raise SystemExit(0)
 
 def main():
+    tg_drop_webhook()
     _signal.signal(_signal.SIGTERM, _on_shutdown)
     _signal.signal(_signal.SIGINT, _on_shutdown)
     # Разовый прогон бэктеста: в Render добавить переменную окружения RUN_BACKTEST=1,
