@@ -531,6 +531,10 @@ def corr(a, b):
         return None
     return sum((x[i] - mx) * (y[i] - my) for i in range(len(x))) / (sx * sy)
 
+def wd(t):
+    """День недели сделки: 0 — понедельник, 6 — воскресенье."""
+    return datetime.fromtimestamp(t["ts"], MSK).weekday()
+
 def filter_lab(trades):
     """Прогоняет уже собранные сделки через разные фильтры и сравнивает итог.
     Сделки не пересчитываются — меняется только то, какие из них мы берём."""
@@ -598,6 +602,12 @@ def filter_lab(trades):
         ("ВСЁ: ≤2 ATR + 8/день + 1/монету + ≤2/30мин + стоп дня 3",
          dict(keep=lambda t: t.get("vwap_atr", 0) <= 2, cap_day=8, one_per_sym=True,
               max_side_30m=2, stop_after_losses=3)),
+        ("ВСЁ + только будни (пн–пт)",
+         dict(keep=lambda t: t.get("vwap_atr", 0) <= 2 and wd(t) < 5, cap_day=8, one_per_sym=True,
+              max_side_30m=2, stop_after_losses=3)),
+        ("ВСЁ + только выходные (сб–вс)",
+         dict(keep=lambda t: t.get("vwap_atr", 0) <= 2 and wd(t) >= 5, cap_day=8, one_per_sym=True,
+              max_side_30m=2, stop_after_losses=3)),
     ]
     out = ["\n<b>ЛАБОРАТОРИЯ ФИЛЬТРОВ (наша стратегия)</b>",
            "Что будет с просадкой и прибылью, если отбирать сделки по-разному:"]
@@ -617,6 +627,28 @@ def filter_lab(trades):
                    f"на сделку {r['avg']:+.3f}% ({d_avg:+.3f}) | всего {r['total']:+.0f}% | "
                    f"просадка {r['dd']:.0f}% ({d_dd:+.0f}) | худший день {r['worst_day']:.1f}%")
     out.append("   ✅ — просадка заметно меньше без потери прибыли на сделку")
+
+    # ── по дням недели (с правилами v8.3) ──
+    names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    sel = [t for t in trades if t.get("vwap_atr", 0) <= 2]
+    by_wd = {}
+    for t in sel:
+        by_wd.setdefault(wd(t), []).append(t["pnl"])
+    out.append("\n<b>По дням недели</b> (с фильтром ≤2 ATR от VWAP):")
+    for i in range(7):
+        v = by_wd.get(i, [])
+        if not v:
+            out.append(f"   {names[i]}: сделок нет"); continue
+        wr = sum(1 for p in v if p > 0) / len(v) * 100
+        mark = "✅" if sum(v) / len(v) > 0.3 else ("🟡" if sum(v) / len(v) > 0 else "❌")
+        out.append(f"   {mark} {names[i]}: n={len(v):<4} WR {wr:.0f}% | на сделку {sum(v)/len(v):+.3f}% | всего {sum(v):+.0f}%")
+    wk = [p for i in range(5) for p in by_wd.get(i, [])]
+    we = [p for i in (5, 6) for p in by_wd.get(i, [])]
+    if wk and we:
+        out.append(f"   ИТОГО будни: n={len(wk)} | на сделку {sum(wk)/len(wk):+.3f}% | "
+                   f"WR {sum(1 for p in wk if p>0)/len(wk)*100:.0f}%")
+        out.append(f"   ИТОГО выходные: n={len(we)} | на сделку {sum(we)/len(we):+.3f}% | "
+                   f"WR {sum(1 for p in we if p>0)/len(we)*100:.0f}%")
     return out
 
 def send_telegram(text):

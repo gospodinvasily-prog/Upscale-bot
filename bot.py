@@ -1,7 +1,7 @@
 """
 Upscale Bot v8.1 — воронка (Gate.io USDT-фьючерсы):
   ⏳ ЗАРЯД   — сжатие, объём/OI растут, цена стоит (ДО движения): альты на 1h (окно 12ч), BTC на 1h.
-               Главное сообщение: в нём готовые ордера Stop Limit, которые ставятся ЗАРАНЕЕ.
+               Главное сообщение: в нём готовые ордера Stop Market, которые ставятся ЗАРАНЕЕ.
   ⚡ ПРОБОЙ  — подтверждение: закрытие 1м свечи за уровнем на объёме ≥2× (проверка каждые 20 сек)
   🚀 ИМПУЛЬС — RS Momentum на 5м, только оценка 🟢 8+ (страховка для движений без заряда)
 
@@ -65,7 +65,7 @@ SCAN_WORKERS     = 8       # параллельных потоков в осно
 # "5m" = как в v8.0 (узкие диапазоны, маленькие цели); "15m" = диапазоны и цели шире; "1h" — ещё шире, сигналов мало.
 CHARGE_TF        = "1h"        # v8.3: 1ч по бэктесту (90 дней, 103 пары) — заметно лучше 15м и 30м
 TF_MIN           = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}[CHARGE_TF]
-MOMENTUM_ENABLED   = True      # 🚀 ИМПУЛЬС — страховка для движений без предварительного ЗАРЯДа (всегда на 5м свечах)
+MOMENTUM_ENABLED   = False     # 🚀 ИМПУЛЬС выключен — торгуем только ЗАРЯД → ПРОБОЙ
 MOMENTUM_MIN_SCORE = 8         # слать только 🟢 Сильный (8+); 5 — ещё и 🟡 Нормальный
 
 def fmt_minutes(m: float) -> str:
@@ -140,7 +140,7 @@ ACC_REALERT_MIN   = 30         # повтор из-за смены уклона 
 FAST_INTERVAL_SEC = 20         # опрос watchlist
 WATCH_TTL_MIN     = 16 * TF_MIN  # сколько живёт ЗАРЯД в watchlist (15м → 4ч)
 WATCH_MAX         = 15
-BREAK_BUFFER      = 0.001      # 0.1% за уровень, чтобы не ловить касания
+BREAK_BUFFER      = 0.001      # 0.1% за уровень — ТОТ ЖЕ отступ, что в ордерах из сообщения ЗАРЯДа, чтобы не ловить касания
 # v8.1: ⚡ПРОБОЙ только по ЗАКРЫТИЮ 5м свечи за уровнем (в v8.0 — касание цены на 1м:
 # 47% пробоев возвращались в диапазон за 15 мин). Проверка по-прежнему каждые 20с,
 # поэтому сигнал приходит через несколько секунд после закрытия свечи.
@@ -1226,6 +1226,11 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
         "plus": plus, "minus": minus, "dir_notes": dir_notes,
     }
 
+def order_trigger(level: float, is_long: bool) -> float:
+    """Цена входа (триггер Stop Market). Одна формула и для сообщения ЗАРЯДа, и для проверки пробоя —
+    иначе ордер срабатывает, а бот молчит (так и вышло в первый день v8.3)."""
+    return level * (1 + BREAK_BUFFER) if is_long else level * (1 - BREAK_BUFFER)
+
 def format_charge(c: dict) -> str:
     P = c["P"]; WT, HT = P["win_txt"], P["half_txt"]
     side_txt = {"long": "🟢 ЛОНГ-уклон", "short": "🔴 ШОРТ-уклон", "both": "⚪ Неясно — ждём любой пробой"}[c["side"]]
@@ -1253,13 +1258,12 @@ def format_charge(c: dict) -> str:
         lines.append(f"Ликвидации {WT}: шортов {fmt_usd(c['liq_short_win'])} / лонгов {fmt_usd(c['liq_long_win'])}")
     # v8.3: готовые ордера — по бэктесту вход ПО УРОВНЮ даёт +0.21% на сделку,
     # а вход после закрытия свечи (то есть по факту сообщения) — минус.
-    lines.append("📥 <b>Ордера (Stop Limit, ставить заранее):</b>")
+    lines.append("📥 <b>Ордера (Stop Market, ставить заранее):</b>")
     for want, level, stop_lvl in (("long", c["hi"], up_stop), ("short", c["lo"], dn_stop)):
         if c["side"] not in (want, "both"):
             continue
         is_long = want == "long"
-        trig = level * (1.001 if is_long else 0.999)          # триггер чуть за уровнем
-        lim = level * (1.002 if is_long else 0.998)           # лимит с запасом, чтобы исполнился
+        trig = order_trigger(level, is_long)                  # цена входа = триггер Stop Market
         dist = abs(trig - stop_lvl) / trig * 100
         dist = min(max(dist, STOP_MIN_PCT), abs(STOP_PCT))
         stop_price = trig * (1 - dist / 100) if is_long else trig * (1 + dist / 100)
@@ -1267,7 +1271,7 @@ def format_charge(c: dict) -> str:
         tp1 = level + h if is_long else level - h
         tp2 = level + 2 * h if is_long else level - 2 * h
         arrow = "🟢 ВВЕРХ" if is_long else "🔴 ВНИЗ"
-        lines.append(f"   {arrow}: триггер <b>{trig:.6g}</b> | лимит {lim:.6g}")
+        lines.append(f"   {arrow}: вход <b>{trig:.6g}</b> (Stop Market)")
         lines.append(f"      стоп {stop_price:.6g} (−{dist:.2f}%) | TP1 {tp1:.6g} | TP2 {tp2:.6g}")
         pl = position_line(trig, dist)
         if pl:
@@ -1278,6 +1282,7 @@ def format_charge(c: dict) -> str:
     for n in c["minus"]:     lines.append(f"  ⚠️ {esc(n)}")
     lines.append("👀 <b>На что смотреть:</b>")
     lines.append("  • Ордера ставь СЕЙЧАС: по бэктесту вход по уровню прибылен, а вход после сообщения о пробое — нет.")
+    lines.append("  • Stop Market исполняется всегда, но цена может быть чуть хуже показанной — это учтено в расчётах.")
     lines.append(f"  • Когда сработает, бот пришлёт ⚡ПРОБОЙ — это подтверждение (закрытие {BREAK_CONFIRM_TF} свечи за уровнем и объём ≥{BREAK_MIN_RVOL}×).")
     lines.append("  • Не сработало до конца жизни заряда — ордера снять.")
     if c["oi_win"] is not None and c["oi_win"] >= 2:
@@ -1504,9 +1509,8 @@ def fast_check():
             w["checked_bar"] = boundary
 
             close = last["c"]
-            buf = max(BREAK_BUFFER, 0.1 * w["atr"] / close) if close > 0 else BREAK_BUFFER
-            up   = close > w["hi"] * (1 + buf)
-            down = close < w["lo"] * (1 - buf)
+            up   = close > order_trigger(w["hi"], True)
+            down = close < order_trigger(w["lo"], False)
             if not up and not down:
                 continue
             side = "long" if up else "short"
@@ -1515,21 +1519,31 @@ def fast_check():
             bar_min  = BREAK_CONFIRM_SEC / 60
             base_bar = w["baseline_tf"] * bar_min / w["P"]["tf_min"]
             rvol_bar = last["v"] / base_bar if base_bar > 0 else 0
+            # Уровень взят — значит, выставленный заранее ордер уже сработал.
+            # Даже если фильтр не пускает сигнал, МОЛЧАТЬ нельзя: позиция открыта.
+            reasons = []
             if rvol_bar < BREAK_MIN_RVOL:
-                print(f"[BREAKOUT] {sym} {side}: закрытие за уровнем, но объём {rvol_bar:.1f}× < {BREAK_MIN_RVOL}× — пропуск")
-                continue
-
-            if not in_signal_window():
-                print(f"[BREAKOUT] {sym} {side}: закрытие за уровнем, но вне окна отправки — не шлём")
-                continue                          # заряд остаётся, сигнал не создаётся и не логируется
-
-            ok, why = gate_allows(sym, side)      # v8.3: лимиты дня, одна монета в день, антикластер
-            if not ok:
-                print(f"[BREAKOUT] {sym} {side}: пропуск — {why}")
-                continue
+                reasons.append(f"объём свечи {rvol_bar:.1f}× < {BREAK_MIN_RVOL}× — пробой на пустом месте")
             vw_ok, vw_txt, vw_d = vwap_filter(sym, price)   # v8.3: главный фильтр — не догонять
             if not vw_ok:
-                print(f"[BREAKOUT] {sym} {side}: пропуск — {vw_txt}")
+                reasons.append(vw_txt)
+            gate_ok_, gate_why = gate_allows(sym, side)
+            if not gate_ok_:
+                reasons.append(gate_why)
+            if not in_signal_window():
+                reasons.append(f"вне окна отправки ({windows_txt()} МСК)")
+            if reasons:
+                print(f"[BREAKOUT] {sym} {side}: уровень взят, но {'; '.join(reasons)}")
+                if not LAST_SENT.get(("warn", sym, side)):
+                    LAST_SENT[("warn", sym, side)] = (time.time(), 0)
+                    arrow = "🟢 вверх" if side == "long" else "🔴 вниз"
+                    send_telegram(
+                        f"⚠️ <b>{sym}/USDT — ордер сработал, но сигнал НЕ подтверждён</b>\n"
+                        f"Уровень {arrow}: {w['hi'] if side == 'long' else w['lo']:.6g}, цена {price:.6g}\n"
+                        "Почему не подтверждаю:\n" + "\n".join(f"  • {esc(r)}" for r in reasons) + "\n"
+                        "Что делать: позиция уже открыта ордером. Стоп оставь как был; "
+                        "если цена не идёт — закрывай руками, не жди целей.")
+                WATCHLIST.pop(sym, None)
                 continue
 
             delta = get_trade_delta(sym, bar)     # агрессор за время свечи пробоя
