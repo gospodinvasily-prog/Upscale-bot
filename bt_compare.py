@@ -208,9 +208,13 @@ def btc_ok(ts, is_long):
 
 # ─── ведение сделки (одинаково для всех стратегий) ────────────────────────────
 
-def run_trade(ex, j, side, entry, stop, tp1, tp2, day_key):
-    """Ведёт сделку по свечам исполнения с j-й; закрывает к концу торгового дня."""
+def run_trade(ex, j, side, entry, stop, tp1, tp2, day_key, ret_level=None, ret_grace=0):
+    """Ведёт сделку по свечам исполнения с j-й; закрывает к концу торгового дня.
+    ret_level — уровень пробоя: если свеча ЗАКРЫЛАСЬ обратно за ним (цена вернулась
+    в диапазон), выходим досрочно, не дожидаясь стопа. ret_grace — сколько таких
+    закрытий подряд нужно (0 = выходим сразу, 1 = даём одну свечу форы)."""
     up = side == "long"
+    back = 0
     dist = abs(entry - stop) / entry * 100
     if dist <= 0:
         return None
@@ -226,6 +230,15 @@ def run_trade(ex, j, side, entry, stop, tp1, tp2, day_key):
         stop_hit = b[L] <= stop if up else b[H] >= stop
         t1 = b[H] >= tp1 if up else b[L] <= tp1
         t2 = b[H] >= tp2 if up else b[L] <= tp2
+        # ранний выход: цена закрылась обратно внутрь диапазона
+        if ret_level is not None and not hit1 and q > j:
+            returned = b[C] < ret_level if up else b[C] > ret_level
+            back = back + 1 if returned else 0
+            if returned and back > ret_grace:
+                if stop_hit:                       # если в этой же свече был и стоп — считаем стоп
+                    res = -dist; exit_ts = b[T]; break
+                res = (b[C] - entry) / entry * 100 * (1 if up else -1)
+                exit_ts = b[T]; break
         if not hit1:
             if stop_hit:
                 res = -dist; exit_ts = b[T]; break   # стоп раньше цели (консервативно)
@@ -322,7 +335,9 @@ def strat_ours(sym, ex, h1, cfg):
             dist = min(max(abs(entry - raw) / entry * 100, STOP_MIN), STOP_MAX)
             stop = entry * (1 - dist / 100) if up else entry * (1 + dist / 100)
             tp1, tp2 = targets_struct(entry, level, hi - lo, dist, up, sw_hi, sw_lo)
-            t = run_trade(ex, j, "long" if up else "short", entry, stop, tp1, tp2, msk_day(c[T]))
+            t = run_trade(ex, j, "long" if up else "short", entry, stop, tp1, tp2, msk_day(c[T]),
+                          ret_level=(level if cfg.get("exit_return") is not None else None),
+                          ret_grace=cfg.get("exit_return") or 0)
             if t:
                 v, a_ex = vw[j], atrs_ex[j]
                 t["vwap_side"] = (entry >= v) if up else (entry <= v)     # вход по «правильную» сторону VWAP
@@ -477,7 +492,15 @@ def strat_vwap(sym, ex, h1, cfg):
         armed_side = None
     return trades
 
-STRATS = {"OURS": (strat_ours, OURS_GRID), "ORB": (strat_orb, ORB_GRID),
+# Три способа ВЕДЕНИЯ одной и той же сделки — чтобы понять, стоит ли выходить
+# раньше стопа, когда свеча закрылась обратно за уровнем.
+OURS_RET_GRID  = [{"squeeze": 25, "vol": 2.0, "stop_atr": 1.0, "exit_return": 0}]
+OURS_RET1_GRID = [{"squeeze": 25, "vol": 2.0, "stop_atr": 1.0, "exit_return": 1}]
+
+STRATS = {"OURS": (strat_ours, OURS_GRID),
+          "OURS-ВЫХОД": (strat_ours, OURS_RET_GRID),
+          "OURS-ВЫХОД+1": (strat_ours, OURS_RET1_GRID),
+          "ORB": (strat_orb, ORB_GRID),
           "FADE": (strat_fade, FADE_GRID), "VWAP": (strat_vwap, VWAP_GRID)}
 
 # ─── накопление результатов ───────────────────────────────────────────────────
