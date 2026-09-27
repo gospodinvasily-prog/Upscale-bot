@@ -27,7 +27,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v8.3"
+BOT_VERSION    = "v8.4"
 
 TRADING_START_MSK = 5          # бот работает (сканирует, копит заряды, следит за BTC)
 TRADING_END_MSK   = 21
@@ -37,9 +37,10 @@ SIGNAL_WINDOWS    = [(10, 0, 11, 30), (14, 30, 21, 0)]
 SUMMARY_HHMM      = (21, 30)   # сводка дня + csv-файлы в Telegram
 
 # ── Риск на сделку (Upscale: счёт $5000, лимит −$150 в день и −6% = −$300 всего) ──
+# v8.4: риск снижен с $10 до $5 (тот же вход/стоп% — меняется только размер позиции).
 # Худшая просадка по бэктесту ≈ 36 стопов подряд: при риске $5 это −$180 из −$300.
 ACCOUNT_USD   = float(os.environ.get("ACCOUNT_USD", "5000"))
-RISK_USD      = float(os.environ.get("RISK_USD", "10"))     # сколько теряем, если сработал стоп
+RISK_USD      = float(os.environ.get("RISK_USD", "5"))      # сколько теряем, если сработал стоп
 MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "1500"))  # потолок размера позиции
 DAY_LOSS_USD  = float(os.environ.get("DAY_LOSS_USD", "150"))  # дневной лимит пропфёрма
 
@@ -52,7 +53,7 @@ DAILY_MAX_SIGNALS  = 15    # потолок на случай ненормаль
 ONE_PER_SYMBOL_DAY = True  # одна монета — одна сделка в день
 MAX_SAME_SIDE_30M  = 2     # не больше 2 сигналов в одну сторону за 30 минут (против кластеров)
 DAY_STOP_LOSSES    = 5     # после 5 закрытых убытков за день бот замолкает до завтра
-                           # (5 × риск $10 = $50 из дневного лимита $150)
+                           # (5 × риск $5 = $25 из дневного лимита $150)
 MSK = timezone(timedelta(hours=3))
 
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
@@ -141,7 +142,10 @@ ACC_REALERT_MIN   = 30         # повтор из-за смены уклона 
 FAST_INTERVAL_SEC = 20         # опрос watchlist
 WATCH_TTL_MIN     = 16 * TF_MIN  # сколько живёт ЗАРЯД в watchlist (15м → 4ч)
 WATCH_MAX         = 15
-BREAK_BUFFER      = 0.001      # 0.1% за уровень — ТОТ ЖЕ отступ, что в ордерах из сообщения ЗАРЯДа, чтобы не ловить касания
+BREAK_BUFFER      = 0.003      # v8.4: было 0.1% — пол минимального отступа за уровнем (см. BREAK_BUFFER_ATR_MULT ниже)
+BREAK_BUFFER_ATR_MULT = 0.15   # v8.4: доп. отступ = 0.15×ATR монеты — защита от снятия ликвидности тонким
+                                # проколом уровня; масштабируется под волатильность конкретной монеты
+                                # (у мемкоина шум в 0.1-0.3% обычный, у BTC/топов — уже перебор)
 # v8.1: ⚡ПРОБОЙ только по ЗАКРЫТИЮ 5м свечи за уровнем (в v8.0 — касание цены на 1м:
 # 47% пробоев возвращались в диапазон за 15 мин). Проверка по-прежнему каждые 20с,
 # поэтому сигнал приходит через несколько секунд после закрытия свечи.
@@ -150,8 +154,8 @@ BREAK_CONFIRM_SEC = 60
 BREAK_MIN_RVOL    = 2.0        # v8.3: объём свечи пробоя ≥2× нормы (по бэктесту)
 BREAK_STOP_MIN    = 0.8        # % минимальный стоп пробоя (0.6% выбивало шумом)
 STOP_MIN_PCT      = 0.8        # % минимальный стоп в ордерах заряда
-TP1_MIN_RR        = 1.0        # TP1 не ближе 1× расстояния до стопа
-TP2_MIN_RR        = 2.0        # TP2 не ближе 2× расстояния до стопа
+TP1_MIN_RR        = 0.5        # v8.4: было 1.0 — TP1 не ближе 0.5× расстояния до стопа (цели уменьшены вдвое)
+TP2_MIN_RR        = 1.0        # v8.4: было 2.0 — TP2 не ближе 1× расстояния до стопа (цели уменьшены вдвое)
 BREAKOUT_COOLDOWN_MIN = max(120, 3 * TF_MIN)  # повторы хуже первых сигналов — пауза 2ч; у BTC своя в профиле
 
 # ── Логирование исходов ──
@@ -1234,10 +1238,14 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
         "plus": plus, "minus": minus, "dir_notes": dir_notes,
     }
 
-def order_trigger(level: float, is_long: bool) -> float:
-    """Цена входа (триггер Stop Market). Одна формула и для сообщения ЗАРЯДа, и для проверки пробоя —
+def order_trigger(level: float, is_long: bool, atr: float = 0.0) -> float:
+    """Цена входа (триггер Stop Market). Отступ за уровнем = max(фиксированный % BREAK_BUFFER,
+    доля ATR монеты BREAK_BUFFER_ATR_MULT) — защита от снятия ликвидности тонким проколом уровня,
+    масштабируется под волатильность конкретной монеты, а не одна цифра на всё.
+    Одна формула и для сообщения ЗАРЯДа, и для проверки пробоя —
     иначе ордер срабатывает, а бот молчит (так и вышло в первый день v8.3)."""
-    return level * (1 + BREAK_BUFFER) if is_long else level * (1 - BREAK_BUFFER)
+    buf = max(level * BREAK_BUFFER, atr * BREAK_BUFFER_ATR_MULT)
+    return level + buf if is_long else level - buf
 
 def charge_verdict(c: dict) -> str:
     """Короткий вывод по ЗАРЯДу: ставить ордера или ждать."""
@@ -1296,7 +1304,7 @@ def format_charge(c: dict) -> str:
         if c["side"] not in (want, "both"):
             continue
         is_long = want == "long"
-        trig = order_trigger(level, is_long)                  # цена входа = триггер Stop Market
+        trig = order_trigger(level, is_long, c["atr"])         # цена входа = триггер Stop Market
         dist = abs(trig - stop_lvl) / trig * 100
         dist = min(max(dist, STOP_MIN_PCT), abs(STOP_PCT))
         stop_price = trig * (1 - dist / 100) if is_long else trig * (1 + dist / 100)
@@ -1558,8 +1566,8 @@ def fast_check():
             w["checked_bar"] = boundary
 
             close = last["c"]
-            up   = close > order_trigger(w["hi"], True)
-            down = close < order_trigger(w["lo"], False)
+            up   = close > order_trigger(w["hi"], True, w["atr"])
+            down = close < order_trigger(w["lo"], False, w["atr"])
             if not up and not down:
                 continue
             side = "long" if up else "short"
