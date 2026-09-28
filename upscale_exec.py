@@ -32,7 +32,7 @@ import requests
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
-MARGIN_BUFFER = Decimal(os.environ.get("EXEC_MARGIN_BUFFER", "0.10"))   # запас на комиссию/спред
+MARGIN_BUFFER = Decimal(os.environ.get("EXEC_MARGIN_BUFFER", "0.02"))   # запас на комиссию/спред (замер: $100 → маржа $99.96)
 MAX_CHASE_ATR = float(os.environ.get("EXEC_MAX_CHASE_ATR", "0.3"))
 TP_DELAY_SEC  = int(os.environ.get("EXEC_TP_DELAY_SEC", "65"))
 MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "3"))
@@ -232,16 +232,22 @@ def take_body(account_id, market_id, direction, position_id, amount_fp9, trigger
     return {"accountId": account_id, "marketId": market_id, "type": "take", "direction": direction,
             "positionId": position_id, "amount": str(amount_fp9), "triggerPrice": to_fp9(trigger_price)}
 
-def _pos_id(p):     return str(pick(p, "id", "positionId") or "")
+def _pos_id(p):     return str(pick(p, "id", "positionId", "uuid") or "")
+
 def _pos_market(p):
-    m = pick(p, "marketId")
-    if m is None and isinstance(p.get("market"), dict):
-        m = p["market"].get("id")
-    return str(m or "")
+    for k in ("marketId", "market"):
+        v = p.get(k)
+        if isinstance(v, dict):
+            v = v.get("id")
+        if v:
+            return str(v)
+    return ""
+
 def _pos_dir(p):    return str(pick(p, "direction", "side") or "").lower()
+
 def _pos_size(p):
     """размер позиции в fp9 (целое). Числа в API — строки ×10⁹."""
-    v = pick(p, "size", "amount", "quantity")
+    v = pick(p, "size", "amount", "quantity", "baseAmount", "qty", "volume")
     if v is None:
         return 0
     v = str(v)
@@ -353,9 +359,12 @@ class Executor:
     def _wait_position(self, mid, direction, before, tries=10):
         for _ in range(tries):
             time.sleep(1)
-            for p in self._positions():
-                if _pos_market(p) == mid and _pos_dir(p) == direction and _pos_id(p) not in before:
+            cands = [p for p in self._positions() if _pos_id(p) not in before]
+            for p in cands:
+                if _pos_market(p) == mid and _pos_dir(p) == direction:
                     return p
+            if len(cands) == 1 and _pos_market(cands[0]) in ("", mid):   # единственная новая позиция
+                return cands[0]
         return None
 
     def _execute(self, b, plan, market) -> str:
@@ -492,7 +501,9 @@ class Executor:
             L.append("   ответ: " + _trunc(resp, 300))
             pos = self._wait_position(mid, "long", before)
             if not pos:
-                return "\n".join(L + ["⚠️ позиция не появилась за 10с — проверь терминал (/closeall если открылась)"])
+                raw = self._positions()
+                return "\n".join(L + ["⚠️ позицию по полям не нашёл. Сырые активные позиции (" + str(len(raw)) + "): " + _trunc(raw, 700),
+                                       "Позиция могла открыться — закрой /closeall"])
             L.append("2) позиция: " + _trunc(pos, 500))
             size = _pos_size(pos)
             L.append(f"   size(fp9)={size} → {Decimal(size) / FP:.6g} BTC")
