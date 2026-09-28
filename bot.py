@@ -20,6 +20,7 @@ import time
 import threading
 import traceback
 import requests
+import upscale_exec
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
@@ -37,11 +38,11 @@ SIGNAL_WINDOWS    = [(10, 0, 11, 30), (14, 30, 21, 0)]
 SUMMARY_HHMM      = (21, 30)   # сводка дня + csv-файлы в Telegram
 
 # ── Риск на сделку (Upscale: счёт $5000, лимит −$150 в день и −6% = −$300 всего) ──
-# v8.4: риск снижен с $10 до $5 (тот же вход/стоп% — меняется только размер позиции).
-# Худшая просадка по бэктесту ≈ 36 стопов подряд: при риске $5 это −$180 из −$300.
-ACCOUNT_USD   = float(os.environ.get("ACCOUNT_USD", "5000"))
-RISK_USD      = float(os.environ.get("RISK_USD", "5"))      # сколько теряем, если сработал стоп
-MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "1500"))  # потолок размера позиции
+# v8.4: риск $20 (счёт $10k: профитный день = +0.5% = $50, при риске $5 это +10R); потолок позиции $3000.
+# Лимиты Upscale Basic $10k: дневная −5% ($500), максимальная −10% ($1000).
+ACCOUNT_USD   = float(os.environ.get("ACCOUNT_USD", "10000"))
+RISK_USD      = float(os.environ.get("RISK_USD", "20"))     # сколько теряем, если сработал стоп
+MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "3000"))  # потолок размера позиции
 DAY_LOSS_USD  = float(os.environ.get("DAY_LOSS_USD", "150"))  # дневной лимит пропфёрма
 
 # ── v8.3: правила отбора сделок (проверены на 90 днях и 103 парах) ──
@@ -53,7 +54,7 @@ DAILY_MAX_SIGNALS  = 15    # потолок на случай ненормаль
 ONE_PER_SYMBOL_DAY = True  # одна монета — одна сделка в день
 MAX_SAME_SIDE_30M  = 2     # не больше 2 сигналов в одну сторону за 30 минут (против кластеров)
 DAY_STOP_LOSSES    = 5     # после 5 закрытых убытков за день бот замолкает до завтра
-                           # (5 × риск $5 = $25 из дневного лимита $150)
+                           # (5 × риск $20 = $100 из дневного лимита $150)
 MSK = timezone(timedelta(hours=3))
 
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
@@ -168,6 +169,7 @@ CHARGE_OUTCOMES_CSV  = os.path.join(LOG_DIR, "charge_outcomes_v8.csv")
 CHARGE_EVAL_WINDOW   = 24 * TF_MIN * 60   # заряд оцениваем по ценам за это время после алерта (15м → 6ч)
 CHARGE_FOLLOW_MIN    = 12 * TF_MIN        # насколько ушла цена после выхода из диапазона (15м → 3ч)
 CHARGE_RETURN_MIN    = 15      # возврат внутрь диапазона за 15 мин = ложный выход
+EXEC_CSV             = os.path.join(LOG_DIR, "exec_dry_v8.csv")    # что бы открыл авто-слой (dry)
 TRADES_CSV           = os.path.join(LOG_DIR, "my_trades_v8.csv")   # мои реальные сделки (команды в чате)
 ALT_P = tf_profile(CHARGE_TF)
 BTC_P = tf_profile(BTC_CHARGE_TF)
@@ -986,7 +988,8 @@ def send_daily_summary():
     for path, cap in ((SIGNALS_CSV, "Все сигналы со всеми признаками"),
                       (OUTCOMES_CSV, "Исходы сигналов: TP1/стоп первым, макс. ход"),
                       (CHARGES_CSV, "Все ЗАРЯДы со всеми признаками"),
-                      (CHARGE_OUTCOMES_CSV, "Исходы ЗАРЯДов: куда вышла цена, ложные выходы")):
+                      (CHARGE_OUTCOMES_CSV, "Исходы ЗАРЯДов: куда вышла цена, ложные выходы"),
+                      (EXEC_CSV, "Авто-слой: что бы открыл (dry)")):
         send_document(path, f"{today} — {cap}")
 
 # ─── ОБЩИЕ РАСЧЁТЫ СТОПОВ И ЦЕЛЕЙ ────────────────────────────────────────────
@@ -1610,6 +1613,7 @@ def fast_check():
             score, verdict, plus, minus = analyze_breakout(b)
             send_telegram(format_breakout(b, score, verdict, plus, minus))
             log_signal("breakout", b, side, score)
+            EXECUTOR.on_signal(b, score)          # авто-слой: сбой тут не влияет на сигнал
             gate_register(sym, side)
             now_ts = time.time()
             LAST_SENT[("breakout", sym, side)] = (now_ts, score)
@@ -2246,7 +2250,11 @@ HELP_TEXT = ("<b>Команды:</b>\n"
              "/stop SEI — выбило стопом\n"
              "/skip SEI причина — сигнал пропустил\n"
              "/stat — мои сделки и проскальзывание\n"
-             "/watch — что сейчас в зарядке")
+             "/watch — что сейчас в зарядке\n"
+             "/up — статус авто-слоя Upscale | /halt — пауза исполнения | /resume — продолжить")
+
+# ── Авто-слой Upscale (v0: dry, ордера не отправляет). AUTO_TRADE=off|dry в переменных Render ──
+EXECUTOR = upscale_exec.Executor(send_telegram, lambda row: _append_csv(EXEC_CSV, row), RISK_USD, MAX_POS_USD)
 
 def handle_command(text: str) -> str:
     parts = text.replace(",", ".").split()
@@ -2270,6 +2278,12 @@ def handle_command(text: str) -> str:
         return f"✅ {arg}: половина по TP1 {t['tp1']:.6g}. Стоп в безубыток — {t['fill']:.6g}."
     if cmd == "/out":
         return close_my_trade(arg, num, "out") if arg else "Формат: /out SEI 0.2901"
+    if cmd == "/up":
+        return EXECUTOR.status()
+    if cmd == "/halt":
+        return EXECUTOR.halt()
+    if cmd == "/resume":
+        return EXECUTOR.resume()
     if cmd == "/stop":
         return close_my_trade(arg, num, "stop") if arg else "Формат: /stop SEI"
     if cmd == "/skip":
@@ -2343,7 +2357,7 @@ def send_logs(caption_prefix: str):
     today = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
     for path, cap in ((SIGNALS_CSV, "сигналы"), (OUTCOMES_CSV, "исходы сигналов"),
                       (CHARGES_CSV, "заряды"), (CHARGE_OUTCOMES_CSV, "исходы зарядов"),
-                      (TRADES_CSV, "мои сделки")):
+                      (TRADES_CSV, "мои сделки"), (EXEC_CSV, "авто-слой (dry)")):
         send_document(path, f"{caption_prefix} {today} — {cap}")
 
 def _on_shutdown(signum, frame):
@@ -2417,6 +2431,8 @@ def main():
                        f"≤{DAILY_MAX_SIGNALS} сигналов в день | 1 монета в день | "
                        f"≤{MAX_SAME_SIDE_30M} в сторону за 30 мин | стоп дня после {DAY_STOP_LOSSES} убытков")
     start_lines.append(f"💰 Риск ${RISK_USD:.0f} на сделку (лимиты: ${DAY_LOSS_USD:.0f} в день)")
+    start_lines.append(f"🤖 Авто-слой Upscale: {EXECUTOR.mode}" + (" (ордера пока не подключены)" if EXECUTOR.mode != "off" else "")
+                       + " | /up статус, /halt пауза")
     if MOMENTUM_ENABLED:
         start_lines.append(f"🚀 ИМПУЛЬС 5М — только оценка от {MOMENTUM_MIN_SCORE} ({mom_lvl}), скан каждые 5 мин")
     else:
