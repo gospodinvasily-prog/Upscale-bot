@@ -2251,10 +2251,11 @@ HELP_TEXT = ("<b>Команды:</b>\n"
              "/skip SEI причина — сигнал пропустил\n"
              "/stat — мои сделки и проскальзывание\n"
              "/watch — что сейчас в зарядке\n"
-             "/up — статус авто-слоя Upscale | /halt — пауза исполнения | /resume — продолжить")
+             "/up — статус авто-слоя Upscale | /uptest — тест: открыть и закрыть BTC на демо\n"
+             "/halt — пауза исполнения | /resume — продолжить | /closeall — закрыть всё на демо")
 
 # ── Авто-слой Upscale (v0: dry, ордера не отправляет). AUTO_TRADE=off|dry в переменных Render ──
-EXECUTOR = upscale_exec.Executor(send_telegram, lambda row: _append_csv(EXEC_CSV, row), RISK_USD, MAX_POS_USD)
+EXECUTOR = upscale_exec.Executor(send_telegram, lambda row: _append_csv(EXEC_CSV, row), RISK_USD, MAX_POS_USD, UPSCALE_PAIRS + ["BTC"])
 
 def handle_command(text: str) -> str:
     parts = text.replace(",", ".").split()
@@ -2280,6 +2281,10 @@ def handle_command(text: str) -> str:
         return close_my_trade(arg, num, "out") if arg else "Формат: /out SEI 0.2901"
     if cmd == "/up":
         return EXECUTOR.status()
+    if cmd == "/uptest":
+        return EXECUTOR.selftest()
+    if cmd == "/closeall":
+        return EXECUTOR.closeall()
     if cmd == "/halt":
         return EXECUTOR.halt()
     if cmd == "/resume":
@@ -2431,7 +2436,7 @@ def main():
                        f"≤{DAILY_MAX_SIGNALS} сигналов в день | 1 монета в день | "
                        f"≤{MAX_SAME_SIDE_30M} в сторону за 30 мин | стоп дня после {DAY_STOP_LOSSES} убытков")
     start_lines.append(f"💰 Риск ${RISK_USD:.0f} на сделку (лимиты: ${DAY_LOSS_USD:.0f} в день)")
-    start_lines.append(f"🤖 Авто-слой Upscale: {EXECUTOR.mode}" + (" (ордера пока не подключены)" if EXECUTOR.mode != "off" else "")
+    start_lines.append(f"🤖 Авто-слой Upscale: {EXECUTOR.mode}" + ({"dry": " (только сообщения, ордеров нет)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""))
                        + " | /up статус, /halt пауза")
     if MOMENTUM_ENABLED:
         start_lines.append(f"🚀 ИМПУЛЬС 5М — только оценка от {MOMENTUM_MIN_SCORE} ({mom_lvl}), скан каждые 5 мин")
