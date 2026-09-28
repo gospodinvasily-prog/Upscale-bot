@@ -29,7 +29,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "1.3"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "1.4"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -536,6 +536,24 @@ class Executor:
             L.append("4) позиция закрыта ✅" if not left else "4) ⚠️ позиция ещё открыта — /closeall")
         except Exception as e:
             L.append(f"⚠️ /uptest: {_trunc(e, 300)}")
+        return "\n".join(L)
+
+    def risk_dump(self) -> str:
+        """Сырые данные для настройки защиты по просадке: риск-статус и все поля счёта."""
+        L = [f"upscale_exec v{EXEC_VERSION}"]
+        try:
+            self._ensure_account()
+            if not self.client or not self.account_id:
+                return "⛔ нет ключа или счёта"
+            acc = next((a for a in _as_list(self.client.accounts())
+                        if isinstance(a, dict) and str(pick(a, "accountId", "id")) == self.account_id), None)
+            L.append("Счёт (все поля): " + _trunc(acc, 1500))
+        except Exception as e:
+            L.append(f"⚠️ счёт: {_trunc(e, 200)}")
+        try:
+            L.append("risk-status: " + _trunc(self.client.risk_status(self.account_id), 1800))
+        except Exception as e:
+            L.append(f"⚠️ risk-status: {_trunc(e, 200)}")
         return "\n".join(L)
 
     def status(self) -> str:
