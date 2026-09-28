@@ -82,13 +82,22 @@ class UpscaleClient:
 
 
 # ── разбор ответов (формат неизвестен → защитно) ─────────────────────────────
-def _as_list(data):
+def _as_list(data, _depth=0):
+    """Достаёт список объектов из ответа любой формы: список, {data:[...]}, {data:{markets:[...]}}, {SYM:{...}}."""
     if isinstance(data, list):
         return data
-    if isinstance(data, dict):
-        for k in ("data", "items", "results", "accounts", "markets", "positions"):
-            if isinstance(data.get(k), list):
-                return data[k]
+    if isinstance(data, dict) and _depth < 3:
+        for k in ("data", "items", "results", "accounts", "markets", "positions", "rows", "list"):
+            if k in data:
+                got = _as_list(data[k], _depth + 1)
+                if got:
+                    return got
+        vals = list(data.values())
+        if vals and all(isinstance(v, dict) for v in vals):      # словарь вида {"BTC": {...}, ...}
+            return [dict(v, _key=k) for k, v in data.items()]
+        for v in vals:                                            # единственный вложенный список
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v
     return []
 
 def _norm_sym(s: str) -> str:
@@ -98,16 +107,41 @@ def _norm_sym(s: str) -> str:
             s = s[: -len(suf)]
     return s
 
+def _strings(d, depth=0):
+    """Все короткие строки объекта (в т.ч. из вложенных словарей) — кандидаты в тикеры."""
+    if isinstance(d, str):
+        if 1 <= len(d) <= 24 and re.search(r"[A-Za-z]", d) and not re.fullmatch(r"[0-9a-fA-F-]{20,}", d):
+            yield d
+    elif isinstance(d, dict) and depth < 2:
+        for k, v in d.items():
+            if k in ("id", "accountId", "userId"):
+                continue
+            yield from _strings(v, depth + 1)
+
 def market_index(markets_raw) -> dict:
     """{'SEI': market_dict, ...} по любым полям, похожим на тикер."""
     idx = {}
     for m in _as_list(markets_raw):
         if not isinstance(m, dict):
             continue
-        for f in ("symbol", "name", "ticker", "baseSymbol", "baseAsset", "base", "asset"):
+        for f in ("symbol", "name", "ticker", "baseSymbol", "baseAsset", "base", "asset", "pair", "_key"):
             if isinstance(m.get(f), str):
                 idx.setdefault(_norm_sym(m[f]), m)
+        for st in _strings(m):                       # запасной путь: любые короткие строки
+            idx.setdefault(_norm_sym(st), m)
     return idx
+
+def describe(raw, n=350) -> str:
+    """Как выглядит ответ — для отладки формата в /up."""
+    if isinstance(raw, list):
+        head = f"список из {len(raw)}"
+        first = raw[0] if raw else None
+    elif isinstance(raw, dict):
+        head = "объект, ключи: " + ", ".join(list(raw.keys())[:12])
+        first = next((v for v in raw.values() if isinstance(v, (list, dict)) and v), None)
+    else:
+        return f"{type(raw).__name__}: {str(raw)[:n]}"
+    return head + (f"\nпервый элемент: {str(first)[:n]}" if first is not None else "")
 
 def pick(d: dict, *names):
     for n in names:
@@ -255,11 +289,12 @@ class Executor:
                 lines.append("⚠️ UPSCALE_ACCOUNT_ID не задан и счёт неоднозначен")
             else:
                 self._mk_ts = 0
-                self._refresh_markets()
-                lines.append(f"Счёт: {self.account_id} | рынков распознано: {len(self._mk)}")
+                raw = self.client.markets(self.account_id)
+                self._mk, self._mk_ts = market_index(raw), time.time()
+                lines.append(f"Счёт: {self.account_id} | рынков распознано: {len(_as_list(raw))}, тикеров: {len(self._mk)}")
+                lines.append("Ответ /v2/markets: " + describe(raw))
                 if self._mk:
-                    m = next(iter(self._mk.values()))
-                    lines.append("Поля рынка: " + ", ".join(list(m.keys())[:15]))
+                    lines.append("Есть на Upscale: " + ", ".join(sorted(self._mk)[:25]))
         except Exception as e:
             lines.append(f"⚠️ API: {e}")
         return "\n".join(lines)
