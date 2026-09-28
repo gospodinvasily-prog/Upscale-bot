@@ -29,10 +29,11 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
+EXEC_VERSION  = "1.3"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
-MARGIN_BUFFER = Decimal(os.environ.get("EXEC_MARGIN_BUFFER", "0.02"))   # запас на комиссию/спред (замер: $100 → маржа $99.96)
+MARGIN_BUFFER = Decimal(os.environ.get("EXEC_MARGIN_BUFFER", "0.005"))  # запас (замер: amount $100 ×5 → notional $499.80, маржа $99.96)
 MAX_CHASE_ATR = float(os.environ.get("EXEC_MAX_CHASE_ATR", "0.3"))
 TP_DELAY_SEC  = int(os.environ.get("EXEC_TP_DELAY_SEC", "65"))
 MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "3"))
@@ -232,7 +233,7 @@ def take_body(account_id, market_id, direction, position_id, amount_fp9, trigger
     return {"accountId": account_id, "marketId": market_id, "type": "take", "direction": direction,
             "positionId": position_id, "amount": str(amount_fp9), "triggerPrice": to_fp9(trigger_price)}
 
-def _pos_id(p):     return str(pick(p, "id", "positionId", "uuid") or "")
+def _pos_id(p):     return str(pick(p, "idx", "positionId", "id", "txId") or "")
 
 def _pos_market(p):
     for k in ("marketId", "market"):
@@ -386,18 +387,25 @@ class Executor:
             return "ордер отправлен, но позицию не нашёл (проверь терминал)"
         size = _pos_size(pos)
         size_base = Decimal(size) / FP
-        notional = size_base * Decimal(str(b["price"]))
+        if pos.get("notional"):
+            notional = from_fp9(pos["notional"])                 # notional из самой позиции
+        else:
+            notional = size_base * Decimal(str(b["price"]))
         real_risk = notional * Decimal(str(b["stop_pct"])) / 100
+        fill = notional / size_base if size_base else Decimal(str(b["price"]))    # цена входа = notional / размер
+        sig_px = Decimal(str(b["price"]))
+        slip = (fill - sig_px) / sig_px * 100 * (1 if side == "long" else -1)      # + = вход хуже сигнала
         info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size,
                 "tp1": b["tp1_price"], "tp2": b["tp2_price"], "sym": sym}
         threading.Timer(TP_DELAY_SEC, self._place_tps, args=(info,)).start()
         self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
+                  f"вход {fill:.6g} (проскальзывание {slip:+.2f}% к сигналу), "
                   f"риск по стопу ≈ ${real_risk:.1f} (план ${plan['real_risk_usd']:.1f}). "
                   f"Стоп {b['stop']:.6g} выставлен со входом. TP поставлю через {TP_DELAY_SEC}с.")
         if plan["real_risk_usd"] and abs(real_risk - plan["real_risk_usd"]) / plan["real_risk_usd"] > Decimal("0.3"):
             self.send(f"⚠️ {sym}: фактический риск ${real_risk:.1f} сильно отличается от плана "
                       f"${plan['real_risk_usd']:.1f} — проверь, как API трактует amount/плечо.")
-        return f"открыт pos={info['id']} size={size_base:.6g} risk≈{real_risk:.1f}"
+        return f"открыт pos={info['id']} size={size_base:.6g} risk≈{real_risk:.1f} slip={slip:+.3f}%"
 
     def _send_take(self, info, amount, price):
         """take-ордер; направление — как у позиции, при отказе пробуем встречное и запоминаем."""
@@ -483,7 +491,7 @@ class Executor:
 
     def selftest(self) -> str:
         """Как Quickstart: открыть BTC long на $100 резерва ×5 (без TP/SL), найти позицию, закрыть. Только демо."""
-        L = []
+        L = [f"upscale_exec v{EXEC_VERSION}"]
         try:
             self._ensure_account()
             self._refresh_markets()
@@ -494,7 +502,8 @@ class Executor:
             if not m:
                 return "⛔ рынок BTC не найден"
             mid = str(m["id"])
-            before = {_pos_id(p) for p in self._positions()}
+            existing = self._positions()
+            before = {_pos_id(p) for p in existing}
             body = open_body(self.account_id, mid, "long", 100, 5)
             L.append("1) открываю BTC long $100 ×5: " + _trunc(body, 250))
             resp = self.client.order(body)
@@ -502,8 +511,16 @@ class Executor:
             pos = self._wait_position(mid, "long", before)
             if not pos:
                 raw = self._positions()
-                return "\n".join(L + ["⚠️ позицию по полям не нашёл. Сырые активные позиции (" + str(len(raw)) + "): " + _trunc(raw, 700),
-                                       "Позиция могла открыться — закрой /closeall"])
+                L.append("⚠️ позицию по полям не нашёл. Сырые активные позиции (" + str(len(raw)) + "): " + _trunc(raw, 700))
+                if not existing:      # до теста позиций не было — значит, любая открытая от теста, можно чистить
+                    try:
+                        self.client.close_all(self.account_id)
+                        L.append("🧹 до теста позиций не было — отправил close-all")
+                    except UpscaleError as e:
+                        L.append(f"⚠️ close-all не принят: {_trunc(e, 200)} — закрой руками или /closeall")
+                else:
+                    L.append("Были и другие позиции — закрой тестовую руками")
+                return "\n".join(L)
             L.append("2) позиция: " + _trunc(pos, 500))
             size = _pos_size(pos)
             L.append(f"   size(fp9)={size} → {Decimal(size) / FP:.6g} BTC")
@@ -522,7 +539,7 @@ class Executor:
         return "\n".join(L)
 
     def status(self) -> str:
-        lines = [f"🤖 Авто-режим: <b>{self.mode}</b>" + (" (реальные ордера ТОЛЬКО на демо-счёт)" if self.mode == "demo" else ""),
+        lines = [f"🤖 upscale_exec v{EXEC_VERSION} | Авто-режим: <b>{self.mode}</b>" + (" (реальные ордера ТОЛЬКО на демо-счёт)" if self.mode == "demo" else ""),
                  f"Пауза: {'да' if self.halted else 'нет'} | ключ: {'есть' if self.client else 'НЕТ'}"]
         if not self.client:
             return "\n".join(lines)
