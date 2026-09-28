@@ -292,15 +292,19 @@ class Executor:
             if str(pick(a, "accountId", "id")) == self.account_id:
                 self.account_type = str(a.get("type") or "").lower()
 
-    def _real_block(self):
-        """Причина, по которой реальные ордера слать нельзя (None — можно)."""
-        if self.mode != "demo":
-            return "режим не demo"
+    def _demo_block(self):
+        """Ручные команды (/uptest, /closeall): нужен только ключ и ДЕМО-счёт, режим AUTO_TRADE не важен."""
         if not self.client or not self.account_id:
             return "нет ключа или счёта"
         if self.account_type != "demo":
             return f"счёт не демо (type={self.account_type or '?'}) — ордера запрещены"
         return None
+
+    def _real_block(self):
+        """Причина, по которой АВТО-ордера слать нельзя (None — можно): режим demo + демо-счёт."""
+        if self.mode != "demo":
+            return "режим не demo"
+        return self._demo_block()
 
     def _day_count(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -460,7 +464,7 @@ class Executor:
     def closeall(self) -> str:
         try:
             self._ensure_account()
-            block = self._real_block()
+            block = self._demo_block()
             if block:
                 return f"⛔ {block}"
             self.client.close_all(self.account_id)
@@ -474,7 +478,7 @@ class Executor:
         try:
             self._ensure_account()
             self._refresh_markets()
-            block = self._real_block()
+            block = self._demo_block()
             if block:
                 return f"⛔ /uptest не выполнен: {block}"
             m = find_market(self._mk, "BTC")
