@@ -2251,7 +2251,7 @@ HELP_TEXT = ("<b>Команды:</b>\n"
              "/skip SEI причина — сигнал пропустил\n"
              "/stat — мои сделки и проскальзывание\n"
              "/watch — что сейчас в зарядке\n"
-             "/up — статус авто-слоя Upscale | /uptest — тест: открыть и закрыть BTC на демо | /risk — сырые данные счёта и просадки\n"
+             "/up — статус авто-слоя Upscale | /uptest — тест: открыть и закрыть BTC на демо | /risk — баланс, просадка, лимиты\n"
              "/halt — пауза исполнения | /resume — продолжить | /closeall — закрыть всё на демо")
 
 # ── Авто-слой Upscale (v0: dry, ордера не отправляет). AUTO_TRADE=off|dry в переменных Render ──
@@ -2282,6 +2282,8 @@ def handle_command(text: str) -> str:
     if cmd == "/up":
         return EXECUTOR.status()
     if cmd == "/risk":
+        return EXECUTOR.risk_summary()
+    if cmd == "/riskraw":
         return EXECUTOR.risk_dump()
     if cmd == "/uptest":
         return EXECUTOR.selftest()

@@ -17,6 +17,9 @@
   EXEC_TP_DELAY_SEC   когда можно ставить TP после входа (65, правило 60с)
   EXEC_MAX_OPEN       максимум одновременных позиций (3)
   EXEC_MAX_TRADES_DAY максимум входов за сутки UTC (8)
+  EXEC_DAY_SOFT_FRAC / EXEC_DAY_HARD_FRAC   доля дневного лимита: стоп входов (0.6) / аварийное закрытие (0.8)
+  EXEC_TOT_SOFT_FRAC / EXEC_TOT_HARD_FRAC   то же для максимальной просадки (0.6 / 0.7)
+  EXEC_DAY_GAIN_CAP_PCT  потолок дневного плюса в % (правило 30%), 0 = выключено
 """
 import os
 import re
@@ -29,7 +32,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "1.4"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "1.5"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -38,6 +41,13 @@ MAX_CHASE_ATR = float(os.environ.get("EXEC_MAX_CHASE_ATR", "0.3"))
 TP_DELAY_SEC  = int(os.environ.get("EXEC_TP_DELAY_SEC", "65"))
 MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "3"))
 MAX_TRADES_DAY = int(os.environ.get("EXEC_MAX_TRADES_DAY", "8"))
+# Защита по просадке — доли от лимитов счёта (при 5%/10%: стоп входов 3%/6%, аварийное закрытие 4%/7%)
+DAY_SOFT_FRAC = Decimal(os.environ.get("EXEC_DAY_SOFT_FRAC", "0.6"))
+DAY_HARD_FRAC = Decimal(os.environ.get("EXEC_DAY_HARD_FRAC", "0.8"))
+TOT_SOFT_FRAC = Decimal(os.environ.get("EXEC_TOT_SOFT_FRAC", "0.6"))
+TOT_HARD_FRAC = Decimal(os.environ.get("EXEC_TOT_HARD_FRAC", "0.7"))
+DAY_GAIN_CAP_PCT = Decimal(os.environ.get("EXEC_DAY_GAIN_CAP_PCT", "0"))   # >0: не входить, если плюс за день ≥ N% (правило 30%); 0 = выкл
+WATCHDOG_SEC  = int(os.environ.get("EXEC_WATCHDOG_SEC", "60"))
 MARKETS_TTL   = 30 * 60
 
 
@@ -274,9 +284,16 @@ class Executor:
         self.account_id = os.environ.get("UPSCALE_ACCOUNT_ID", "").strip()
         self.account_type = ""
         self.close_dir = "same"          # направление take-ордера при закрытии: как у позиции или встречное
+        self.acc = {}                    # карточка счёта (лимиты просадки)
+        self._open_risk = {}             # id позиции -> риск по стопу, $
+        self._trip = None                # {"kind": "day"|"total", "date": ...} — сработала аварийная защита
+        self._soft_date = ""
+        self._snap_err = ""
         self._mk, self._mk_ts = {}, 0.0
         self._day = {"date": "", "n": 0}
         self._lock = threading.Lock()
+        if self.mode == "demo" and self.client:
+            threading.Thread(target=self._watchdog, daemon=True).start()
 
     # -- служебное --
     def _refresh_markets(self):
@@ -290,7 +307,7 @@ class Executor:
     def _ensure_account(self):
         if not self.client:
             return
-        if self.account_id and self.account_type:
+        if self.account_id and self.account_type and self.acc:
             return
         accs = [a for a in _as_list(self.client.accounts()) if isinstance(a, dict)]
         if not self.account_id and len(accs) == 1:
@@ -298,6 +315,7 @@ class Executor:
         for a in accs:
             if str(pick(a, "accountId", "id")) == self.account_id:
                 self.account_type = str(a.get("type") or "").lower()
+                self.acc = a
 
     def _demo_block(self):
         """Ручные команды (/uptest, /closeall): нужен только ключ и ДЕМО-счёт, режим AUTO_TRADE не важен."""
@@ -318,6 +336,124 @@ class Executor:
         if self._day["date"] != today:
             self._day = {"date": today, "n": 0}
         return self._day["n"]
+
+    # -- контроль баланса и просадки --
+    def _snapshot(self):
+        """Эквити и лимиты из risk-status. None, если не удалось прочитать (тогда входы блокируются)."""
+        try:
+            rs = self.client.risk_status(self.account_id)
+        except Exception as e:
+            self._snap_err = _trunc(e, 200)
+            return None
+        if not isinstance(rs, dict) or pick(rs, "currentEquity", "equity") is None or pick(rs, "dayStartEquity") is None:
+            self._snap_err = "неожиданный формат risk-status: " + _trunc(rs, 200)
+            return None
+        equity = from_fp9(pick(rs, "currentEquity", "equity"))
+        day_start = from_fp9(rs["dayStartEquity"])
+        init = self.acc.get("initialAccountBalance") or pick(rs, "periodStartEquity")
+        base = from_fp9(init) if init else day_start
+        dd = Decimal(str(self.acc.get("maxDailyDrawdown") or 5))
+        td = Decimal(str(self.acc.get("maxTotalDrawdown") or 10))
+        day_lim, tot_lim = day_start * dd / 100, base * td / 100
+        return {"equity": equity, "day_start": day_start, "base": base, "rs": rs,
+                "dd_pct": dd, "td_pct": td,
+                "day_loss": max(Decimal(0), day_start - equity), "tot_loss": max(Decimal(0), base - equity),
+                "day_gain": max(Decimal(0), equity - day_start),
+                "day_lim": day_lim, "tot_lim": tot_lim,
+                "day_soft": day_lim * DAY_SOFT_FRAC, "day_hard": day_lim * DAY_HARD_FRAC,
+                "tot_soft": tot_lim * TOT_SOFT_FRAC, "tot_hard": tot_lim * TOT_HARD_FRAC}
+
+    def _guard_skip(self, snap, new_risk: Decimal):
+        """Причина отказа от входа по риску или None. Открытый риск считаем по стопам открытых позиций."""
+        open_risk = sum(self._open_risk.values(), Decimal(0))
+        if snap["day_loss"] + open_risk + new_risk > snap["day_soft"]:
+            return (f"дневной риск: убыток ${snap['day_loss']:.0f} + открытый ${open_risk:.0f} + новый ${new_risk:.0f} "
+                    f"> порога ${snap['day_soft']:.0f} (лимит ${snap['day_lim']:.0f})")
+        if snap["tot_loss"] + open_risk + new_risk > snap["tot_soft"]:
+            return (f"общая просадка: ${snap['tot_loss']:.0f} + открытый ${open_risk:.0f} + новый ${new_risk:.0f} "
+                    f"> порога ${snap['tot_soft']:.0f} (лимит ${snap['tot_lim']:.0f})")
+        if DAY_GAIN_CAP_PCT > 0 and snap["day_gain"] >= snap["base"] * DAY_GAIN_CAP_PCT / 100:
+            return f"дневной плюс ${snap['day_gain']:.0f} достиг потолка {DAY_GAIN_CAP_PCT}% (правило 30%)"
+        return None
+
+    def _check_hard(self, snap):
+        """Аварийная защита: закрыть всё и остановить исполнение. Возвращает True, если сработала."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        kind = None
+        if snap["day_loss"] >= snap["day_hard"]:
+            kind = "day"
+        elif snap["tot_loss"] >= snap["tot_hard"]:
+            kind = "total"
+        if kind and not self._trip:
+            try:
+                self.client.close_all(self.account_id)
+                closed = "все позиции закрыты"
+            except Exception as e:
+                closed = f"⚠️ close-all не принят: {_trunc(e, 150)} — закрой руками!"
+            self.halted = True
+            self._trip = {"kind": kind, "date": today}
+            what = (f"дневной убыток ${snap['day_loss']:.0f} из лимита ${snap['day_lim']:.0f}" if kind == "day"
+                    else f"общая просадка ${snap['tot_loss']:.0f} из лимита ${snap['tot_lim']:.0f}")
+            self.send(f"🚨 <b>АВАРИЙНАЯ ЗАЩИТА</b>: {what}. {closed}. Исполнение остановлено"
+                      + (" до следующего дня UTC." if kind == "day" else " (общая просадка — только вручную /resume)."))
+            return True
+        if snap["day_loss"] >= snap["day_soft"] and self._soft_date != today:
+            self._soft_date = today
+            self.send(f"🟠 Дневной убыток ${snap['day_loss']:.0f} достиг порога ${snap['day_soft']:.0f} "
+                      f"(лимит ${snap['day_lim']:.0f}) — новые входы заблокированы до завтра (UTC).")
+        return False
+
+    def _watchdog_tick(self):
+        if self.mode != "demo" or not self.client:
+            return
+        self._ensure_account()
+        if not self.account_id or self._demo_block():
+            return
+        snap = self._snapshot()
+        if not snap:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._trip and self._trip["kind"] == "day" and self._trip["date"] != today and snap["day_loss"] < snap["day_soft"]:
+            self._trip, self.halted = None, False
+            self.send("▶️ Новый день (UTC): исполнение возобновлено.")
+        self._check_hard(snap)
+
+    def _watchdog(self):
+        while True:
+            time.sleep(WATCHDOG_SEC)
+            try:
+                self._watchdog_tick()
+            except Exception:
+                print(f"[EXEC] watchdog: {traceback.format_exc()}")
+
+    def risk_summary(self) -> str:
+        L = [f"upscale_exec v{EXEC_VERSION}"]
+        try:
+            self._ensure_account()
+            if not self.client or not self.account_id:
+                return "⛔ нет ключа или счёта"
+            snap = self._snapshot()
+            if not snap:
+                return "\n".join(L + [f"⚠️ не смог прочитать risk-status: {self._snap_err}"])
+            rs = snap["rs"]
+            L.append(f"Эквити ${snap['equity']:.2f} | начало дня ${snap['day_start']:.2f} | старт ${snap['base']:.2f}")
+            L.append(f"Дневной убыток ${snap['day_loss']:.2f} из лимита ${snap['day_lim']:.0f} ({snap['dd_pct']}%) — "
+                     f"стоп входов ${snap['day_soft']:.0f}, аварийное закрытие ${snap['day_hard']:.0f}")
+            L.append(f"Общая просадка ${snap['tot_loss']:.2f} из лимита ${snap['tot_lim']:.0f} ({snap['td_pct']}%) — "
+                     f"стоп входов ${snap['tot_soft']:.0f}, аварийное закрытие ${snap['tot_hard']:.0f}")
+            open_risk = sum(self._open_risk.values(), Decimal(0))
+            L.append(f"Открытый риск по стопам (по данным бота): ${open_risk:.0f}")
+            profit = snap["equity"] - from_fp9(rs.get("periodStartEquity") or 0)
+            best = from_fp9(rs.get("maxPeriodDailyEquityDelta") or 0)
+            ratio = (best / profit * 100) if profit > 0 else None
+            L.append(f"Прибыль периода ${profit:.2f} | лучший день ${best:.2f}"
+                     + (f" = {ratio:.0f}% (правило 30%: должно быть < 30%)" if ratio is not None else ""))
+            L.append(f"Профитных дней: {self.acc.get('profitableDays', '?')} из {self.acc.get('minTradingDays', '?')} | цель {self.acc.get('profitTarget', '?')}%")
+            if self._trip:
+                L.append(f"🚨 Аварийная защита сработала: {self._trip}")
+        except Exception as e:
+            L.append(f"⚠️ {_trunc(e, 200)}")
+        return "\n".join(L)
 
     # -- вход сигнала --
     def on_signal(self, b: dict, score: int):
@@ -376,6 +512,14 @@ class Executor:
         if any(_pos_market(p) == mid for p in pos_now):
             return "пропуск: по монете уже есть позиция"
         before = {_pos_id(p) for p in pos_now}
+        live = set(before)
+        self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
+        snap = self._snapshot()
+        if snap is None:
+            return f"пропуск: не смог прочитать risk-status ({self._snap_err})"
+        why = self._guard_skip(snap, plan["real_risk_usd"])
+        if why:
+            return "пропуск: " + why
         body = open_body(acc, mid, side, plan["margin_usd"], plan["leverage"], stop=b["stop"])
         try:
             self.client.order(body)
@@ -397,6 +541,7 @@ class Executor:
         slip = (fill - sig_px) / sig_px * 100 * (1 if side == "long" else -1)      # + = вход хуже сигнала
         info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size,
                 "tp1": b["tp1_price"], "tp2": b["tp2_price"], "sym": sym}
+        self._open_risk[info["id"]] = real_risk
         threading.Timer(TP_DELAY_SEC, self._place_tps, args=(info,)).start()
         self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
                   f"вход {fill:.6g} (проскальзывание {slip:+.2f}% к сигналу), "
@@ -582,6 +727,9 @@ class Executor:
                     miss = [p for p in self.pairs if not find_market(self._mk, p)]
                     lines.append(f"Пар бота на Upscale: {len(self.pairs) - len(miss)} из {len(self.pairs)}"
                                  + (f" (нет: {', '.join(miss[:40])})" if miss else ""))
+                snap = self._snapshot()
+                if snap:
+                    lines.append(f"Эквити ${snap['equity']:.2f} | убыток дня ${snap['day_loss']:.2f}/${snap['day_lim']:.0f} | просадка ${snap['tot_loss']:.2f}/${snap['tot_lim']:.0f}")
                 try:
                     lines.append("Открыто позиций: " + str(len(self._positions())) + f" | входов сегодня (UTC): {self._day_count()}/{MAX_TRADES_DAY}")
                 except Exception as e:
