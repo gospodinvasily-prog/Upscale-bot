@@ -7,7 +7,7 @@ Upscale Bot v8.1 — воронка (Gate.io USDT-фьючерсы):
 
 Сделки шлём только в окнах 10:00–11:30 и 14:30–21:00 МСК; вне окон бот работает молча (копит заряды).
 В CSV попадают только реально отправленные сигналы; бот сам считает исход (TP1/стоп первым, TP2 до стопа).
-Сводка и файлы — в 21:30 МСК.
+Сводка и файлы — в 23:30 МСК.
 Зависимости: только requests. Переменные окружения: TELEGRAM_TOKEN, LOG_DIR (необязательно).
 """
 
@@ -28,14 +28,15 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v8.6"
+BOT_VERSION    = "v8.8"
 
-TRADING_START_MSK = 5          # бот работает (сканирует, копит заряды, следит за BTC)
-TRADING_END_MSK   = 21
+TRADING_START_MSK = 4          # v8.8: было 5 — но окно УКЛОНА начинается в 4:00,
+                               # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
+TRADING_END_MSK   = 23         # v8.8: было 21
 # Окна, в которые бот ШЛЁТ сделки (⚡ПРОБОЙ и 🚀ИМПУЛЬС). Вне окон работает молча:
 # заряды копятся, watchlist живёт, но сигналы не создаются и в csv не пишутся.
-SIGNAL_WINDOWS    = [(10, 0, 11, 30), (14, 30, 21, 0)]
-SUMMARY_HHMM      = (21, 30)   # сводка дня + csv-файлы в Telegram
+SIGNAL_WINDOWS    = [(10, 0, 11, 30), (14, 30, 23, 0)]   # v8.8: вечернее окно до 23:00
+SUMMARY_HHMM      = (23, 30)   # v8.8: сводка дня + csv-файлы в Telegram (было 21:30)
 
 # ── Риск на сделку (Upscale: счёт $5000, лимит −$150 в день и −6% = −$300 всего) ──
 # v8.4: риск $20 (счёт $10k: профитный день = +0.5% = $50, при риске $5 это +10R); потолок позиции $3000.
@@ -55,7 +56,7 @@ TILT_MIN_DIST_PCT  = 1.0       # мин. расстояние от цены до
 TILT_STOP_PCT      = 0.5       # стоп от цены входа (%)
 TILT_TP1_PCT       = 1.0       # TP1 от цены входа (%)
 TILT_TP2_MARGIN    = 0.2       # TP2 — граница диапазона минус этот % (чуть перед границей)
-TILT_WINDOWS       = [(4, 0, 12, 0), (14, 30, 21, 0)]  # окна УКЛОНА (МСК)
+TILT_WINDOWS       = [(4, 0, 12, 0), (14, 30, 23, 0)]  # окна УКЛОНА (МСК), v8.8: до 23:00
 # Защита повтора: если уже был стоп в то же направление по монете — не входим,
 # пока цена не вышла за стоп (т.е. не прошла дальше и не дала новый шанс).
 TILT_LAST_STOP = {}   # {"SYM:long": stop_price, "SYM:short": stop_price}
@@ -81,8 +82,14 @@ SCAN_WORKERS     = 8       # параллельных потоков в осно
 # ── v8.1: таймфрейм ЗАРЯДа и ПРОБОЯ ──
 # Все окна ниже заданы в свечах, поэтому при смене таймфрейма растягиваются автоматически.
 # "5m" = как в v8.0 (узкие диапазоны, маленькие цели); "15m" = диапазоны и цели шире; "1h" — ещё шире, сигналов мало.
-CHARGE_TF        = "1h"        # v8.3: 1ч по бэктесту (90 дней, 103 пары) — заметно лучше 15м и 30м
+# v8.7: было "1h" (бэктест v8.3 показал его лучшим), эксперимент — вернули "15m" для более
+# частого скана и точной ловли локальных сжатий, но окно коридора и проверку "цена стоит"
+# держим в реальных часах, как на 1h (см. ACC_WINDOW_HOURS и ACC_FLAT_ATR_EFF ниже) —
+# иначе просто сжатие таймфрейма даёт другой, более узкий и шумный коридор, а не то же самое зорче.
+CHARGE_TF        = "15m"
 TF_MIN           = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}[CHARGE_TF]
+REF_TF_MIN       = 60          # таймфрейм, на котором откалиброваны пороги ниже (бэктест v8.3)
+ATR_TF_SCALE     = (REF_TF_MIN / TF_MIN) ** 0.5   # 1.0 на 1h; на 15m ≈2.0 — компенсирует меньший ATR свечи
 MOMENTUM_ENABLED   = False     # 🚀 ИМПУЛЬС выключен — торгуем только ЗАРЯД → ПРОБОЙ
 MOMENTUM_MIN_SCORE = 8         # слать только 🟢 Сильный (8+); 5 — ещё и 🟡 Нормальный
 
@@ -116,18 +123,40 @@ TOP_N                = 2       # максимум импульсов одной 
 MOMENTUM_COOLDOWN_MIN = 120    # по отчёту v8.0 повторные сигналы хуже первых (47% против 58% TP1)
 
 # ── Свечи / база объёма ──
-CANDLES_LIMIT    = 300         # свечей таймфрейма (15м → ~3 суток)
-BASE_FROM        = 84          # база объёма: закрытые свечи [-84 : -12] (15м → 18ч,
-BASE_TO          = 12          # заканчиваются 3ч назад — не включают проверяемые свечи)
-SWING_LOOKBACK   = 144         # свечей для свинг-уровней и процентиля BB (15м → 36ч)
+# v8.7: все окна ниже заданы в ЧАСАХ и переводятся в свечи по текущему TF.
+# Раньше они были в свечах и калибровались на 1h; при переходе на 15м они бы сжались вчетверо,
+# а база объёма ([-BASE_FROM:-BASE_TO]) начала бы залезать внутрь 12-часового окна заряда —
+# «норма» объёма считалась бы по самому накоплению и занижала бы rvol (зарядов стало бы МЕНЬШЕ).
+BASE_FROM_H      = 84          # база объёма: закрытые свечи за последние 84ч,
+BASE_TO_H        = 12          # заканчиваются 12ч назад — ровно там, где начинается окно заряда
+SWING_LOOKBACK_H = 144         # часов истории для свинг-уровней и процентиля BB (6 суток)
+BASE_FROM        = max(10, round(BASE_FROM_H * 60 / TF_MIN))
+BASE_TO          = max(2,  round(BASE_TO_H  * 60 / TF_MIN))
+SWING_LOOKBACK   = max(40, round(SWING_LOOKBACK_H * 60 / TF_MIN))
+CANDLES_LIMIT    = max(300, SWING_LOOKBACK + 40)   # хватает и на свинги, и на базу объёма
 
 # ── ЗАРЯД (накопление) ──
-ACC_WINDOW        = 12         # свечей в окне заряда (15м → 3 часа)
-WIN_MIN           = ACC_WINDOW * TF_MIN          # окно заряда в минутах
+# v8.7: ACC_WINDOW теперь считается в часах, а не в свечах — при смене CHARGE_TF ширина
+# коридора (hi/lo) остаётся 12 часов, как было на 1h ("точки коридора выбирал как на 1h"),
+# а свечи внутри окна мельче — это и должно точнее ловить локальные сжатия внутри окна.
+ACC_WINDOW_HOURS  = 12         # реальная ширина коридора в часах (была 12 свечей × 1h)
+ACC_WINDOW        = max(4, round(ACC_WINDOW_HOURS * 60 / TF_MIN))   # свечей в окне заряда
+WIN_MIN           = ACC_WINDOW * TF_MIN          # окно заряда в минутах (≈ ACC_WINDOW_HOURS*60)
 HALF_MIN          = WIN_MIN // 2                 # половина окна (для объёма)
 WIN_TXT, HALF_TXT = fmt_minutes(WIN_MIN), fmt_minutes(HALF_MIN)
-ACC_FLAT_ATR      = 2.0        # |изменение цены за окно| ≤ 2 × нормальный ATR
-ACC_MAX_RANGE_PCT = 5.0        # диапазон окна не шире 5%
+ACC_FLAT_ATR      = 2.0        # |изменение цены за окно| ≤ 2 × нормальный ATR (порог, откалиброван на 1h)
+ACC_FLAT_ATR_EFF  = ACC_FLAT_ATR * ATR_TF_SCALE  # v8.7: применяемый порог — скорректирован под размер свечи
+# v8.8: потолок диапазона стал адаптивным. Раньше это было жёсткое «не шире 5%» — одна цифра
+# и для BTC, и для мемкоина, и для спокойного рынка, и для волатильного. За 12ч волатильная
+# монета физически не укладывается в 5%, поэтому при росте волатильности заряды исчезали
+# (проходимость фильтра падала с ~99% при 0.4%/ч до ~26% при 1.5%/ч, замерено симуляцией).
+# Теперь потолок = ожидаемый размах самой монеты за окно: k × ATR × √(число свечей).
+# В спокойном рынке ожидаемый размах меньше 5%, потолок остаётся 5% — поведение как в v8.3.
+ACC_MAX_RANGE_PCT = 5.0        # базовый потолок (нижняя граница адаптивного)
+ACC_RANGE_ATR_K   = 1.6        # коэффициент ожидаемого размаха случайного блуждания
+ACC_MAX_RANGE_ABS = 9.0        # жёсткий предел: шире — это уже не коридор, а тренд
+DIR_SWING_HOURS   = 4          # v8.7: было 4 свечи (=4ч на 1h) — окно для структуры "повыш./пониж. минимумы/максимумы"
+DIR_SWING_N       = max(2, round(DIR_SWING_HOURS * 60 / TF_MIN))    # свечей, тоже в реальных часах
 ACC_SQUEEZE_PCTL  = 25         # v8.3: 25 вместо 35 — по бэктесту лучший вариант
 ACC_TR_RATIO_MAX  = 0.75       # или средний диапазон свечей ≤ 75% от нормы
 ACC_RVOL_MIN      = 1.3        # объём второй половины окна ≥ 1.3× нормы
@@ -136,27 +165,42 @@ ACC_MIN_SCORE     = 6          # минимальная сила заряда д
 ACC_MAX_SCORE     = 12
 ACC_REALERT_DELTA = 2          # повторный алерт, только если сила выросла на 2+
 
+# ── Сроки жизни/оценки — в ЧАСАХ (v8.7), одинаковы на любом таймфрейме ──
+WATCH_TTL_HOURS   = 16         # сколько ЗАРЯД ждёт пробоя в watchlist
+EVAL_WINDOW_HOURS = 24         # окно объективной оценки заряда по ценам
+FOLLOW_HOURS      = 12         # сколько меряем ход после выхода из диапазона
+HORIZON_HOURS     = 12         # горизонт оценки исхода сигнала
+COOLDOWN_HOURS    = 3          # пауза по монете после пробоя
+
 # ── Профили таймфрейма: у каждого ЗАРЯДа свой (альты — CHARGE_TF, BTC — BTC_CHARGE_TF) ──
 BTC_CHARGE_ENABLED = True
 BTC_CHARGE_TF      = "1h"      # BTC движется медленнее альтов — на 1h диапазоны 1–3%, пробои крупнее
 
 def tf_profile(tf: str) -> dict:
+    """v8.7: окна профиля заданы в ЧАСАХ. Раньше были в свечах (N × tf_min), поэтому при
+    переходе 1h → 15м все сроки (жизнь заряда, горизонт оценки) сжимались вчетверо, и
+    статистика v8.7 стала бы несопоставима с v8.3–8.6. Теперь они одинаковы на любом TF."""
     m = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}[tf]
-    win = ACC_WINDOW * m
+    win_candles = max(4, round(ACC_WINDOW_HOURS * 60 / m))   # окно в часах для ЭТОГО tf,
+    win = win_candles * m                                     # не глобальный ACC_WINDOW (он под CHARGE_TF альтов)
     return {
         "tf": tf, "tf_min": m, "win_min": win, "win_txt": fmt_minutes(win),
-        "half_txt": fmt_minutes(win // 2), "swing_txt": fmt_minutes(SWING_LOOKBACK * m),
-        "watch_ttl_min": 16 * m,                       # сколько живёт в watchlist (15м → 4ч, 1h → 16ч)
-        "eval_window": min(24 * m, 1800) * 60,         # оценка заряда по ценам (15м → 6ч, 1h → 24ч)
-        "follow_min": 12 * m,                          # ход после выхода (15м → 3ч, 1h → 12ч)
-        "horizon": min(12 * m, 1800) * 60,             # оценка сигнала (5м → 1ч, 15м → 3ч, 1h → 12ч)
-        "cooldown_min": max(120, 3 * m),               # пауза после пробоя (15м → 2ч, 1h → 3ч)
+        "window": win_candles,
+        "dir_swing_n": max(2, round(DIR_SWING_HOURS * 60 / m)),
+        "flat_atr_eff": ACC_FLAT_ATR * (REF_TF_MIN / m) ** 0.5,
+        "half_txt": fmt_minutes(win // 2),
+        "swing_txt": fmt_minutes(SWING_LOOKBACK_H * 60),
+        "watch_ttl_min": WATCH_TTL_HOURS * 60,         # сколько живёт в watchlist — 16ч на любом TF
+        "eval_window": EVAL_WINDOW_HOURS * 3600,       # оценка заряда по ценам — 24ч
+        "follow_min": FOLLOW_HOURS * 60,               # ход после выхода — 12ч
+        "horizon": HORIZON_HOURS * 3600,               # оценка сигнала — 12ч
+        "cooldown_min": COOLDOWN_HOURS * 60,           # пауза после пробоя — 3ч
     }
 ACC_REALERT_MIN   = 30         # повтор из-за смены уклона — не чаще раза в 30 мин (v8.0 спамил)
 
 # ── ПРОБОЙ (быстрый триггер) ──
 FAST_INTERVAL_SEC = 20         # опрос watchlist
-WATCH_TTL_MIN     = 16 * TF_MIN  # сколько живёт ЗАРЯД в watchlist (15м → 4ч)
+WATCH_TTL_MIN     = WATCH_TTL_HOURS * 60   # v8.7: 16ч на любом TF (было 16 свечей)
 WATCH_MAX         = 15
 BREAK_BUFFER      = 0.003      # v8.4: было 0.1% — пол минимального отступа за уровнем (см. BREAK_BUFFER_ATR_MULT ниже)
 BREAK_BUFFER_ATR_MULT = 0.15   # v8.4: доп. отступ = 0.15×ATR монеты — защита от снятия ликвидности тонким
@@ -172,7 +216,7 @@ BREAK_STOP_MIN    = 0.8        # % минимальный стоп пробоя 
 STOP_MIN_PCT      = 0.8        # % минимальный стоп в ордерах заряда
 TP1_MIN_RR        = 0.5        # v8.4: было 1.0 — TP1 не ближе 0.5× расстояния до стопа (цели уменьшены вдвое)
 TP2_MIN_RR        = 1.0        # v8.4: было 2.0 — TP2 не ближе 1× расстояния до стопа (цели уменьшены вдвое)
-BREAKOUT_COOLDOWN_MIN = max(120, 3 * TF_MIN)  # повторы хуже первых сигналов — пауза 2ч; у BTC своя в профиле
+BREAKOUT_COOLDOWN_MIN = COOLDOWN_HOURS * 60  # повторы хуже первых сигналов — пауза 2ч; у BTC своя в профиле
 
 # ── Логирование исходов ──
 LOG_DIR          = os.environ.get("LOG_DIR", ".")
@@ -843,6 +887,7 @@ def log_charge(c: dict):
         "time_msk": datetime.fromtimestamp(now_ts, MSK).strftime("%Y-%m-%d %H:%M:%S"),
         "symbol": c["symbol"], "bias": c["side"], "score": c["score"], "bias_pts": c["bias"],
         "hi": c["hi"], "lo": c["lo"], "range_pct": round(c["rng_pct"], 2), "price": c["price"],
+        "max_range": c.get("max_range", ""), "atr_pct": c.get("atr_pct", ""),
         "pos_in_range": round(c["pos"], 2),
         "bb_pctl": round(c["sq_pct"], 1) if c["sq_pct"] is not None else "",
         "tr_ratio": round(c["tr_ratio"], 2), "rvol_half": round(c["rvol_half"], 2), "vol_rising": c["vol_rising"],
@@ -1122,7 +1167,11 @@ def structure_targets(price: float, is_long: bool, swings: list, atr: float):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache, P=ALT_P):
-    W = ACC_WINDOW
+    # v8.7: окно и пороги берём ИЗ ПРОФИЛЯ — у альтов CHARGE_TF, у BTC свой (BTC_CHARGE_TF).
+    # Глобальные ACC_WINDOW/DIR_SWING_N посчитаны под CHARGE_TF и для BTC не подходят.
+    W = P.get("window", ACC_WINDOW)
+    dir_n = P.get("dir_swing_n", DIR_SWING_N)
+    flat_atr_eff = P.get("flat_atr_eff", ACC_FLAT_ATR_EFF)
     WT, HT = P["win_txt"], P["half_txt"]
     if len(closed) < 60 or atr_norm <= 0 or baseline <= 0:
         return None
@@ -1137,7 +1186,11 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
     chg_win = pct(win[0]["o"], win[-1]["c"])
 
     # 1) Цена стоит
-    if abs(move) > ACC_FLAT_ATR * atr_norm or rng_pct > ACC_MAX_RANGE_PCT:
+    # v8.8: потолок размаха подстраивается под волатильность самой монеты.
+    atr_pct = atr_norm / price * 100 if price > 0 else 0
+    exp_range = ACC_RANGE_ATR_K * atr_pct * (W ** 0.5)      # ожидаемый размах за окно
+    max_range = min(ACC_MAX_RANGE_ABS, max(ACC_MAX_RANGE_PCT, exp_range))
+    if abs(move) > flat_atr_eff * atr_norm or rng_pct > max_range:
         return None
     # 2) Сжатие
     closes = [c["c"] for c in closed]
@@ -1199,8 +1252,8 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
     pos = min(max((price - lo) / height, 0.0), 1.0) if height > 0 else 0.5
     if pos >= 0.66:   bl += 1; dir_notes.append("цена прижата к верхней границе")
     elif pos <= 0.33: bs += 1; dir_notes.append("цена прижата к нижней границе")
-    lows_a  = min(c["l"] for c in win[:4]);  lows_c  = min(c["l"] for c in win[-4:])
-    highs_a = max(c["h"] for c in win[:4]);  highs_c = max(c["h"] for c in win[-4:])
+    lows_a  = min(c["l"] for c in win[:dir_n]);  lows_c  = min(c["l"] for c in win[-dir_n:])
+    highs_a = max(c["h"] for c in win[:dir_n]);  highs_c = max(c["h"] for c in win[-dir_n:])
     if lows_c > lows_a and highs_c >= highs_a * 0.998:
         bl += 1; dir_notes.append("повышающиеся минимумы (сжатие к сопротивлению)")
     if highs_c < highs_a and lows_c <= lows_a * 1.002:
@@ -1247,6 +1300,7 @@ def detect_charge(sym, closed, price, baseline, atr_norm, ctx, tick, stats_cache
     return {
         "symbol": sym, "side": side, "score": score, "bias": bias, "bl": bl, "bs": bs,
         "hi": hi, "lo": lo, "height": height, "rng_pct": rng_pct, "price": price, "pos": pos,
+        "max_range": round(max_range, 2), "atr_pct": round(atr_pct, 3),
         "sq_pct": sq_pct, "tr_ratio": tr_ratio, "rvol_half": rvol_half, "vol_rising": vol_rising,
         "oi_win": oi_win, "oi_15m": oi_15m, "taker_win": taker_win, "funding": funding,
         "change_24h": tick.get("change_24h", 0), "chg_win": chg_win,
@@ -2145,7 +2199,7 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
 
     # ── 🚀 ИМПУЛЬС ── (только в окно отправки: вне окна сигнал не создаётся и не логируется)
     if not in_signal_window():
-        print(f"[SCAN] вне окна отправки ({windows_txt()} МСК) — импульсы не шлём")
+        print(f"[SCAN] вне окна отправки ({windows_txt()} МСК) — ИМПУЛЬС не шлём (заряды/уклон не затронуты)")
         return len(charges), btc_chg_15
     longs  = [r["momentum"] for r in results if r["momentum"] and r["momentum"]["side"] == "long"]
     shorts = [r["momentum"] for r in results if r["momentum"] and r["momentum"]["side"] == "short"]
@@ -2516,9 +2570,10 @@ def main():
     bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -2540,7 +2595,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("compare", "2", "cmp"):
+                if bt_mode in ("range", "3", "rng"):
+                    import bt_range
+                    bt_range.main()        # v8.8: проверка адаптивного потолка диапазона
+                elif bt_mode in ("compare", "2", "cmp"):
                     import bt_compare
                     bt_compare.main()      # сравнение стратегий
                 else:
@@ -2557,7 +2615,8 @@ def main():
     mom_lvl = "🟢" if MOMENTUM_MIN_SCORE >= 8 else "🟡/🟢"
     start_lines = [
         f"🚀 <b>Upscale Bot {BOT_VERSION} запущен</b>",
-        f"⏳ ЗАРЯД {CHARGE_TF} — сжатие + объём/OI при стоящей цене, окно {WIN_TXT}, скан каждые {TF_MIN} мин",
+        f"⏳ ЗАРЯД {CHARGE_TF} — сжатие + объём/OI при стоящей цене, коридор {WIN_TXT} ({ACC_WINDOW} свечей), скан каждые {TF_MIN} мин",
+        f"📏 Потолок размаха: адаптивный — от {ACC_MAX_RANGE_PCT}% до {ACC_MAX_RANGE_ABS}% по волатильности монеты",
     ]
     if BTC_CHARGE_ENABLED:
         start_lines.append(f"🟠 BTC — отдельный ЗАРЯД→ПРОБОЙ на {BTC_CHARGE_TF}, окно {BTC_P['win_txt']}, скан раз в час")
