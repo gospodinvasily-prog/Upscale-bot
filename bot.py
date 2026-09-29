@@ -28,7 +28,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v8.5"
+BOT_VERSION    = "v8.6"
 
 TRADING_START_MSK = 5          # бот работает (сканирует, копит заряды, следит за BTC)
 TRADING_END_MSK   = 21
@@ -44,6 +44,21 @@ ACCOUNT_USD   = float(os.environ.get("ACCOUNT_USD", "10000"))
 RISK_USD      = float(os.environ.get("RISK_USD", "20"))     # сколько теряем, если сработал стоп
 MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "3000"))  # потолок размера позиции
 DAY_LOSS_USD  = float(os.environ.get("DAY_LOSS_USD", "150"))  # дневной лимит пропфёрма
+
+
+# ── 🎯 УКЛОН — вход внутри диапазона заряда по направлению уклона ──────────────
+# Сигнал появляется сразу при нахождении заряда (без ожидания пробоя).
+# Окно: 4:00–21:00 МСК, кроме 12:00–14:30 (вне него не шлём, но и не копим — не ставим ордера).
+TILT_ENABLED       = True
+TILT_MIN_SCORE     = 7         # минимальный score заряда
+TILT_MIN_DIST_PCT  = 1.0       # мин. расстояние от цены до границы диапазона (%)
+TILT_STOP_PCT      = 0.5       # стоп от цены входа (%)
+TILT_TP1_PCT       = 1.0       # TP1 от цены входа (%)
+TILT_TP2_MARGIN    = 0.2       # TP2 — граница диапазона минус этот % (чуть перед границей)
+TILT_WINDOWS       = [(4, 0, 12, 0), (14, 30, 21, 0)]  # окна УКЛОНА (МСК)
+# Защита повтора: если уже был стоп в то же направление по монете — не входим,
+# пока цена не вышла за стоп (т.е. не прошла дальше и не дала новый шанс).
+TILT_LAST_STOP = {}   # {"SYM:long": stop_price, "SYM:short": stop_price}
 
 # ── v8.3: правила отбора сделок (проверены на 90 днях и 103 парах) ──
 # Без них: 62 сделки в день, винрейт 68%, просадка −146%.
@@ -1250,6 +1265,84 @@ def order_trigger(level: float, is_long: bool, atr: float = 0.0) -> float:
     buf = max(level * BREAK_BUFFER, atr * BREAK_BUFFER_ATR_MULT)
     return level + buf if is_long else level - buf
 
+
+def in_tilt_window() -> bool:
+    """Окно работы УКЛОНА: 4:00-21:00 МСК кроме 12:00-14:30."""
+    now = datetime.now(MSK)
+    nm = now.hour * 60 + now.minute
+    return any(h1 * 60 + m1 <= nm < h2 * 60 + m2 for h1, m1, h2, m2 in TILT_WINDOWS)
+
+
+def build_tilt(c: dict):
+    """Строит сигнал УКЛОН по словарю заряда. Возвращает None если условия не выполнены."""
+    if not TILT_ENABLED:
+        return None
+    side = c["side"]
+    if side == "both":
+        return None
+    if c["score"] < TILT_MIN_SCORE:
+        return None
+    is_long = side == "long"
+    price   = c["price"]
+    hi, lo  = c["hi"], c["lo"]
+    dist_pct = (hi - price) / price * 100 if is_long else (price - lo) / price * 100
+    if dist_pct < TILT_MIN_DIST_PCT:
+        return None
+    key = f"{c['symbol']}:{side}"
+    prev_stop = TILT_LAST_STOP.get(key)
+    if prev_stop is not None:
+        if is_long and price <= prev_stop:
+            return None
+        if not is_long and price >= prev_stop:
+            return None
+    entry = price
+    stop  = entry * (1 - TILT_STOP_PCT / 100) if is_long else entry * (1 + TILT_STOP_PCT / 100)
+    tp1   = entry * (1 + TILT_TP1_PCT  / 100) if is_long else entry * (1 - TILT_TP1_PCT  / 100)
+    margin = entry * TILT_TP2_MARGIN / 100
+    tp2   = (hi - margin) if is_long else (lo + margin)
+    if is_long and tp2 <= tp1:
+        tp2 = tp1 * 1.001
+    if not is_long and tp2 >= tp1:
+        tp2 = tp1 * 0.999
+    rr1 = TILT_TP1_PCT / TILT_STOP_PCT
+    rr2 = abs(tp2 - entry) / entry * 100 / TILT_STOP_PCT
+    return {
+        "kind": "tilt", "symbol": c["symbol"], "side": side, "score": c["score"],
+        "price": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
+        "stop_pct": TILT_STOP_PCT, "tp1_pct": TILT_TP1_PCT,
+        "tp2_pct": abs(tp2 - entry) / entry * 100,
+        "dist_pct": dist_pct, "rr1": rr1, "rr2": rr2,
+        "hi": hi, "lo": lo, "atr": c["atr"], "charge_score": c["score"], "charge_side": side,
+    }
+
+
+def format_tilt(t: dict) -> str:
+    sym, side = t["symbol"], t["side"]
+    arrow    = "LONG" if side == "long" else "SHORT"
+    boundary = t["hi"] if side == "long" else t["lo"]
+    return (
+        f"УКЛОН {sym} {arrow} score={t['score']}\n"
+        f"Вход: {t['price']:.6g} | до границы: {t['dist_pct']:.2f}%\n"
+        f"Стоп: {t['stop']:.6g} (-{t['stop_pct']}%) | TP1: {t['tp1']:.6g} (+{t['tp1_pct']}%, RR 1:{t['rr1']:.1f})\n"
+        f"TP2: {t['tp2']:.6g} (перед {boundary:.6g}, RR 1:{t['rr2']:.1f})\n"
+        f"Расстояние до границы: {t['dist_pct']:.1f}%"
+    )
+
+
+def log_tilt(t: dict):
+    _append_csv(SIGNALS_CSV, {
+        "id": f"{int(time.time())}-{t['symbol']}-tilt-{t['side']}",
+        "ver": BOT_VERSION, "time_msk": datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": "tilt", "symbol": t["symbol"], "side": t["side"], "score": t["score"],
+        "price": t["price"], "stop": t["stop"], "tp1": t["tp1"], "tp2": t["tp2"],
+        "rvol": "", "decorr": "", "oi_15m": "", "oi_1h": "", "oi_win": "",
+        "stop_pct": t["stop_pct"], "tp1_pct": t["tp1_pct"], "tp2_pct": round(t["tp2_pct"], 2),
+        "tf": "1h", "taker": "", "funding": "", "ch24": "", "from_charge": True,
+        "charge_score": t["charge_score"], "charge_side": t["charge_side"],
+        "pace": "", "delta": "", "h4": "", "btc15": "", "btc12_chg": "", "btc12_oi": "",
+    })
+
+
 def charge_verdict(c: dict) -> str:
     """Короткий вывод по ЗАРЯДу: ставить ордера или ждать."""
     s = c["score"]
@@ -2014,10 +2107,41 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
             send_blocks(format_charge(c).split("\n"))
             WATCHLIST[c["symbol"]]["alerted"] = True
         else:
-            # вне окна сообщение не шлём, но помечаем: как окно откроется — дошлём,
-            # иначе пробой прилетит по заряду, под который ордера не выставлены
             WATCHLIST[c["symbol"]]["alerted"] = False
             print(f"[CHARGE] {c['symbol']}: вне окна — дошлю при открытии окна")
+
+        # ── 🎯 УКЛОН: сразу при заряде ─────────────────────────────────────────
+        if not in_tilt_window():
+            print(f"[TILT] {c['symbol']}: вне окна уклона — пропуск")
+            continue
+        tilt = build_tilt(c)
+        if tilt is None:
+            print(f"[TILT] {c['symbol']}: условия не выполнены (score={c['score']} side={c['side']})")
+            continue
+        ok, why = gate_allows(c["symbol"], c["side"])
+        if not ok:
+            print(f"[TILT] {c['symbol']}: гейт — {why}")
+            continue
+        vw_ok, vw_txt, _ = vwap_filter(c["symbol"], c["price"])
+        if not vw_ok:
+            print(f"[TILT] {c['symbol']}: VWAP — {vw_txt}")
+            continue
+        print(f"[TILT] {c['symbol']} {c['side']} score={c['score']} dist={tilt['dist_pct']:.2f}%")
+        send_blocks(format_tilt(tilt).split("\n"))
+        log_tilt(tilt)
+        gate_register(c["symbol"], c["side"])
+        TILT_LAST_STOP[f"{c['symbol']}:{c['side']}"] = tilt["stop"]
+        EXECUTOR.on_signal({
+            "symbol":    tilt["symbol"],
+            "side":      tilt["side"],
+            "price":     tilt["price"],
+            "stop":      tilt["stop"],
+            "stop_pct":  tilt["stop_pct"],
+            "tp1_price": tilt["tp1"],
+            "tp2_price": tilt["tp2"],
+            "atr":       tilt["atr"],
+            "ext_atr":   0.0,          # вход по заряду: не гонимся за ценой пробоя
+        }, tilt["score"])
 
     # ── 🚀 ИМПУЛЬС ── (только в окно отправки: вне окна сигнал не создаётся и не логируется)
     if not in_signal_window():
@@ -2193,6 +2317,8 @@ def close_my_trade(sym, exit_price=None, how="out"):
                   "pnl_usd": round(pnl_usd, 2), "pos_usd": round(pos)})
     if pnl_usd <= 0:
         gate_loss()
+        if how == "stop" and t.get("kind") == "tilt":
+            TILT_LAST_STOP[f"{t['sym']}:{t['side']}"] = exit_price
     mark = "🟢" if pnl_usd > 0 else "🔴"
     return (f"{mark} <b>{t['sym']}</b> закрыта по {exit_price:.6g}\n"
             f"{pnl_pct:+.2f}% от входа ≈ <b>${pnl_usd:+.2f}</b> (позиция ${pos:,.0f})")
