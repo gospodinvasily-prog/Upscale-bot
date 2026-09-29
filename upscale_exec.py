@@ -17,6 +17,7 @@
   EXEC_TP_DELAY_SEC   когда можно ставить TP после входа (65, правило 60с)
   EXEC_MAX_OPEN       максимум одновременных позиций (3)
   EXEC_MAX_TRADES_DAY максимум входов за сутки UTC (8)
+  EXEC_BREAKEVEN      on|off — перевод стопа в безубыток после TP1 (по умолчанию on)
   EXEC_DAY_SOFT_FRAC / EXEC_DAY_HARD_FRAC   доля дневного лимита: стоп входов (0.6) / аварийное закрытие (0.8)
   EXEC_TOT_SOFT_FRAC / EXEC_TOT_HARD_FRAC   то же для максимальной просадки (0.6 / 0.7)
   EXEC_DAY_GAIN_CAP_PCT  потолок дневного плюса в % (правило 30%), 0 = выключено
@@ -32,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "1.5"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "1.6"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -48,6 +49,14 @@ TOT_SOFT_FRAC = Decimal(os.environ.get("EXEC_TOT_SOFT_FRAC", "0.6"))
 TOT_HARD_FRAC = Decimal(os.environ.get("EXEC_TOT_HARD_FRAC", "0.7"))
 DAY_GAIN_CAP_PCT = Decimal(os.environ.get("EXEC_DAY_GAIN_CAP_PCT", "0"))   # >0: не входить, если плюс за день ≥ N% (правило 30%); 0 = выкл
 WATCHDOG_SEC  = int(os.environ.get("EXEC_WATCHDOG_SEC", "60"))
+# v1.6: перевод стопа в безубыток после срабатывания TP1.
+# Отменить исходный stopTriggerPrice (выставленный вместе со входом) API не позволяет,
+# поэтому безубыток ставится ДОПОЛНИТЕЛЬНЫМ stop-ордером. Он всегда ближе к цене, чем
+# исходный, поэтому срабатывает первым и закрывает позицию — исходный остаётся не у дел.
+BREAKEVEN_ENABLED = os.environ.get("EXEC_BREAKEVEN", "on").strip().lower() not in ("off", "0", "no")
+BREAKEVEN_OFFSET  = Decimal(os.environ.get("EXEC_BREAKEVEN_OFFSET", "0.0005"))  # +0.05% от входа: покрыть комиссию
+BREAKEVEN_POLL    = int(os.environ.get("EXEC_BREAKEVEN_POLL", "20"))            # как часто смотреть, сработал ли TP1
+BREAKEVEN_MAX_MIN = int(os.environ.get("EXEC_BREAKEVEN_MAX_MIN", "720"))        # сколько всего следить, мин
 MARKETS_TTL   = 30 * 60
 
 
@@ -242,6 +251,17 @@ def take_body(account_id, market_id, direction, position_id, amount_fp9, trigger
     """take-ордер по позиции: amount = размер в базовом активе (fp9), trigger 0 = по рынку."""
     return {"accountId": account_id, "marketId": market_id, "type": "take", "direction": direction,
             "positionId": position_id, "amount": str(amount_fp9), "triggerPrice": to_fp9(trigger_price)}
+
+def stop_body(account_id, market_id, direction, position_id, amount_fp9, trigger_price) -> dict:
+    """stop-ордер по открытой позиции (безубыток). Формат тот же, что у take, отличается type."""
+    return {"accountId": account_id, "marketId": market_id, "type": "stop", "direction": direction,
+            "positionId": position_id, "amount": str(amount_fp9), "triggerPrice": to_fp9(trigger_price)}
+
+def breakeven_price(entry, side, offset=None) -> Decimal:
+    """Цена безубытка: вход плюс небольшой отступ в сторону прибыли, чтобы покрыть комиссию."""
+    off = BREAKEVEN_OFFSET if offset is None else Decimal(str(offset))
+    e = Decimal(str(entry))
+    return e * (1 + off) if side == "long" else e * (1 - off)
 
 def _pos_id(p):     return str(pick(p, "idx", "positionId", "id", "txId") or "")
 
@@ -540,7 +560,7 @@ class Executor:
         sig_px = Decimal(str(b["price"]))
         slip = (fill - sig_px) / sig_px * 100 * (1 if side == "long" else -1)      # + = вход хуже сигнала
         info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size,
-                "tp1": b["tp1_price"], "tp2": b["tp2_price"], "sym": sym}
+                "tp1": b["tp1_price"], "tp2": b["tp2_price"], "sym": sym, "entry": fill}
         self._open_risk[info["id"]] = real_risk
         threading.Timer(TP_DELAY_SEC, self._place_tps, args=(info,)).start()
         self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
@@ -585,9 +605,54 @@ class Executor:
                     self.send(f"⚠️ {info['sym']}: {label} не принят: {_trunc(e, 300)}")
             if done:
                 self.send(f"🎯 {info['sym']}: выставлены " + ", ".join(done))
+            if done and BREAKEVEN_ENABLED and len(legs) > 1:
+                info["size"] = size
+                threading.Thread(target=self._watch_breakeven, args=(info,), daemon=True).start()
         except Exception as e:
             print(f"[EXEC] place_tps: {traceback.format_exc()}")
             self.send(f"⚠️ {info['sym']}: ошибка постановки TP: {e}")
+
+    # -- безубыток после TP1 --
+    def _send_stop(self, info, amount, price):
+        """stop-ордер; направление как у take (уже выяснено рабочее в close_dir)."""
+        dirs = [info["dir"], _opp(info["dir"])] if self.close_dir == "same" else [_opp(info["dir"]), info["dir"]]
+        last = None
+        for d in dirs:
+            try:
+                self.client.order(stop_body(self.account_id, info["mid"], d, info["id"], amount, price))
+                return
+            except UpscaleError as e:
+                last = e
+        raise last
+
+    def _watch_breakeven(self, info):
+        """Следит за позицией: как только размер упал (TP1 сработал) — ставит стоп в безубыток.
+        Исходный стоп отменить нельзя, но безубыток ближе к цене и сработает раньше него."""
+        deadline = time.time() + BREAKEVEN_MAX_MIN * 60
+        start_size = info["size"]
+        while time.time() < deadline:
+            time.sleep(BREAKEVEN_POLL)
+            try:
+                if not self.client:
+                    return
+                cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
+                if not cur:
+                    return                      # позиция закрыта целиком — следить не за чем
+                size_now = _pos_size(cur)
+                if size_now <= 0 or size_now >= start_size * 0.9:
+                    continue                    # TP1 ещё не сработал
+                be = breakeven_price(info["entry"], info["dir"])
+                self._send_stop(info, size_now, be)
+                self.send(f"🔒 {info['sym']}: TP1 сработал — стоп переведён в безубыток {be:.6g} "
+                          f"на остаток позиции.")
+                return
+            except UpscaleError as e:
+                self.send(f"⚠️ {info['sym']}: безубыток не принят: {_trunc(e, 250)} — "
+                          f"перенеси стоп руками.")
+                return
+            except Exception:
+                print(f"[EXEC] breakeven: {traceback.format_exc()}")
+                return
 
     # -- отчёт --
     def _report(self, b, score, plan, skip, result=""):
