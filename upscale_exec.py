@@ -33,15 +33,15 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "1.7"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "1.8"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
 MARGIN_BUFFER = Decimal(os.environ.get("EXEC_MARGIN_BUFFER", "0.005"))  # запас (замер: amount $100 ×5 → notional $499.80, маржа $99.96)
 MAX_CHASE_ATR = float(os.environ.get("EXEC_MAX_CHASE_ATR", "0.3"))
 TP_DELAY_SEC  = int(os.environ.get("EXEC_TP_DELAY_SEC", "65"))
-MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "3"))
-MAX_TRADES_DAY = int(os.environ.get("EXEC_MAX_TRADES_DAY", "8"))
+MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "0"))       # 0 = без лимита, ориентир только на риск
+MAX_TRADES_DAY = int(os.environ.get("EXEC_MAX_TRADES_DAY", "0"))  # 0 = без лимита, ориентир только на риск
 # Защита по просадке — доли от лимитов счёта (при 5%/10%: стоп входов 3%/6%, аварийное закрытие 4%/7%)
 DAY_SOFT_FRAC = Decimal(os.environ.get("EXEC_DAY_SOFT_FRAC", "0.6"))
 DAY_HARD_FRAC = Decimal(os.environ.get("EXEC_DAY_HARD_FRAC", "0.8"))
@@ -247,15 +247,26 @@ def open_body(account_id, market_id, direction, margin_usd, leverage, stop=None,
         body["takeTriggerPrice"] = to_fp9(take)
     return body
 
+def _check_amount(amount_fp9):
+    """v1.8: не отправляем ордер с нулевым/отрицательным объёмом — биржа вернёт
+    amount_not_positive, а позиция останется без цели."""
+    n = int(amount_fp9)
+    if n <= 0:
+        raise UpscaleError(f"объём ордера не положительный ({n}) — ордер не отправлен")
+    return str(n)
+
+
 def take_body(account_id, market_id, direction, position_id, amount_fp9, trigger_price) -> dict:
     """take-ордер по позиции: amount = размер в базовом активе (fp9), trigger 0 = по рынку."""
     return {"accountId": account_id, "marketId": market_id, "type": "take", "direction": direction,
-            "positionId": position_id, "amount": str(amount_fp9), "triggerPrice": to_fp9(trigger_price)}
+            "positionId": position_id, "amount": _check_amount(amount_fp9),
+            "triggerPrice": to_fp9(trigger_price)}
 
 def stop_body(account_id, market_id, direction, position_id, amount_fp9, trigger_price) -> dict:
     """stop-ордер по открытой позиции (безубыток). Формат тот же, что у take, отличается type."""
     return {"accountId": account_id, "marketId": market_id, "type": "stop", "direction": direction,
-            "positionId": position_id, "amount": str(amount_fp9), "triggerPrice": to_fp9(trigger_price)}
+            "positionId": position_id, "amount": _check_amount(amount_fp9),
+            "triggerPrice": to_fp9(trigger_price)}
 
 def breakeven_price(entry, side, offset=None) -> Decimal:
     """Цена безубытка: вход плюс небольшой отступ в сторону прибыли, чтобы покрыть комиссию."""
@@ -277,12 +288,22 @@ def _pos_market(p):
 def _pos_dir(p):    return str(pick(p, "direction", "side") or "").lower()
 
 def _pos_size(p):
-    """размер позиции в fp9 (целое). Числа в API — строки ×10⁹."""
+    """Размер позиции в fp9, всегда ПОЛОЖИТЕЛЬНЫЙ (направление берём из direction).
+    v1.8: было `int(v) if v.isdigit()` — у шорта размер приходит как "-6021973",
+    а isdigit() для минуса даёт False, поэтому число повторно умножалось на 10⁹.
+    Отсюда риск в миллиардах и «Order must have positive amount» на тейках."""
     v = pick(p, "size", "amount", "quantity", "baseAmount", "qty", "volume")
     if v is None:
         return 0
-    v = str(v)
-    return int(v) if v.isdigit() else int(to_fp9(v))
+    v = str(v).strip()
+    try:
+        n = int(v)                      # целое (в т.ч. отрицательное) — уже fp9
+    except ValueError:
+        try:
+            n = int(to_fp9(v))          # дробное — переводим в fp9
+        except Exception:
+            return 0
+    return abs(n)
 
 def _opp(d): return "short" if d == "long" else "long"
 
@@ -500,7 +521,7 @@ class Executor:
                                   b["tp1_price"], b["tp2_price"], self.risk_usd, self.max_pos_usd)
             if not skip and self.mode == "demo":
                 skip = self._real_block()
-                if not skip and self._day_count() >= MAX_TRADES_DAY:
+                if not skip and MAX_TRADES_DAY and self._day_count() >= MAX_TRADES_DAY:
                     skip = f"лимит {MAX_TRADES_DAY} входов за сутки UTC"
                 if not skip:
                     result = self._execute(b, plan, market)
@@ -527,7 +548,7 @@ class Executor:
     def _execute(self, b, plan, market) -> str:
         sym, side, mid, acc = b["symbol"], b["side"], str(market["id"]), self.account_id
         pos_now = self._positions()
-        if len(pos_now) >= MAX_OPEN:
+        if MAX_OPEN and len(pos_now) >= MAX_OPEN:
             return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
         if any(_pos_market(p) == mid for p in pos_now):
             return "пропуск: по монете уже есть позиция"
@@ -551,12 +572,15 @@ class Executor:
             return "ордер отправлен, но позицию не нашёл (проверь терминал)"
         size = _pos_size(pos)
         size_base = Decimal(size) / FP
-        if pos.get("notional"):
-            notional = from_fp9(pos["notional"])                 # notional из самой позиции
-        else:
+        notional = abs(from_fp9(pos["notional"])) if pos.get("notional") else Decimal(0)
+        if notional <= 0:                                        # нет поля или мусор
             notional = size_base * Decimal(str(b["price"]))
-        fill = notional / size_base if size_base else Decimal(str(b["price"]))    # цена входа = notional / размер
         sig_px = Decimal(str(b["price"]))
+        fill = notional / size_base if size_base else sig_px      # цена входа = notional / размер
+        if not (sig_px / 2 < fill < sig_px * 2):                  # v1.8: страховка от битых данных
+            self.send(f"⚠️ {sym}: цена входа из API ({fill:.6g}) не похожа на цену сигнала "
+                      f"({sig_px:.6g}) — считаю по сигналу. Проверь позицию в терминале.")
+            fill = sig_px
         slip = (fill - sig_px) / sig_px * 100 * (1 if side == "long" else -1)      # + = вход хуже сигнала
         # v1.7: риск считаем от ФАКТИЧЕСКОГО входа до ФАКТИЧЕСКОГО стопа.
         # Раньше брали плановый stop_pct — при проскальзывании 0.21% и стопе 0.5%
