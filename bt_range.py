@@ -94,6 +94,7 @@ def run():
     follow = max(4, int(B.FOLLOW_HOURS * 60 / B.TF_MIN))
 
     only_old = only_new = both = 0
+    base_out, base_rng = [], []
     added = []          # заряды, которые добавил новый потолок
     caps_seen = []
     checked = 0
@@ -128,6 +129,8 @@ def run():
             caps_seen.append(caps["new_cap"])
             if ok_old and ok_new:
                 both += 1
+                base_out.append(_outcome(closed[end:end + follow], caps["hi"], caps["lo"]))
+                base_rng.append(caps["rng_pct"])
             elif ok_old:
                 only_old += 1
             elif ok_new:
@@ -162,14 +165,32 @@ def run():
     if caps_seen:
         lines.append(f"Медианный новый потолок: {statistics.median(caps_seen):.1f}% "
                      f"(старый всегда {OLD_FIXED_CAP}%)")
+    def _brk(outs):
+        n = len(outs)
+        return (sum(1 for o in outs if o in ("вверх", "вниз")) / n * 100) if n else 0.0
+
     if n_add:
         lines.append("")
-        lines.append("<b>Что стало с добавленными зарядами:</b>")
+        lines.append("<b>Главное — сравнение качества:</b>")
+        lines.append(f"  базовые заряды ({len(base_out)}): вышли из коридора "
+                     f"<b>{_brk(base_out):.0f}%</b>")
+        lines.append(f"  добавленные ({n_add}): вышли из коридора "
+                     f"<b>{_brk([a['out'] for a in added]):.0f}%</b>")
+        diff = _brk([a["out"] for a in added]) - _brk(base_out)
+        lines.append(f"  разница: <b>{diff:+.0f} п.п.</b> — "
+                     + ("добавленные не хуже базовых, потолок можно оставить"
+                        if diff > -8 else "добавленные заметно хуже, стоит снизить ACC_RANGE_ABS"))
+        lines.append("")
+        lines.append("<b>Добавленные по ширине коридора:</b>")
+        for lo_b, hi_b in ((0, 6), (6, 7), (7, 8), (8, 99)):
+            grp = [a for a in added if lo_b <= a["rng"] < hi_b]
+            if grp:
+                lines.append(f"  {lo_b}–{hi_b if hi_b<99 else '∞'}%: {len(grp)} шт, "
+                             f"вышли {_brk([g['out'] for g in grp]):.0f}%")
+        lines.append("")
+        lines.append("<b>Исходы добавленных:</b>")
         for k, v in sorted(out_stats.items(), key=lambda x: -x[1]):
             lines.append(f"  {k}: {v} ({v/n_add*100:.0f}%)")
-        wide = [a for a in added if a["rng"] > 7]
-        lines.append(f"Из них с размахом >7%: {len(wide)} — если их много, "
-                     f"стоит снизить ACC_MAX_RANGE_ABS")
         lines.append("")
         lines.append("Примеры:")
         for a in added[:8]:
