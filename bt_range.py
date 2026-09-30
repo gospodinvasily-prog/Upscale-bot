@@ -105,6 +105,32 @@ def _outcome(future, hi, lo):
     return "осталась внутри"
 
 
+def _followthrough(future, hi, lo, back_bars=4):
+    """Что было ПОСЛЕ выхода — главное для денег.
+    Возвращает: ход в свою сторону (%), откат против (%), был ли ложный выход
+    (цена вернулась внутрь коридора за back_bars свечей — снятие ликвидности)."""
+    if not future:
+        return None
+    for i, c in enumerate(future):
+        up = c["h"] > hi
+        dn = c["l"] < lo
+        if not (up or dn):
+            continue
+        lvl = hi if up else lo
+        after = future[i:i + back_bars + 1]
+        rest = future[i:]
+        if up:
+            go = (max(x["h"] for x in rest) - lvl) / lvl * 100
+            adv = (lvl - min(x["l"] for x in rest)) / lvl * 100
+            false_br = any(x["c"] < lo for x in after)
+        else:
+            go = (lvl - min(x["l"] for x in rest)) / lvl * 100
+            adv = (max(x["h"] for x in rest) - lvl) / lvl * 100
+            false_br = any(x["c"] > hi for x in after)
+        return {"go": go, "adv": adv, "false": false_br}
+    return None
+
+
 def run():
     pairs = B.UPSCALE_PAIRS[:BT_PAIRS] if BT_PAIRS else B.UPSCALE_PAIRS
     W = B.ACC_WINDOW
@@ -113,7 +139,7 @@ def run():
     follow = max(4, int(B.FOLLOW_HOURS * 60 / B.TF_MIN))
 
     only_old = only_new = both = 0
-    base_out, base_rng = [], []
+    base_out, base_rng, base_ft = [], [], []
     added = []          # заряды, которые добавил новый потолок
     caps_seen = []
     checked = 0
@@ -148,8 +174,12 @@ def run():
             caps_seen.append(caps["new_cap"])
             if ok_old and ok_new:
                 both += 1
-                base_out.append(_outcome(closed[end:end + follow], caps["hi"], caps["lo"]))
+                fut = closed[end:end + follow]
+                base_out.append(_outcome(fut, caps["hi"], caps["lo"]))
                 base_rng.append((caps["rng_pct"], caps["atr_pct"]))
+                ft = _followthrough(fut, caps["hi"], caps["lo"])
+                if ft:
+                    base_ft.append(ft)
             elif ok_old:
                 only_old += 1
             elif ok_new:
@@ -159,6 +189,7 @@ def run():
                     "atr_pct": caps["atr_pct"],
                     "out": _outcome(closed[end:end + follow], caps["hi"], caps["lo"]),
                     "atr": caps["atr_pct"],
+                    "ft": _followthrough(closed[end:end + follow], caps["hi"], caps["lo"]),
                 })
         if i % 10 == 0:
             print(f"[BT] {i}/{len(pairs)} пар, окон проверено {checked}, "
@@ -223,6 +254,27 @@ def run():
                 g_act, g_exp = _norm(grp)
                 lines.append(f"  {lo_b}–{hi_b if hi_b<99 else '∞'}%: {len(grp)} шт, "
                              f"{g_act:.0f}% / {g_exp:.0f}% → {g_act - g_exp:+.0f} п.п.")
+        add_ft = [a["ft"] for a in added if a.get("ft")]
+        if base_ft and add_ft:
+            def _ft(g):
+                n = len(g)
+                return (statistics.median(x["go"] for x in g),
+                        statistics.median(x["adv"] for x in g),
+                        sum(1 for x in g if x["false"]) / n * 100)
+            bg, ba, bf = _ft(base_ft)
+            ag, aa, af = _ft(add_ft)
+            lines.append("")
+            lines.append("<b>Что было ПОСЛЕ выхода (это и есть деньги):</b>")
+            lines.append(f"  базовые ({len(base_ft)}): ход {bg:.1f}%, откат против {ba:.1f}%, "
+                         f"ложных выходов <b>{bf:.0f}%</b>")
+            lines.append(f"  добавленные ({len(add_ft)}): ход {ag:.1f}%, откат против {aa:.1f}%, "
+                         f"ложных выходов <b>{af:.0f}%</b>")
+            lines.append(f"  → ложных выходов {af - bf:+.0f} п.п., ход {ag - bg:+.1f} п.п.")
+            verdict = ("добавленные торгуются не хуже — оставляем"
+                       if (af - bf) < 8 and (ag - bg) > -0.5
+                       else "добавленные дают больше ложных выходов — снизить ACC_RANGE_ABS")
+            lines.append(f"  <b>{verdict}</b>")
+
         lines.append("")
         lines.append("<b>Исходы добавленных:</b>")
         for k, v in sorted(out_stats.items(), key=lambda x: -x[1]):
