@@ -111,45 +111,63 @@ def _find_charge(upto, price, vol_base, atr_norm):
             "oi_win": None, "oi_15m": None, "P": B.ALT_P}
 
 
-def _simulate(future, side, entry, stop, tp1, tp2, fee_pct):
-    """Прогон сделки по свечам. Возвращает результат в R (единицах риска) после комиссии.
-    Половина позиции закрывается на TP1, остаток — на TP2 или по стопу.
-    После TP1 стоп переносится в безубыток (как делает живой бот)."""
+def _simulate(future, side, entry, stop, tp1, tp2, fee_pct, optimistic=False, amb=None):
+    """Прогон сделки по свечам. Возвращает результат в R после комиссии.
+    Половина на TP1, затем стоп в безубыток, остаток на TP2.
+
+    optimistic: что считать, если в ОДНОЙ свече задеты и стоп, и цель.
+      False — стоп (пессимизм), True — цель (оптимизм). Порядок внутри часовой
+      свечи неизвестен, поэтому честный ответ — вилка между двумя прогонами.
+      Это принципиально: TP1 (0.5R) ближе к входу, чем стоп (1R), и такие свечи
+      частые — значит выбор допущения двигает итог сильно.
+    amb: список для подсчёта, в скольких сделках исход решила спорная свеча."""
     risk = abs(entry - stop)
     if risk <= 0:
         return None
     is_long = side == "long"
     half_done = False
     cur_stop = stop
-    realized = 0.0          # в R, по закрытой половине
+    realized = 0.0
 
     for c in future:
         hit_stop = (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop)
         tgt = tp1 if not half_done else tp2
         hit_tp = (c["h"] >= tgt) if is_long else (c["l"] <= tgt)
 
-        # пессимистично: если в свече задеты оба — считаем стоп
+        if hit_stop and hit_tp:
+            if amb is not None:
+                amb.append(1)
+            if not optimistic:
+                part = 0.5 if half_done else 1.0
+                r = (cur_stop - entry) / risk if is_long else (entry - cur_stop) / risk
+                return realized + r * part - fee_pct / 100 * entry / risk
+            # оптимистично: сначала цель
+            if not half_done:
+                realized += 0.5 * (abs(tp1 - entry) / risk)
+                half_done = True
+                cur_stop = entry
+                continue
+            realized += 0.5 * (abs(tp2 - entry) / risk)
+            return realized - fee_pct / 100 * entry / risk
+
         if hit_stop:
             part = 0.5 if half_done else 1.0
             r = (cur_stop - entry) / risk if is_long else (entry - cur_stop) / risk
-            realized += r * part
-            return realized - fee_pct / 100 * entry / risk
+            return realized + r * part - fee_pct / 100 * entry / risk
 
         if hit_tp:
             if not half_done:
                 realized += 0.5 * (abs(tp1 - entry) / risk)
                 half_done = True
-                cur_stop = entry          # безубыток на остаток
+                cur_stop = entry
             else:
                 realized += 0.5 * (abs(tp2 - entry) / risk)
                 return realized - fee_pct / 100 * entry / risk
 
-    # вышли по времени — закрываем по последней цене
     last = future[-1]["c"] if future else entry
     part = 0.5 if half_done else 1.0
     r = (last - entry) / risk if is_long else (entry - last) / risk
-    realized += r * part
-    return realized - fee_pct / 100 * entry / risk
+    return realized + r * part - fee_pct / 100 * entry / risk
 
 
 def _stats(rs, label):
@@ -190,7 +208,8 @@ def run():
     hold = max(4, int(MAX_HOLD_H * 60 / B.TF_MIN))
     watch = max(4, int(B.WATCH_TTL_HOURS * 60 / B.TF_MIN))
 
-    cur_rs, old_rs = [], []
+    cur_rs, old_rs, opt_rs = [], [], []
+    amb = []
     charges = entries = 0
     n_cross = n_novol = 0
     saved_min = B.ACC_MIN_SCORE
@@ -259,10 +278,14 @@ def run():
                     if not fut:
                         continue
                     r = _simulate(fut, side, entry, bo["stop"], bo["tp1_price"],
-                                  bo["tp2_price"], FEE_PCT)
+                                  bo["tp2_price"], FEE_PCT, False, amb)
                     if r is None:
                         continue
                     cur_rs.append(r)
+                    ro = _simulate(fut, side, entry, bo["stop"], bo["tp1_price"],
+                                   bo["tp2_price"], FEE_PCT, True)
+                    if ro is not None:
+                        opt_rs.append(ro)
                     entries += 1
                     entered_at = k
                     dist = abs(entry - bo["stop"]) / entry * 100
@@ -296,7 +319,27 @@ def run():
         "",
         "<b>Результат в R (1R = риск на сделку, у тебя $20):</b>",
     ]
-    lines += _stats(cur_rs, "текущие цели (TP1 0.5R, TP2 1R)")
+    if cur_rs:
+        lines.append(f"Исход решила спорная свеча (задеты и стоп, и цель): "
+                     f"<b>{len(amb)/len(cur_rs)*100:.0f}%</b> сделок — "
+                     f"в них порядок событий внутри часа неизвестен")
+        lines.append("")
+    lines += _stats(cur_rs, "ПЕССИМИСТИЧНО: в спорной свече сначала стоп")
+    lines.append("")
+    lines += _stats(opt_rs, "ОПТИМИСТИЧНО: в спорной свече сначала цель")
+    if cur_rs and opt_rs:
+        p, o = sum(cur_rs)/len(cur_rs), sum(opt_rs)/len(opt_rs)
+        lines.append("")
+        if p > 0:
+            v = "<b>ПЛЮС при любом допущении</b> — стратегия рабочая"
+        elif o < 0:
+            v = "<b>МИНУС при любом допущении</b> — стратегия в текущем виде не работает"
+        else:
+            v = ("<b>вилка накрывает ноль</b> — часовых свечей НЕ ХВАТАЕТ для ответа, "
+                 "нужен прогон по 15м/5м свечам")
+        lines.append(f"Истина между {p:+.3f}R и {o:+.3f}R → {v}")
+    lines.append("")
+    lines += _stats(cur_rs, "(для сравнения тейков) текущие цели, пессимистично")
     lines.append("")
     lines += _stats(old_rs, "старые цели v8.3 (TP1 1R, TP2 2R)")
     if cur_rs and old_rs:
