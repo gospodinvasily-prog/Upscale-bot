@@ -27,6 +27,7 @@ import bot as B
 BT_DAYS   = int(os.environ.get("BT_DAYS", "30"))
 BT_PAIRS  = int(os.environ.get("BT_PAIRS", "0"))      # 0 = все пары из UPSCALE_PAIRS
 BT_STEP   = int(os.environ.get("BT_STEP", "4"))       # шаг проверки окон, в свечах
+OLD_FIXED_CAP = 5.0                                   # жёсткий потолок v8.3, с которым сравниваем
 
 
 def _fetch(sym: str, need: int):
@@ -48,9 +49,9 @@ def _range_caps(win, atr_norm, price, W):
     rng_pct = (hi - lo) / lo * 100
     atr_pct = atr_norm / price * 100
     exp_range = B.ACC_RANGE_ATR_K * atr_pct * (W ** 0.5)
-    new_cap = min(B.ACC_MAX_RANGE_ABS, max(B.ACC_MAX_RANGE_PCT, exp_range))
+    new_cap = min(B.ACC_MAX_RANGE_ABS, max(B.ACC_RANGE_FLOOR_PCT, exp_range))
     return {"hi": hi, "lo": lo, "rng_pct": rng_pct, "atr_pct": atr_pct,
-            "old_cap": B.ACC_MAX_RANGE_PCT, "new_cap": new_cap}
+            "old_cap": OLD_FIXED_CAP, "new_cap": new_cap}
 
 
 def _passes_core(win, closed_upto, atr_norm, baseline, W):
@@ -151,15 +152,16 @@ def run():
         f"Окон проверено: {checked}, время {took/60:.1f} мин",
         "",
         f"Проходят оба варианта: <b>{both}</b>",
-        f"Только старый (жёсткие 5%): <b>{only_old}</b>",
+        f"Только старый (жёсткие {OLD_FIXED_CAP}%): <b>{only_old}</b>  ← их новый потолок отсекает",
         f"Только новый (адаптивный): <b>{n_add}</b>",
     ]
-    if both + only_old > 0:
-        gain = n_add / (both + only_old) * 100
-        lines.append(f"Прирост зарядов: <b>+{gain:.0f}%</b>")
+    old_total, new_total = both + only_old, both + n_add
+    if old_total > 0:
+        lines.append(f"Итого зарядов: старый потолок {old_total} → новый {new_total} "
+                     f"(<b>{(new_total/old_total-1)*100:+.0f}%</b>)")
     if caps_seen:
         lines.append(f"Медианный новый потолок: {statistics.median(caps_seen):.1f}% "
-                     f"(старый всегда {B.ACC_MAX_RANGE_PCT}%)")
+                     f"(старый всегда {OLD_FIXED_CAP}%)")
     if n_add:
         lines.append("")
         lines.append("<b>Что стало с добавленными зарядами:</b>")
