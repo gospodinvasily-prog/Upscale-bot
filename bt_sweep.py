@@ -45,6 +45,11 @@ TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 VWAP_GRID  = [2.0, 2.5, 3.0, 3.5, None]          # None = фильтр выключен
 RVOL_GRID  = [1.0, 1.5, 2.0, 2.5]
 TSTOP_GRID = [0.5, 0.75, 1.0, 1.25]
+# Пункт 8: порог силы ПРОБОЯ. В бэктесте сила СИСТЕМАТИЧЕСКИ НИЖЕ живой — дельта
+# агрессора и фандинг за историю недоступны, это минус 2-3 очка. Поэтому сетка
+# сдвинута вниз; смотри, какой вариант лучше ОТНОСИТЕЛЬНО остальных, а живой порог
+# потом ставь примерно на 2-3 выше выбранного.
+BSCORE_GRID = [0, 1, 2, 3, 4]
 CHARGE_TFS = ["1h", "15m"]
 
 
@@ -122,7 +127,8 @@ def run():
     bars_day = int(24 * 3600 / step)
 
     # результаты: [charge_tf][ключ варианта] -> список R
-    brk = {tf: {"vwap": {v: [] for v in VWAP_GRID}, "rvol": {v: [] for v in RVOL_GRID}} for tf in CHARGE_TFS}
+    brk = {tf: {"vwap": {v: [] for v in VWAP_GRID}, "rvol": {v: [] for v in RVOL_GRID},
+                "bscore": {v: [] for v in BSCORE_GRID}} for tf in CHARGE_TFS}
     tlt = {tf: {"stop": {v: [] for v in TSTOP_GRID}} for tf in CHARGE_TFS}
     n_ch = {tf: 0 for tf in CHARGE_TFS}
     days = 0.0
@@ -239,11 +245,25 @@ def run():
                             continue
                         rv = bar["v"] / vol_fine
                         va = _vwap_atr(fine, k, bars_day)
+                        # пункт 8: сила пробоя. Бот считает её ПОСЛЕ отправки, только
+                        # для сообщения — фильтра по ней нет. В журнале были сигналы
+                        # с силой -3 и 1, и ни один не отработал.
+                        bo["pace"] = rv
+                        bo.setdefault("delta", None)
+                        bo.setdefault("ext_atr", 0.0)
+                        try:
+                            bscore = B.analyze_breakout(bo)[0]
+                        except Exception:
+                            bscore = None
                         for thr in VWAP_GRID:              # пункт 4: изолируем VWAP,
                             # фильтр объёма здесь НЕ применяем — иначе варианты
                             # окажутся пустыми и сравнивать будет нечего
                             if thr is None or (va is not None and va <= thr):
                                 brk[ctf]["vwap"][thr].append(r)
+                        if bscore is not None:             # пункт 8
+                            for bthr in BSCORE_GRID:
+                                if bscore >= bthr and (va is None or va <= B.VWAP_MAX_ATR):
+                                    brk[ctf]["bscore"][bthr].append(r)
                         for rthr in RVOL_GRID:             # пункт 5
                             if rv >= rthr and (va is None or va <= B.VWAP_MAX_ATR):
                                 brk[ctf]["rvol"][rthr].append(r)
@@ -274,6 +294,11 @@ def run():
               f"а на {FINE_TF} редок — сравнивай варианты между собой, а не с порогом бота</i>"]
         for v in RVOL_GRID:
             L.append(_stat_line(brk[ctf]["rvol"][v], f"объём ≥{v}×" + (" (выкл)" if v <= 1.0 else "")))
+        L += ["", "<b>8) Порог силы ПРОБОЯ (сейчас в боте фильтра НЕТ):</b>",
+              "  <i>в бэктесте сила ниже живой на 2-3 (нет дельты и фандинга) — "
+              "живой порог ставить выше выбранного здесь</i>"]
+        for v in BSCORE_GRID:
+            L.append(_stat_line(brk[ctf]["bscore"][v], f"сила ≥{v}" + (" (как сейчас — фильтра нет)" if v == 0 else "")))
         L += ["", "<b>6) Стоп УКЛОНА:</b>"]
         for v in TSTOP_GRID:
             L.append(_stat_line(tlt[ctf]["stop"][v], f"стоп {v}%"))
