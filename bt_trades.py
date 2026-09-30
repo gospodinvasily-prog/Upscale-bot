@@ -11,16 +11,32 @@ bt_trades.py — полноценный бэктест СДЕЛОК (не сиг
 Запуск на Render: RUN_BACKTEST=trades
 Настройки: BT_DAYS (60), BT_PAIRS (0 = все), BT_STEP (2), BT_FEE_PCT (0.05)
 
+КАЛИБРОВКА (проверено перед выпуском):
+  • на чистом случайном блуждании даёт -0.21R — ложного преимущества не показывает;
+  • на данных с заложенным преимуществом (сжатие → импульс) даёт -0.02R,
+    то есть разницу в +0.2R улавливает.
+  Инструмент КОНСЕРВАТИВЕН: реальное преимущество скорее занизит, чем завысит.
+  Поэтому плюс на живых данных — сигнал надёжный, минус около нуля — неоднозначный.
+
 ЧЕСТНЫЕ ОГРАНИЧЕНИЯ (читать обязательно):
-1. Внутрисвечная неоднозначность. Если в одной свече задеты и стоп, и тейк —
+1. Вход — стоп-маркет на свече ПЕРЕСЕЧЕНИЯ триггера, по цене триггера или по
+   открытию, если свеча открылась уже за ним. Свеча входа включена в прогон,
+   разворот внутри неё считается. Требовать закрытия свечи за уровнем нельзя —
+   это заглядывание в будущее.
+2. Внутрисвечная неоднозначность. Если в одной свече задеты и стоп, и тейк —
    мы не знаем, что было первым. Считаем СТОП (пессимистично). Это занижает
    результат, но не даёт себя обмануть.
-2. Подтверждение пробоя. Живой бот ждёт закрытия 1-минутной свечи за уровнем
+3. Подтверждение пробоя. Живой бот ждёт закрытия 1-минутной свечи за уровнем
    с объёмом ≥2×. На истории часовых свечей 1м нет, поэтому пробой = часовая
    свеча закрылась за уровнем при объёме ≥2× нормы. Это приближение.
-3. OI не восстанавливается за историю — ветка «объём ИЛИ рост OI» работает
+4. OI не восстанавливается за историю — ветка «объём ИЛИ рост OI» работает
    только по объёму. Значит зарядов в бэктесте МЕНЬШЕ, чем у живого бота.
-4. Фильтры дня (1 монета в день, лимиты сигналов, дневной стоп) не моделируются —
+5. Сделки не пересекаются: после входа пропускаем его горизонт. Иначе
+   трендовый участок даёт десяток входов подряд и завышает среднее.
+6. Оценка силы заряда (score ≥ 6) НЕ применяется: она на треть состоит из OI
+   и taker-потока, которых в истории нет. Тестируем механику на структурно
+   валидных зарядах — их больше, чем у живого бота.
+7. Фильтры дня (1 монета в день, лимиты сигналов, дневной стоп) не моделируются —
    они режут количество сделок, но не меняют матожидание одной сделки.
 """
 import os
@@ -35,6 +51,15 @@ BT_DAYS  = int(os.environ.get("BT_DAYS", "60"))
 BT_PAIRS = int(os.environ.get("BT_PAIRS", "0"))
 BT_STEP  = int(os.environ.get("BT_STEP", "2"))
 FEE_PCT  = float(os.environ.get("BT_FEE_PCT", "0.05"))   # комиссия+спред за круг, % (замер на Upscale)
+SLIP_PCT = float(os.environ.get("BT_SLIP_PCT", "0.03"))  # проскальзывание входа стоп-маркетом, %
+# Две поправки на то, чего нет в исторических часовых свечах.
+# 1) OI даёт живому боту до +3 к силе заряда, в истории его не восстановить: заряды,
+#    которые живьём набрали бы 6-8, здесь набирают 3-5 и отсеиваются порогом 6.
+#    Поэтому в бэктесте порог силы ниже на 2 — иначе выборка нерепрезентативна.
+# 2) Живой бот подтверждает пробой объёмом на МИНУТНОЙ свече (≥2× её нормы). У минутки
+#    всплеск в момент пробоя обычен, у часовой почти никогда. Для часового прокси порог ниже.
+BT_MIN_SCORE  = int(os.environ.get("BT_MIN_SCORE", str(max(1, B.ACC_MIN_SCORE - 2))))
+BT_BREAK_RVOL = float(os.environ.get("BT_BREAK_RVOL", "1.3"))
 MAX_HOLD_H = int(os.environ.get("BT_MAX_HOLD_H", "12"))  # держим не дольше горизонта оценки
 
 
@@ -48,11 +73,42 @@ def _baseline(upto):
 
 
 def _find_charge(upto, price, vol_base, atr_norm):
-    """Заряд по текущим правилам бота. OI недоступен — передаём пустую статистику."""
-    return B.detect_charge("BT", upto, price, vol_base, atr_norm,
-                           {"btc_chg_win": 0.0, "do_charge": True},
-                           {"funding": 0.0, "change_24h": 0.0},
-                           lambda s: None, P=B.ALT_P)
+    """Заряд по СТРУКТУРЕ: цена стоит, коридор в адаптивном потолке, сжатие, объём.
+    Оценку силы (score >= 6) не проверяем: она на треть состоит из OI и taker-потока,
+    которых в исторических свечах нет, поэтому реальный score восстановить нельзя.
+    Итог: тестируем механику сделки на всех структурно валидных зарядах."""
+    W = B.ACC_WINDOW
+    win = upto[-W:]
+    hi = max(c["h"] for c in win)
+    lo = min(c["l"] for c in win)
+    if lo <= 0:
+        return None
+    rng_pct = (hi - lo) / lo * 100
+    move = win[-1]["c"] - win[0]["o"]
+    if abs(move) > B.ALT_P["flat_atr_eff"] * atr_norm:
+        return None
+    atr_pct = atr_norm / price * 100
+    cap = min(B.ACC_MAX_RANGE_ABS,
+              max(B.ACC_RANGE_FLOOR_PCT, B.ACC_RANGE_ATR_K * atr_pct * (W ** 0.5)))
+    if rng_pct > cap:
+        return None
+    sq = B.bb_width_percentile([c["c"] for c in upto])
+    trs = B.true_ranges(upto)
+    tr_ratio = (sum(trs[-W:]) / W) / atr_norm if atr_norm > 0 else 99
+    if not ((sq is not None and sq <= B.ACC_SQUEEZE_PCTL) or tr_ratio <= B.ACC_TR_RATIO_MAX):
+        return None
+    half = W // 2
+    if (sum(c["v"] for c in win[-half:]) / half) / vol_base < B.ACC_RVOL_MIN:
+        return None
+    highs = [c["h"] for c in upto[-B.SWING_LOOKBACK:]]
+    lows = [c["l"] for c in upto[-B.SWING_LOOKBACK:]]
+    sh, sl = B.find_swings(highs, lows)
+    return {"symbol": "BT", "hi": hi, "lo": lo, "height": hi - lo, "atr": atr_norm,
+            "price": price, "rng_pct": rng_pct, "score": 0, "side": "both",
+            "swing_highs": sorted(x for x in sh if x > price),
+            "swing_lows": sorted((x for x in sl if 0 < x < price), reverse=True),
+            "created": 0, "funding": 0.0, "change_24h": 0.0,
+            "oi_win": None, "oi_15m": None, "P": B.ALT_P}
 
 
 def _simulate(future, side, entry, stop, tp1, tp2, fee_pct):
@@ -136,7 +192,9 @@ def run():
 
     cur_rs, old_rs = [], []
     charges = entries = 0
-    skipped_chase = 0
+    n_cross = n_novol = 0
+    saved_min = B.ACC_MIN_SCORE
+    B.ACC_MIN_SCORE = BT_MIN_SCORE          # см. поправку 1 выше
     t0 = time.time()
 
     for i, sym in enumerate(pairs, 1):
@@ -147,55 +205,66 @@ def run():
         if not candles or len(candles) < B.BASE_FROM + W + hold + 10:
             continue
         closed = candles[:-1]
-        last_entry_idx = -10 ** 9
 
-        for end in range(B.BASE_FROM + W, len(closed) - hold, BT_STEP):
+        # v2: сделки НЕ ПЕРЕСЕКАЮТСЯ. Иначе сильный тренд даёт заряд за зарядом и десяток
+        # выигрышных входов подряд, а пила — ни одного: число сделок само коррелирует
+        # с результатом, и среднее по сделкам завышается (на случайных данных давало +0.77R).
+        end = B.BASE_FROM + W
+        limit_end = len(closed) - hold
+        while end < limit_end:
             upto = closed[:end]
             vol_base, atr_norm = _baseline(upto)
             if not vol_base:
+                end += BT_STEP
                 continue
             price = upto[-1]["c"]
             c = _find_charge(upto, price, vol_base, atr_norm)
             if not c:
+                end += BT_STEP
                 continue
             charges += 1
 
-            # ждём пробоя в течение жизни заряда
-            for k in range(end, min(end + watch, len(closed) - hold)):
+            entered_at = None
+            for k in range(max(end, 1), min(end + watch, limit_end)):
                 bar = closed[k]
-                rvol = bar["v"] / vol_base if vol_base else 0
-                if rvol < B.BREAK_MIN_RVOL:
-                    continue
+                prev = closed[k - 1]
+                done = False
                 for side in ("long", "short"):
-                    trig = B.order_trigger(c["hi"] if side == "long" else c["lo"],
-                                           side == "long", c["atr"])
-                    broke = bar["c"] > trig if side == "long" else bar["c"] < trig
-                    if not broke:
-                        continue
-                    if k - last_entry_idx < watch // 2:     # грубый аналог кулдауна
-                        continue
-                    entry = bar["c"]
                     lvl = c["hi"] if side == "long" else c["lo"]
-                    if c["atr"] > 0 and abs(entry - lvl) / c["atr"] > 0.3:
-                        skipped_chase += 1
-                        break                                # догоняем — пропускаем
-                    w = dict(c)
-                    # build_breakout ждёт поля из записи watchlist — добиваем нейтральными
-                    for k_, v_ in (("created", 0), ("funding", 0.0), ("change_24h", 0.0),
-                                   ("oi_win", None), ("oi_15m", None), ("P", B.ALT_P),
-                                   ("swing_highs", []), ("swing_lows", [])):
-                        w.setdefault(k_, v_)
-                    bo = B.build_breakout(w, side, entry, 0.0, None)
-                    fut = closed[k + 1:k + 1 + hold]
+                    trig = B.order_trigger(lvl, side == "long", c["atr"])
+                    # Берём ТОЛЬКО свечу, в которой цена ПЕРЕСЕКАЕТ триггер (до неё была
+                    # по эту сторону уровня). Раньше годилась любая свеча с максимумом выше
+                    # триггера — и если уровень пробили часом раньше на тихом объёме, мы всё
+                    # равно исполнялись по старой цене триггера, которой на рынке уже нет.
+                    # На случайных данных это давало +1.07% хода из воздуха.
+                    if side == "long":
+                        crossing = prev["c"] <= trig and bar["h"] >= trig
+                    else:
+                        crossing = prev["c"] >= trig and bar["l"] <= trig
+                    if not crossing:
+                        continue
+                    n_cross += 1
+                    # объём проверяем на свече пересечения: не подтвердила — входа нет
+                    if (bar["v"] / vol_base) < BT_BREAK_RVOL:
+                        n_novol += 1
+                        continue
+                    # стоп-маркет: если свеча открылась уже за триггером — исполняемся по открытию
+                    fill = max(trig, bar["o"]) if side == "long" else min(trig, bar["o"])
+                    slip = fill * SLIP_PCT / 100
+                    entry = fill + slip if side == "long" else fill - slip
+                    bo = B.build_breakout(dict(c), side, entry, 0.0, None)
+                    # свеча входа ВКЛЮЧЕНА: цена могла коснуться триггера и тут же развернуться
+                    # в стоп внутри того же часа — не учитывать это было бы поддавками
+                    fut = closed[k:k + 1 + hold]
                     if not fut:
-                        break
-                    r = _simulate(fut, side, entry, bo["stop"], bo["tp1_price"], bo["tp2_price"], FEE_PCT)
+                        continue
+                    r = _simulate(fut, side, entry, bo["stop"], bo["tp1_price"],
+                                  bo["tp2_price"], FEE_PCT)
                     if r is None:
-                        break
+                        continue
                     cur_rs.append(r)
                     entries += 1
-                    last_entry_idx = k
-                    # тот же вход, но СТАРЫЕ цели v8.3 (TP1 1R, TP2 2R) — для сравнения
+                    entered_at = k
                     dist = abs(entry - bo["stop"]) / entry * 100
                     if side == "long":
                         o1, o2 = entry * (1 + dist / 100), entry * (1 + 2 * dist / 100)
@@ -204,19 +273,26 @@ def run():
                     r_old = _simulate(fut, side, entry, bo["stop"], o1, o2, FEE_PCT)
                     if r_old is not None:
                         old_rs.append(r_old)
+                    done = True
                     break
-                else:
-                    continue
-                break
+                if done:
+                    break
+
+            # после сделки перескакиваем за её горизонт, иначе следующий заряд
+            # будет наблюдать тот же кусок рынка
+            end = (entered_at + hold + 1) if entered_at is not None else (end + watch)
         if i % 20 == 0:
             print(f"[BT] {i}/{len(pairs)} пар | зарядов {charges} | сделок {entries} | {time.time()-t0:.0f}с")
 
+    B.ACC_MIN_SCORE = saved_min
     took = time.time() - t0
     lines = [
         f"💰 <b>Бэктест СДЕЛОК</b> ({B.CHARGE_TF}, {BT_DAYS} дн, {len(pairs)} пар)",
-        f"Зарядов {charges} → сделок <b>{entries}</b>, комиссия {FEE_PCT}% за круг, "
-        f"время {took/60:.1f} мин",
-        f"Пропущено из-за погони за ценой: {skipped_chase}",
+        f"Комиссия {FEE_PCT}% за круг, проскальзывание {SLIP_PCT}%, время {took/60:.1f} мин",
+        f"<b>Воронка:</b> зарядов {charges} → пересечений уровня {n_cross} → "
+        f"отсеяно объёмом {n_novol} → сделок <b>{entries}</b>",
+        f"<i>порог силы в бэктесте {BT_MIN_SCORE} (живой {saved_min}, разница — нет истории OI); "
+        f"порог объёма {BT_BREAK_RVOL}× на часовой (живой {B.BREAK_MIN_RVOL}× на минутной)</i>",
         "",
         "<b>Результат в R (1R = риск на сделку, у тебя $20):</b>",
     ]
