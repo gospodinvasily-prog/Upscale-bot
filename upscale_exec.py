@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "1.6"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "1.7"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -555,18 +555,37 @@ class Executor:
             notional = from_fp9(pos["notional"])                 # notional из самой позиции
         else:
             notional = size_base * Decimal(str(b["price"]))
-        real_risk = notional * Decimal(str(b["stop_pct"])) / 100
         fill = notional / size_base if size_base else Decimal(str(b["price"]))    # цена входа = notional / размер
         sig_px = Decimal(str(b["price"]))
         slip = (fill - sig_px) / sig_px * 100 * (1 if side == "long" else -1)      # + = вход хуже сигнала
+        # v1.7: риск считаем от ФАКТИЧЕСКОГО входа до ФАКТИЧЕСКОГО стопа.
+        # Раньше брали плановый stop_pct — при проскальзывании 0.21% и стопе 0.5%
+        # реальная дистанция до стопа 0.71%, и риск занижался почти в полтора раза
+        # (а заниженная цифра шла ещё и в защиту от просадки).
+        stop_px = Decimal(str(b["stop"]))
+        risk_px = abs(fill - stop_px)
+        real_stop_pct = risk_px / fill * 100
+        real_risk = notional * real_stop_pct / 100
+        # Цели НЕ двигаем: они структурные, а не кратные риску. В УКЛОНЕ TP2 стоит
+        # чуть перед границей коридора, в ПРОБОЕ цели берутся из свингов и высоты
+        # диапазона. Пересчёт «чтобы сохранить RR» вынес бы их за структуру —
+        # в живой сделке SAND TP2 уехал бы выше самой границы.
+        # Проскальзывание честно ухудшает RR, и это надо ПОКАЗАТЬ, а не замаскировать.
+        rr1_real = abs(Decimal(str(b["tp1_price"])) - fill) / (risk_px or Decimal(1))
         info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size,
                 "tp1": b["tp1_price"], "tp2": b["tp2_price"], "sym": sym, "entry": fill}
         self._open_risk[info["id"]] = real_risk
         threading.Timer(TP_DELAY_SEC, self._place_tps, args=(info,)).start()
         self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
                   f"вход {fill:.6g} (проскальзывание {slip:+.2f}% к сигналу), "
-                  f"риск по стопу ≈ ${real_risk:.1f} (план ${plan['real_risk_usd']:.1f}). "
-                  f"Стоп {b['stop']:.6g} выставлен со входом. TP поставлю через {TP_DELAY_SEC}с.")
+                  f"риск по стопу ≈ ${real_risk:.1f} (план ${plan['real_risk_usd']:.1f}, "
+                  f"стоп {real_stop_pct:.2f}% от входа). "
+                  f"Стоп {b['stop']:.6g} со входом. TP {b['tp1_price']:.6g} / {b['tp2_price']:.6g} "
+                  f"(реальное RR к TP1 = 1:{float(rr1_real):.1f}) через {TP_DELAY_SEC}с.")
+        if rr1_real < Decimal("1"):
+            self.send(f"⚠️ {sym}: проскальзывание {slip:+.2f}% срезало RR до 1:{float(rr1_real):.1f} — "
+                      f"цель ближе стопа. Цели структурные, двигать их нельзя; "
+                      f"если такое повторяется, увеличивай буфер входа или стоп.")
         if plan["real_risk_usd"] and abs(real_risk - plan["real_risk_usd"]) / plan["real_risk_usd"] > Decimal("0.3"):
             self.send(f"⚠️ {sym}: фактический риск ${real_risk:.1f} сильно отличается от плана "
                       f"${plan['real_risk_usd']:.1f} — проверь, как API трактует amount/плечо.")
