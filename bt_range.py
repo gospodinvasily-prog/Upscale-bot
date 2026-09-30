@@ -74,6 +74,25 @@ def _passes_core(win, closed_upto, atr_norm, baseline, W):
     return baseline > 0 and (vol_half / baseline) >= B.ACC_RVOL_MIN
 
 
+def _expected_breakout(width_pct, atr_pct, bars, n=1500):
+    """Какая доля выходов ОЖИДАЕТСЯ для такой ширины коридора при такой волатильности.
+    Из широкого коридора выйти труднее чисто геометрически, поэтому сравнивать
+    доли выходов у коридоров разной ширины напрямую нельзя."""
+    import random as _r
+    if width_pct <= 0 or atr_pct <= 0:
+        return 0.0
+    hit = 0
+    half = width_pct / 2
+    for _ in range(n):
+        p = 0.0
+        for _ in range(bars):
+            p += _r.gauss(0, atr_pct)
+            if abs(p) > half:
+                hit += 1
+                break
+    return hit / n * 100
+
+
 def _outcome(future, hi, lo):
     """Что было после заряда: вышла ли цена из коридора и куда."""
     if not future:
@@ -130,7 +149,7 @@ def run():
             if ok_old and ok_new:
                 both += 1
                 base_out.append(_outcome(closed[end:end + follow], caps["hi"], caps["lo"]))
-                base_rng.append(caps["rng_pct"])
+                base_rng.append((caps["rng_pct"], caps["atr_pct"]))
             elif ok_old:
                 only_old += 1
             elif ok_new:
@@ -139,6 +158,7 @@ def run():
                     "sym": sym, "rng": caps["rng_pct"], "cap": caps["new_cap"],
                     "atr_pct": caps["atr_pct"],
                     "out": _outcome(closed[end:end + follow], caps["hi"], caps["lo"]),
+                    "atr": caps["atr_pct"],
                 })
         if i % 10 == 0:
             print(f"[BT] {i}/{len(pairs)} пар, окон проверено {checked}, "
@@ -171,22 +191,38 @@ def run():
 
     if n_add:
         lines.append("")
-        lines.append("<b>Главное — сравнение качества:</b>")
-        lines.append(f"  базовые заряды ({len(base_out)}): вышли из коридора "
-                     f"<b>{_brk(base_out):.0f}%</b>")
-        lines.append(f"  добавленные ({n_add}): вышли из коридора "
-                     f"<b>{_brk([a['out'] for a in added]):.0f}%</b>")
-        diff = _brk([a["out"] for a in added]) - _brk(base_out)
-        lines.append(f"  разница: <b>{diff:+.0f} п.п.</b> — "
-                     + ("добавленные не хуже базовых, потолок можно оставить"
-                        if diff > -8 else "добавленные заметно хуже, стоит снизить ACC_RANGE_ABS"))
+        lines.append("<b>Главное — качество с поправкой на ширину коридора:</b>")
+        lines.append("  (из широкого коридора выйти труднее геометрически —")
+        lines.append("   поэтому сравниваем не доли выходов, а факт против ожидания)")
+
+        def _norm(items):
+            """items: [(доля_выхода_факт, ширина, atr)] -> (факт %, ожидание %)"""
+            if not items:
+                return 0.0, 0.0
+            act = sum(1 for o, _, _ in items if o in ("вверх", "вниз")) / len(items) * 100
+            exp = sum(_expected_breakout(w, a, follow) for _, w, a in items) / len(items)
+            return act, exp
+
+        base_items = [(o, w, a) for o, (w, a) in zip(base_out, base_rng)]
+        add_items = [(a["out"], a["rng"], a["atr"]) for a in added]
+        b_act, b_exp = _norm(base_items)
+        a_act, a_exp = _norm(add_items)
+        lines.append(f"  базовые ({len(base_items)}): факт {b_act:.0f}% при ожидании {b_exp:.0f}% "
+                     f"→ <b>{b_act - b_exp:+.0f} п.п.</b>")
+        lines.append(f"  добавленные ({n_add}): факт {a_act:.0f}% при ожидании {a_exp:.0f}% "
+                     f"→ <b>{a_act - a_exp:+.0f} п.п.</b>")
+        delta = (a_act - a_exp) - (b_act - b_exp)
+        lines.append(f"  разница качества: <b>{delta:+.0f} п.п.</b> — "
+                     + ("добавленные не хуже базовых, предел можно оставить"
+                        if delta > -8 else "добавленные действительно слабее, снизить ACC_RANGE_ABS"))
         lines.append("")
-        lines.append("<b>Добавленные по ширине коридора:</b>")
+        lines.append("<b>Добавленные по ширине (факт / ожидание):</b>")
         for lo_b, hi_b in ((0, 6), (6, 7), (7, 8), (8, 99)):
-            grp = [a for a in added if lo_b <= a["rng"] < hi_b]
+            grp = [(a["out"], a["rng"], a["atr"]) for a in added if lo_b <= a["rng"] < hi_b]
             if grp:
+                g_act, g_exp = _norm(grp)
                 lines.append(f"  {lo_b}–{hi_b if hi_b<99 else '∞'}%: {len(grp)} шт, "
-                             f"вышли {_brk([g['out'] for g in grp]):.0f}%")
+                             f"{g_act:.0f}% / {g_exp:.0f}% → {g_act - g_exp:+.0f} п.п.")
         lines.append("")
         lines.append("<b>Исходы добавленных:</b>")
         for k, v in sorted(out_stats.items(), key=lambda x: -x[1]):
