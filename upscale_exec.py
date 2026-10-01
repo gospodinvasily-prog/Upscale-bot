@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "1.8"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "1.9"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -146,6 +146,28 @@ def _as_list(data, _depth=0):
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 return v
     return []
+
+def market_price(m: dict):
+    """Текущая цена рынка по данным Upscale. Бот считает уровни по свечам Gate,
+    а торгует здесь — расхождение площадок выглядело как проскальзывание 0.2-0.8%.
+    Берём цену оттуда, где реально исполняемся."""
+    if not isinstance(m, dict):
+        return None
+    for src in (m.get("state"), m):
+        if not isinstance(src, dict):
+            continue
+        for k in ("price", "markPrice", "lastPrice", "indexPrice", "oraclePrice", "mark"):
+            v = src.get(k)
+            if v is None:
+                continue
+            try:
+                p = from_fp9(v) if str(v).isdigit() and len(str(v)) > 9 else Decimal(str(v))
+                if p > 0:
+                    return p
+            except Exception:
+                continue
+    return None
+
 
 def _norm_sym(s: str) -> str:
     s = re.sub(r"[^A-Z0-9]", "", str(s).upper())
@@ -517,6 +539,22 @@ class Executor:
                 if self._mk and not market:
                     skip = "монеты нет на Upscale"
             if not skip:
+                # v1.9: уровни считаны по свечам Gate, а торгуем на Upscale. Если цены
+                # площадок разошлись, сдвигаем ВСЕ уровни на то же отношение — тогда
+                # стоп и цели остаются на своих процентах от реальной цены входа,
+                # а не уезжают (из-за этого на SAND RR упало с 1:2 до 1:1.1).
+                if market is not None:
+                    up_px = market_price(market)
+                    sig_px0 = Decimal(str(b["price"]))
+                    if up_px and sig_px0 > 0:
+                        k = up_px / sig_px0
+                        if Decimal("0.9") < k < Decimal("1.1"):      # защита от битых данных
+                            if abs(k - 1) > Decimal("0.0005"):
+                                self.send(f"📐 {sym}: цена Upscale {up_px:.6g} против {sig_px0:.6g} "
+                                          f"по свечам ({(k-1)*100:+.2f}%) — сдвигаю уровни под Upscale")
+                            for f_ in ("price", "stop", "tp1_price", "tp2_price", "tp3_price"):
+                                if b.get(f_):
+                                    b[f_] = float(Decimal(str(b[f_])) * k)
                 plan = build_plan(b["price"], b["stop_pct"], side, b["stop"],
                                   b["tp1_price"], b["tp2_price"], self.risk_usd, self.max_pos_usd)
             if not skip and self.mode == "demo":
@@ -597,7 +635,8 @@ class Executor:
         # Проскальзывание честно ухудшает RR, и это надо ПОКАЗАТЬ, а не замаскировать.
         rr1_real = abs(Decimal(str(b["tp1_price"])) - fill) / (risk_px or Decimal(1))
         info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size,
-                "tp1": b["tp1_price"], "tp2": b["tp2_price"], "sym": sym, "entry": fill}
+                "tp1": b["tp1_price"], "tp2": b["tp2_price"],
+                "tp3": b.get("tp3_price"), "sym": sym, "entry": fill}
         self._open_risk[info["id"]] = real_risk
         threading.Timer(TP_DELAY_SEC, self._place_tps, args=(info,)).start()
         self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
@@ -637,19 +676,26 @@ class Executor:
                 self.send(f"ℹ️ {info['sym']}: позиция уже закрыта (стоп?) — TP не ставлю.")
                 return
             size = _pos_size(cur) or info["size"]
-            half = size // 2
-            legs = [(half, info["tp1"], "TP1"), (size - half, info["tp2"], "TP2")] if half > 0 else [(size, info["tp1"], "TP1")]
+            tps = [t for t in (info.get("tp1"), info.get("tp2"), info.get("tp3")) if t]
+            n = len(tps)
+            if n >= 2:
+                part = size // n
+                legs = [(part, tps[i], f"TP{i+1}") for i in range(n - 1)]
+                legs.append((size - part * (n - 1), tps[-1], f"TP{n}"))
+            else:
+                legs = [(size, tps[0], "TP1")] if tps else []
             done = []
             for amt, price, label in legs:
+                if amt <= 0:
+                    continue
                 try:
                     self._send_take(info, amt, price)
                     done.append(f"{label} {price:.6g}")
                 except UpscaleError as e:
-                    self.send(f"⚠️ {info['sym']}: {label} не принят: {_trunc(e, 300)}")
-            if done:
-                self.send(f"🎯 {info['sym']}: выставлены " + ", ".join(done))
+                    self.send(f"⚠️ {info['sym']}: {label} не принят: {_trunc(e, 250)}")
             if done and BREAKEVEN_ENABLED and len(legs) > 1:
                 info["size"] = size
+                info["n_legs"] = len(legs)
                 threading.Thread(target=self._watch_breakeven, args=(info,), daemon=True).start()
         except Exception as e:
             print(f"[EXEC] place_tps: {traceback.format_exc()}")
@@ -669,10 +715,16 @@ class Executor:
         raise last
 
     def _watch_breakeven(self, info):
-        """Следит за позицией: как только размер упал (TP1 сработал) — ставит стоп в безубыток.
-        Исходный стоп отменить нельзя, но безубыток ближе к цене и сработает раньше него."""
+        """Подтягивает стоп по мере взятия целей:
+          после TP1 — в безубыток (риска больше нет);
+          после TP2 — на цену TP1 (прибыль заперта).
+        Именно подтяжка даёт основной прирост: в бэктесте те же три цели без неё
+        давали +0.174R, с ней +0.264R, винрейт 66% против 77%.
+        Факт взятия цели определяем по уменьшению размера позиции."""
         deadline = time.time() + BREAKEVEN_MAX_MIN * 60
-        start_size = info["size"]
+        start = info["size"]
+        legs = max(2, int(info.get("n_legs", 2)))
+        moved = 0
         while time.time() < deadline:
             time.sleep(BREAKEVEN_POLL)
             try:
@@ -680,21 +732,31 @@ class Executor:
                     return
                 cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
                 if not cur:
-                    return                      # позиция закрыта целиком — следить не за чем
+                    return                               # позиция закрыта целиком
                 size_now = _pos_size(cur)
-                if size_now <= 0 or size_now >= start_size * 0.9:
-                    continue                    # TP1 ещё не сработал
-                be = breakeven_price(info["entry"], info["dir"])
-                self._send_stop(info, size_now, be)
-                self.send(f"🔒 {info['sym']}: TP1 сработал — стоп переведён в безубыток {be:.6g} "
-                          f"на остаток позиции.")
-                return
+                if size_now <= 0:
+                    return
+                taken = round((start - size_now) / start * legs)   # сколько целей взято
+                if taken <= moved:
+                    continue
+                if taken == 1:
+                    lvl, what = breakeven_price(info["entry"], info["dir"]), "безубыток"
+                elif taken >= 2 and info.get("tp1"):
+                    lvl, what = Decimal(str(info["tp1"])), "уровень TP1"
+                else:
+                    continue
+                self._send_stop(info, size_now, lvl)
+                moved = taken
+                self.send(f"🔒 {info['sym']}: взята цель {taken} — стоп переставлен "
+                          f"в {what} ({float(lvl):.6g}) на остаток.")
+                if taken >= legs - 1:
+                    return
             except UpscaleError as e:
-                self.send(f"⚠️ {info['sym']}: безубыток не принят: {_trunc(e, 250)} — "
-                          f"перенеси стоп руками.")
+                self.send(f"⚠️ {info['sym']}: стоп не переставлен: {_trunc(e, 250)} — "
+                          f"перенеси руками.")
                 return
             except Exception:
-                print(f"[EXEC] breakeven: {traceback.format_exc()}")
+                print(f"[EXEC] trail: {traceback.format_exc()}")
                 return
 
     # -- отчёт --

@@ -28,7 +28,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v9.0"
+BOT_VERSION    = "v9.1"
 
 TRADING_START_MSK = 4          # v8.8: было 5 — но окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -50,8 +50,15 @@ DAY_LOSS_USD  = float(os.environ.get("DAY_LOSS_USD", "150"))  # дневной �
 # ── 🎯 УКЛОН — вход внутри диапазона заряда по направлению уклона ──────────────
 # Сигнал появляется сразу при нахождении заряда (без ожидания пробоя).
 # Окно: 4:00–21:00 МСК, кроме 12:00–14:30 (вне него не шлём, но и не копим — не ставим ордера).
+BREAKOUT_ENABLED   = False     # v9.1: ПРОБОЙ отдельной сделкой ОТКЛЮЧЁН. Бэктест 60 дней,
+                               # 1144 сделки: -0.21R, и ни один из ~30 проверенных вариантов
+                               # (окна, объём, сила, цели, удалённость входа, деление позиции)
+                               # не вывел в плюс. Пробой остаётся только третьей целью УКЛОНА.
 TILT_ENABLED       = True
-TILT_MIN_SCORE     = 7         # минимальный score заряда
+TILT_MIN_SCORE     = 0         # v9.1: порог УБРАН. Бэктест 60 дней: с порогом 7 — 105 сделок
+                               # и +0.264R, без порога — 228 сделок и +0.294R. Фильтр выбрасывал
+                               # половину хороших сделок, не улучшая качество. Остаются два
+                               # условия: чёткий уклон (не "both") и ход до границы ≥ TILT_MIN_DIST_PCT.
 TILT_MIN_DIST_PCT  = 1.0       # мин. расстояние от цены до границы диапазона (%)
 TILT_STOP_PCT      = 1.0       # v8.9: было 0.5. Бэктест 60 дней, 106 сделок: при реальном
                                # проскальзывании (0.25%) тесный стоп уходит в минус (-0.03R),
@@ -64,6 +71,11 @@ TILT_TP1_PCT       = 1.0       # v9.0: ВЕРНУЛИ 1.0 (в v8.9 ошибоч�
                                # фактического входа, а не от цены сигнала. После починки
                                # порядок перевернулся: 1.0% даёт +0.150R против +0.102R у 0.5%.
                                # 0.75% практически вровень (+0.143R), разница в пределах шума.
+TILT_TP3_PCT       = 2.0       # v9.1: третья цель ЗА границей коридора. Пробой отдельной
+                               # сделкой убыточен (1144 сд, -0.21R), но как продолжение уклона
+                               # работает: три цели по трети позиции дали +0.294R против +0.177R
+                               # у двух. Значение 2.0 — середина сетки (1.5-4.0 дали почти одно
+                               # и то же), берём не край, чтобы не подгонять.
 TILT_TP2_MARGIN    = 0.0       # v9.0: было 0.2. Тренд в бэктесте чистый — чем ближе к
                                # границе, тем лучше: 0.0% → +0.122R, 0.2% → +0.102R,
                                # 0.5% → +0.089R. Ставим точно на границу коридора.
@@ -1375,14 +1387,22 @@ def build_tilt(c: dict):
         tp2 = tp1 * 1.001
     if not is_long and tp2 >= tp1:
         tp2 = tp1 * 0.999
+    tp3 = entry * (1 + TILT_TP3_PCT / 100) if is_long else entry * (1 - TILT_TP3_PCT / 100)
+    # цели строго по возрастанию в сторону сделки
+    if is_long and tp3 <= tp2:
+        tp3 = tp2 * 1.001
+    if not is_long and tp3 >= tp2:
+        tp3 = tp2 * 0.999
     rr1 = TILT_TP1_PCT / TILT_STOP_PCT
     rr2 = abs(tp2 - entry) / entry * 100 / TILT_STOP_PCT
+    rr3 = abs(tp3 - entry) / entry * 100 / TILT_STOP_PCT
     return {
         "kind": "tilt", "symbol": c["symbol"], "side": side, "score": c["score"],
-        "price": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
+        "price": entry, "stop": stop, "tp1": tp1, "tp2": tp2, "tp3": tp3,
         "stop_pct": TILT_STOP_PCT, "tp1_pct": TILT_TP1_PCT,
         "tp2_pct": abs(tp2 - entry) / entry * 100,
-        "dist_pct": dist_pct, "rr1": rr1, "rr2": rr2,
+        "dist_pct": dist_pct, "rr1": rr1, "rr2": rr2, "rr3": rr3,
+        "tp3_pct": abs(tp3 - entry) / entry * 100,
         "hi": hi, "lo": lo, "atr": c["atr"], "charge_score": c["score"], "charge_side": side,
     }
 
@@ -1395,8 +1415,9 @@ def format_tilt(t: dict) -> str:
         f"УКЛОН {sym} {arrow} score={t['score']}\n"
         f"Вход: {t['price']:.6g} | до границы: {t['dist_pct']:.2f}%\n"
         f"Стоп: {t['stop']:.6g} (-{t['stop_pct']}%) | TP1: {t['tp1']:.6g} (+{t['tp1_pct']}%, RR 1:{t['rr1']:.1f})\n"
-        f"TP2: {t['tp2']:.6g} (перед {boundary:.6g}, RR 1:{t['rr2']:.1f})\n"
-        f"Расстояние до границы: {t['dist_pct']:.1f}%"
+        f"TP2: {t['tp2']:.6g} (граница коридора, RR 1:{t['rr2']:.1f})\n"
+        f"TP3: {t['tp3']:.6g} (за пробоем, RR 1:{t['rr3']:.1f})\n"
+        f"По трети позиции на каждую цель, стоп подтягивается после TP1 и TP2"
     )
 
 
@@ -1770,6 +1791,10 @@ def fast_check():
                 WATCHLIST.pop(sym, None)
                 continue
 
+            if not BREAKOUT_ENABLED:
+                print(f"[BREAKOUT] {sym} {side}: уровень взят, но ПРОБОЙ отключён (v9.1)")
+                WATCHLIST.pop(sym, None)
+                continue
             delta = get_trade_delta(sym, bar)     # агрессор за время свечи пробоя
             b = build_breakout(w, side, price, rvol_bar, delta)
             b["bar_close"] = close
@@ -2447,6 +2472,7 @@ HELP_TEXT = ("<b>Команды:</b>\n"
              "/stop SEI — выбило стопом\n"
              "/skip SEI причина — сигнал пропустил\n"
              "/stat — мои сделки и проскальзывание\n"
+             "/log — прислать журналы прямо сейчас\n"
              "/watch — что сейчас в зарядке\n"
              "/up — статус авто-слоя Upscale | /uptest — тест: открыть и закрыть BTC на демо | /risk — баланс, просадка, лимиты\n"
              "/halt — пауза исполнения | /resume — продолжить | /closeall — закрыть всё на демо")
@@ -2502,6 +2528,16 @@ def handle_command(text: str) -> str:
         return cmd_stat()
     if cmd == "/watch":
         return cmd_watch()
+    if cmd in ("/log", "/files", "/journal"):
+        today = datetime.now(MSK).strftime("%Y-%m-%d")
+        sent = 0
+        for path, cap in ((SIGNALS_CSV, "сигналы"), (OUTCOMES_CSV, "исходы сигналов"),
+                          (CHARGES_CSV, "заряды"), (CHARGE_OUTCOMES_CSV, "исходы зарядов"),
+                          (TRADES_CSV, "мои сделки"), (EXEC_CSV, "авто-слой")):
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                send_document(path, f"{today} — {cap}")
+                sent += 1
+        return f"📒 Отправлено файлов: {sent}" if sent else "📒 Журналы пока пустые."
     if cmd in ("/help", "/start"):
         return HELP_TEXT
     return ""
