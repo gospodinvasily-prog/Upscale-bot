@@ -237,6 +237,7 @@ def run():
         "brvol": {v: [] for v in BRVOL_GRID},
         "bscore": {v: [] for v in BSCORE_GRID},
         "btgt": {v: [] for v in BTGT_GRID},
+        "bentry": {v: [] for v in BENTRY_GRID},
         "t_single": {v: [] for v in SINGLE_GRID}, "t_split": [],
         "b_single": {v: [] for v in SINGLE_GRID}, "b_split": [],
         "combo": {v: [] for v in COMBO_TP3},
