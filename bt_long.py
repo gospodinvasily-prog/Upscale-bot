@@ -46,6 +46,19 @@ RECHECK_MIN = [60, 30, 15, 5]               # как часто перепров
 # свече. Прошлый прогон этого не учитывал — туда попали все пробои подряд, круглосуточно.
 BRVOL_GRID  = [1.0, 1.3, 1.6, 2.0]          # объём свечи пробоя (на 15m, не равно порогу бота)
 BSCORE_GRID = [0, 1, 2, 3]                  # сила пробоя (в бэктесте ниже живой на 2-3)
+# Цели ПРОБОЯ: сейчас структурные (свинги и высота диапазона), стоп доходит до 3%.
+# В журнале стопы были 2.3-2.7%, то есть цели далеко, а позиция мелкая. У УКЛОНА
+# сработало обратное — близкая цель и высокий винрейт. Проверяем, переносится ли.
+BTGT_GRID = [None, (1.0, 0.5), (1.0, 0.75), (1.5, 0.75), (1.5, 1.0)]   # None = как сейчас
+# ── СВИП-РАЗВОРОТ ──────────────────────────────────────────────────────────────
+# Цена прокалывает границу коридора и ЗАКРЫВАЕТСЯ обратно внутрь — ликвидность снята,
+# входим в противоположную сторону. Косвенные подтверждения уже есть: у ПРОБОЯ фильтр
+# объёма делает только хуже (всплеск = истощение, а не сила), а в первом живом журнале
+# 53% выходов возвращались внутрь за 15 минут.
+SW_PIERCE   = [0.1, 0.2, 0.3]        # мин. глубина прокола за границу, % — чтобы не считать касание
+SW_STOP     = [0.5, 0.75, 1.0, 1.5, None]   # стоп в %, None = за экстремум прокола + буфер
+SW_TP1      = [0.5, 0.75, 1.0, 1.5]  # первая цель, % от входа
+SW_MAXBARS  = 3                      # за сколько свечей цена должна вернуться внутрь
 
 
 def _ts(c):
@@ -158,8 +171,12 @@ def run():
         "bwin": {True: [], False: []},
         "brvol": {v: [] for v in BRVOL_GRID},
         "bscore": {v: [] for v in BSCORE_GRID},
+        "btgt": {v: [] for v in BTGT_GRID},
+        "swp": {v: [] for v in SW_PIERCE},
+        "swstop": {v: [] for v in SW_STOP},
+        "swtp": {v: [] for v in SW_TP1},
     }
-    n_ch = n_tilt = n_brk = 0
+    n_ch = n_tilt = n_brk = n_swp = 0
     saved = B.ACC_MIN_SCORE
     B.ACC_MIN_SCORE = MIN_SCORE
     t0 = time.time()
@@ -269,6 +286,73 @@ def run():
                             res["recheck"][rc].append(r)
                             break
 
+            # ── СВИП-РАЗВОРОТ ──
+            # Ищем первый прокол границы с возвратом внутрь коридора.
+            hi_c, lo_c = c["hi"], c["lo"]
+            swept = None
+            for k in range(k0 + 1, min(k0 + watch, len(fine) - hold - 2)):
+                bar = fine[k]
+                for up in (True, False):
+                    lvl = hi_c if up else lo_c
+                    pierce = ((bar["h"] - lvl) / lvl * 100) if up else ((lvl - bar["l"]) / lvl * 100)
+                    if pierce <= 0:
+                        continue
+                    # закрылась обратно внутрь — на этой свече или в ближайшие SW_MAXBARS
+                    back = None
+                    for j in range(k, min(k + SW_MAXBARS + 1, len(fine) - hold - 1)):
+                        cc = fine[j]["c"]
+                        if (up and cc < lvl) or ((not up) and cc > lvl):
+                            back = j
+                            break
+                    if back is None:
+                        continue
+                    ext = max(fine[x]["h"] for x in range(k, back + 1)) if up \
+                          else min(fine[x]["l"] for x in range(k, back + 1))
+                    swept = {"up": up, "lvl": lvl, "pierce": pierce, "k": back, "ext": ext}
+                    break
+                if swept:
+                    break
+            if swept:
+                side_s = "short" if swept["up"] else "long"   # входим ПРОТИВ прокола
+                kb = swept["k"]
+                sig_s = fine[kb]["c"]
+                ent_s = sig_s * (1 - 0.25 / 100) if side_s == "short" else sig_s * (1 + 0.25 / 100)
+                fut_s = fine[kb + 1:kb + 1 + hold]
+                opp = lo_c if swept["up"] else hi_c          # цель-максимум: другая граница
+                if len(fut_s) >= 4:
+                    n_swp += 1
+
+                    def _swp(stop_pct, tp1_pct):
+                        if stop_pct is None:                  # стоп за экстремум прокола
+                            stp = swept["ext"] * (1 + 0.1 / 100) if side_s == "short" \
+                                  else swept["ext"] * (1 - 0.1 / 100)
+                        else:
+                            stp = sig_s * (1 + stop_pct / 100) if side_s == "short" \
+                                  else sig_s * (1 - stop_pct / 100)
+                        t1 = sig_s * (1 - tp1_pct / 100) if side_s == "short" \
+                             else sig_s * (1 + tp1_pct / 100)
+                        t2 = opp
+                        if side_s == "short" and t2 >= t1:
+                            t2 = t1 * 0.999
+                        if side_s == "long" and t2 <= t1:
+                            t2 = t1 * 1.001
+                        return _sim(fut_s, side_s, ent_s, stp, t1, t2)
+
+                    for p_ in SW_PIERCE:
+                        if swept["pierce"] >= p_:
+                            r = _swp(1.0, 1.0)
+                            if r is not None:
+                                res["swp"][p_].append(r)
+                    if swept["pierce"] >= 0.1:
+                        for sp in SW_STOP:
+                            r = _swp(sp, 1.0)
+                            if r is not None:
+                                res["swstop"][sp].append(r)
+                        for tp in SW_TP1:
+                            r = _swp(1.0, tp)
+                            if r is not None:
+                                res["swtp"][tp].append(r)
+
             # ── ПРОБОЙ: только сетка VWAP ──
             hi_t = B.order_trigger(c["hi"], True, c["atr"])
             lo_t = B.order_trigger(c["lo"], False, c["atr"])
@@ -307,6 +391,24 @@ def run():
                         bsc = B.analyze_breakout(bo)[0]
                     except Exception:
                         bsc = None
+                    if inw and vw_ok:
+                        # цели пробоя: структурные против фиксированных, как у УКЛОНА
+                        for tg in BTGT_GRID:
+                            if tg is None:
+                                res["btgt"][tg].append(r)
+                                continue
+                            spc, t1pc = tg
+                            if side == "long":
+                                st2 = sig_px * (1 - spc / 100)
+                                a1 = sig_px * (1 + t1pc / 100)
+                                a2 = c["hi"] + (c["hi"] - c["lo"]) * 0.5
+                            else:
+                                st2 = sig_px * (1 + spc / 100)
+                                a1 = sig_px * (1 - t1pc / 100)
+                                a2 = c["lo"] - (c["hi"] - c["lo"]) * 0.5
+                            r2 = _sim(fut, side, ent, st2, a1, a2)
+                            if r2 is not None:
+                                res["btgt"][tg].append(r2)
                     if inw and vw_ok:                       # база: окно + VWAP как в боте
                         for rt in BRVOL_GRID:
                             if rv_b >= rt:
@@ -330,7 +432,7 @@ def run():
 
     L = [f"📚 <b>Длинный бэктест</b> (заряд 1h, сделки по {FINE_TF}, ~{cov:.0f} дн, {len(pairs)} пар)",
          f"Комиссия {FEE_PCT}%, время {took/60:.1f} мин",
-         f"Зарядов {n_ch} | сделок УКЛОНА {n_tilt}, ПРОБОЯ {n_brk}",
+         f"Зарядов {n_ch} | сделок: УКЛОН {n_tilt}, ПРОБОЙ {n_brk}, СВИП {n_swp}",
          "<i>✅ плюс уверенно · ❌ минус уверенно · пусто — неотличимо от нуля</i>",
          "", "<b>Порог VWAP (ПРОБОЙ):</b>"]
     for v in VWAP_GRID:
@@ -347,6 +449,24 @@ def run():
           "  <i>в бэктесте сила ниже живой на 2-3 — живой порог ставить выше</i>"]
     for v in BSCORE_GRID:
         L.append(_line(res["bscore"][v], f"сила ≥{v}" + (" (как сейчас — фильтра нет)" if v == 0 else "")))
+
+    L += ["", "<b>ПРОБОЙ: цели структурные или фиксированные, как у УКЛОНА?</b>",
+          "  <i>в журнале структурные стопы были 2.3-2.7% — цели далеко, позиция мелкая</i>"]
+    for v in BTGT_GRID:
+        lbl = "структурные (как сейчас)" if v is None else f"стоп {v[0]}% / TP1 {v[1]}%"
+        L.append(_line(res["btgt"][v], lbl))
+
+    L += ["", "═══ <b>СВИП-РАЗВОРОТ</b> (вход ПРОТИВ прокола границы) ═══",
+          "  <i>цена проколола границу коридора и закрылась обратно внутрь — входим в обратную</i>",
+          "", "<b>Минимальная глубина прокола</b> (стоп 1%, TP1 1%)"]
+    for v in SW_PIERCE:
+        L.append(_line(res["swp"][v], f"прокол ≥{v}%"))
+    L += ["", "<b>Стоп</b> (TP1 1%)"]
+    for v in SW_STOP:
+        L.append(_line(res["swstop"][v], "за экстремум прокола" if v is None else f"стоп {v}%"))
+    L += ["", "<b>TP1</b> (стоп 1%), TP2 — противоположная граница коридора"]
+    for v in SW_TP1:
+        L.append(_line(res["swtp"][v], f"TP1 {v}%"))
 
     L += ["", "<b>УКЛОН: стоп × проскальзывание</b> (живьём было 0.21-0.77%)"]
     for sp in TSTOP_GRID:
