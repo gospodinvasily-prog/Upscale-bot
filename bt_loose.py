@@ -30,8 +30,10 @@ SLIP    = float(os.environ.get("LO_SLIP", "0.25"))
 HOLD_H  = int(os.environ.get("LO_HOLD_H", "12"))
 TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 
-SCORE_GRID = [6, 5, 4, 3, 2]      # 6 — как сейчас
-RVOL_GRID  = [1.3, 1.1, 1.0, 0.8] # 1.3 — как сейчас
+SCORE_GRID = [6, 5, 4, 3, 2]      # 6 — как было до v9.2
+RVOL_GRID  = [1.3, 1.1, 1.0, 0.8] # 1.3 — как было до v9.2
+SQ_GRID    = [25, 30, 35, 45]     # процентиль сжатия: 25 — как сейчас
+RNG_GRID   = [9.0, 10.5, 12.0, 15.0]  # жёсткий предел размаха: 9 — как сейчас
 TP1, TP3 = 1.0, 2.0               # лучшая схема из bt_long
 STOP = 1.0
 
@@ -118,11 +120,13 @@ def run():
     hold = max(6, int(HOLD_H * 3600 / step))
 
     # один проход с самыми мягкими порогами, отбор — потом
-    saved_score, saved_rvol = B.ACC_MIN_SCORE, B.ACC_RVOL_MIN
+    saved = (B.ACC_MIN_SCORE, B.ACC_RVOL_MIN, B.ACC_SQUEEZE_PCTL, B.ACC_MAX_RANGE_ABS)
     B.ACC_MIN_SCORE = min(SCORE_GRID)
     B.ACC_RVOL_MIN = min(RVOL_GRID)
+    B.ACC_SQUEEZE_PCTL = max(SQ_GRID)
+    B.ACC_MAX_RANGE_ABS = max(RNG_GRID)
 
-    trades = []          # (score, rvol, R)
+    trades = []          # (score, rvol, sq, tr, rng, R)
     n_ch = 0
     t0 = time.time()
     cov = 0.0
@@ -186,13 +190,16 @@ def run():
                 r = _sim3(fut, c["side"], ent, stp, y1, bnd, y3)
                 if r is None:
                     continue
-                trades.append((c["score"], c.get("rvol_half", 0), r))
+                trades.append((c["score"], c.get("rvol_half", 0),
+                               c.get("sq_pct"), c.get("tr_ratio", 9),
+                               c.get("rng_pct", 0), r))
                 last_ts = fut[-1].get("t", 0)
             if i % 20 == 0:
                 print(f"[LOOSE] {i}/{len(pairs)} | зарядов {n_ch} | сделок {len(trades)} "
                       f"| {time.time()-t0:.0f}с")
     finally:
-        B.ACC_MIN_SCORE, B.ACC_RVOL_MIN = saved_score, saved_rvol
+        (B.ACC_MIN_SCORE, B.ACC_RVOL_MIN,
+         B.ACC_SQUEEZE_PCTL, B.ACC_MAX_RANGE_ABS) = saved
 
     took = time.time() - t0
     L = [f"🔓 <b>Что даст ослабление условий заряда</b> (1h заряд, сделки по {FINE_TF}, "
@@ -204,33 +211,67 @@ def run():
          "<i>OI за историю не восстановить — сила ниже живой на 2-3, "
          "поэтому смотри на СРАВНЕНИЕ вариантов, а не на абсолютный порог</i>",
          "", "<b>Порог силы заряда</b> (объём ≥1.3 как сейчас):"]
+    def sel(score_thr=5, rvol_thr=1.0, sq_thr=25, rng_thr=9.0):
+        """Отбор под заданные пороги. Сила пересчитана: прогон шёл с мягким
+        порогом сжатия, при строгом отборе лишнее очко за сжатие снимаем."""
+        out = []
+        for sc, rv, sq, tr, rng, r in trades:
+            adj = sc
+            if sq is not None and sq > sq_thr:
+                if sq <= max(SQ_GRID):
+                    adj -= 1                     # очко за сжатие не положено
+                squeezed = tr <= B.ACC_TR_RATIO_MAX
+            else:
+                squeezed = True
+            if not squeezed:
+                continue
+            if adj >= score_thr and rv >= rvol_thr and rng <= rng_thr:
+                out.append(r)
+        return out
+
     for s_ in SCORE_GRID:
-        rs = [r for sc, rv, r in trades if sc >= s_ and rv >= 1.3]
-        L.append(_line(rs, f"сила ≥{s_}" + (" (как сейчас)" if s_ == 6 else "")))
+        L.append(_line(sel(score_thr=s_), f"сила ≥{s_}" + (" (сейчас 5)" if s_ == 5 else "")))
 
-    L += ["", "<b>Порог объёма</b> (сила ≥6 как сейчас):"]
+    L += ["", "<b>Порог объёма</b> (сила ≥5, сжатие ≤25, размах ≤9%):"]
     for v_ in RVOL_GRID:
-        rs = [r for sc, rv, r in trades if sc >= 6 and rv >= v_]
-        L.append(_line(rs, f"объём ≥{v_}×" + (" (как сейчас)" if v_ == 1.3 else "")))
+        L.append(_line(sel(rvol_thr=v_), f"объём ≥{v_}×" + (" (сейчас)" if v_ == 1.0 else "")))
 
-    L += ["", "<b>Оба вместе</b> — ищем, где больше сделок без потери качества:"]
+    L += ["", "<b>Процентиль сжатия</b> — НЕ проверялся раньше (сила ≥5, объём ≥1.0):"]
+    for q_ in SQ_GRID:
+        L.append(_line(sel(sq_thr=q_), f"сжатие ≤{q_}" + (" (сейчас)" if q_ == 25 else "")))
+
+    L += ["", "<b>Предел размаха коридора</b> — НЕ проверялся раньше:"]
+    for g_ in RNG_GRID:
+        L.append(_line(sel(rng_thr=g_), f"размах ≤{g_}%" + (" (сейчас)" if g_ == 9.0 else "")))
+
+    L += ["", "<b>ВСЁ ВМЕСТЕ</b> — перебор всех четырёх, ищем максимум сделок при плюсе:"]
     best = None
     for s_ in SCORE_GRID:
-        row = []
         for v_ in RVOL_GRID:
-            rs = [r for sc, rv, r in trades if sc >= s_ and rv >= v_]
-            e = sum(rs) / len(rs) if rs else 0
-            row.append(f"{len(rs):4}шт {e:+.2f}")
-            if rs and len(rs) >= 30:
-                se = (statistics.pstdev(rs) / (len(rs) ** 0.5)) if len(rs) > 1 else 0
-                if e - 1.96 * se > 0 and (best is None or len(rs) > best[2]):
-                    best = (s_, v_, len(rs), e)
-        L.append(f"  сила ≥{s_} | " + " | ".join(f"об.{v_}: {x}" for v_, x in zip(RVOL_GRID, row)))
+            for q_ in SQ_GRID:
+                for g_ in RNG_GRID:
+                    rs = sel(s_, v_, q_, g_)
+                    if len(rs) < 100:
+                        continue
+                    e = sum(rs) / len(rs)
+                    se = statistics.pstdev(rs) / (len(rs) ** 0.5)
+                    if e - 1.96 * se > 0 and (best is None or len(rs) > best[4]):
+                        best = (s_, v_, q_, g_, len(rs), e)
     if best:
-        L.append(f"  → <b>больше всего сделок при уверенном плюсе: сила ≥{best[0]}, "
-                 f"объём ≥{best[1]} — {best[2]} сделок, {best[3]:+.3f}R</b>")
+        s_, v_, q_, g_, n_, e_ = best
+        now = sel()
+        e_now = sum(now) / len(now) if now else 0
+        L.append(f"  сейчас: сила ≥5, объём ≥1.0, сжатие ≤25, размах ≤9% — "
+                 f"{len(now)} сд, {e_now:+.3f}R")
+        L.append(f"  → <b>лучшее: сила ≥{s_}, объём ≥{v_}, сжатие ≤{q_}, размах ≤{g_}% — "
+                 f"{n_} сделок, {e_:+.3f}R</b>")
+        L.append(f"  <i>сделок {'больше' if n_ > len(now) else 'меньше'} в "
+                 f"{max(n_, len(now)) / max(1, min(n_, len(now))):.1f}×, "
+                 f"качество {e_ - e_now:+.3f}R</i>")
     else:
-        L.append("  → ни одно сочетание не дало уверенного плюса на выборке ≥30 сделок")
+        L.append("  → ни одно сочетание не дало уверенного плюса на выборке ≥100 сделок")
+    L.append("  <i>очко за сжатие пересчитывается под выбранный порог; "
+             "прочие слагаемые силы от этих параметров не зависят</i>")
 
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
