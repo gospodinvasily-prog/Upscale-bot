@@ -138,6 +138,12 @@ def run():
 
     trades = []          # (score, rvol, sq, tr, rng, R)
     tp3res = {name: [] for name, _ in TP3_MODES}
+    # КОНТРОЛЬ: то же самое, но вход в СЛУЧАЙНЫЙ момент. Если преимущество даёт схема
+    # выходов (три цели + двойная подтяжка), а не сигнал, случайный вход покажет тот же
+    # плюс. Если сигнал настоящий — случайный уйдёт в ноль или минус.
+    ctl_time, ctl_dir = [], []
+    import random as _rnd
+    _rnd.seed(12345)
     n_ch = 0
     t0 = time.time()
     cov = 0.0
@@ -211,6 +217,37 @@ def run():
                     rr = _sim3(fut, c["side"], ent, stp, y1, bnd, t3)
                     if rr is not None:
                         tp3res[name].append(rr)
+                # контроль 1: случайный момент входа, всё остальное то же
+                for _ in range(2):
+                    kr = _rnd.randrange(50, max(51, len(fine) - hold - 2))
+                    pr = fine[kr]["c"]
+                    roomr = (bnd - pr) / pr * 100 if is_l else (pr - bnd) / pr * 100
+                    if roomr < B.TILT_MIN_DIST_PCT:
+                        continue
+                    er = pr * (1 + SLIP / 100) if is_l else pr * (1 - SLIP / 100)
+                    sr = pr * (1 - STOP / 100) if is_l else pr * (1 + STOP / 100)
+                    a1 = pr * (1 + TP1 / 100) if is_l else pr * (1 - TP1 / 100)
+                    a3 = pr * (1 + TP3 / 100) if is_l else pr * (1 - TP3 / 100)
+                    fr = fine[kr + 1:kr + 1 + hold]
+                    if len(fr) < 4:
+                        continue
+                    rr_ = _sim3(fr, c["side"], er, sr, a1, bnd, a3)
+                    if rr_ is not None:
+                        ctl_time.append(rr_)
+                    break
+                # контроль 2: тот же момент, но направление монеткой
+                sd_r = _rnd.choice(("long", "short"))
+                isr = sd_r == "long"
+                bndr = c["hi"] if isr else c["lo"]
+                roomr = (bndr - px) / px * 100 if isr else (px - bndr) / px * 100
+                if roomr >= B.TILT_MIN_DIST_PCT:
+                    er = px * (1 + SLIP / 100) if isr else px * (1 - SLIP / 100)
+                    sr = px * (1 - STOP / 100) if isr else px * (1 + STOP / 100)
+                    a1 = px * (1 + TP1 / 100) if isr else px * (1 - TP1 / 100)
+                    a3 = px * (1 + TP3 / 100) if isr else px * (1 - TP3 / 100)
+                    rr_ = _sim3(fut, sd_r, er, sr, a1, bndr, a3)
+                    if rr_ is not None:
+                        ctl_dir.append(rr_)
                 trades.append((c["score"], c.get("rvol_half", 0),
                                c.get("sq_pct"), c.get("tr_ratio", 9),
                                c.get("rng_pct", 0), r))
@@ -270,6 +307,21 @@ def run():
           "   код отодвигает её на 0.1% за вторую — и третья цель вырождается в дубль второй</i>"]
     for name, _f in TP3_MODES:
         L.append(_line(tp3res[name], name))
+
+    L += ["", "═══ <b>КОНТРОЛЬ: а не схема ли выходов даёт плюс?</b> ═══",
+          "  <i>та же схема (3 цели по трети, двойная подтяжка стопа), но вход",
+          "   не по сигналу. Если плюс останется — сигнал ничего не стоит</i>"]
+    L.append(_line(sel(4, 0.8), "НАШ СИГНАЛ (сила ≥4, объём ≥0.8)"))
+    L.append(_line(ctl_time, "тот же коридор и направление, вход в СЛУЧАЙНЫЙ момент"))
+    L.append(_line(ctl_dir, "тот же момент, направление МОНЕТКОЙ"))
+    base_r = sel(4, 0.8)
+    if base_r and ctl_time:
+        d1 = sum(base_r) / len(base_r) - sum(ctl_time) / len(ctl_time)
+        d2 = (sum(base_r) / len(base_r) - sum(ctl_dir) / len(ctl_dir)) if ctl_dir else 0
+        L.append(f"  → сигнал лучше случайного момента на <b>{d1:+.3f}R</b>, "
+                 f"случайного направления на <b>{d2:+.3f}R</b>")
+        L.append("  <i>если обе разницы около нуля — преимущество даёт схема выходов, "
+                 "а не отбор сигналов, и строить на нём челлендж нельзя</i>")
 
     L += ["", "<b>ВСЁ ВМЕСТЕ</b> — перебор всех четырёх, ищем максимум сделок при плюсе:"]
     best = None
