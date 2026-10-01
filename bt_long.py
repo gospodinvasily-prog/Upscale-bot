@@ -50,26 +50,21 @@ BSCORE_GRID = [0, 1, 2, 3]                  # сила пробоя (в бэкт
 # В журнале стопы были 2.3-2.7%, то есть цели далеко, а позиция мелкая. У УКЛОНА
 # сработало обратное — близкая цель и высокий винрейт. Проверяем, переносится ли.
 BTGT_GRID = [None, (1.0, 0.5), (1.0, 0.75), (1.5, 0.75), (1.5, 1.0)]   # None = как сейчас
-# ── СВИП-РАЗВОРОТ ──────────────────────────────────────────────────────────────
-# Цена прокалывает границу коридора и ЗАКРЫВАЕТСЯ обратно внутрь — ликвидность снята,
-# входим в противоположную сторону. Косвенные подтверждения уже есть: у ПРОБОЯ фильтр
-# объёма делает только хуже (всплеск = истощение, а не сила), а в первом живом журнале
-# 53% выходов возвращались внутрь за 15 минут.
-SW_PIERCE   = [0.1, 0.2, 0.3]        # мин. глубина прокола за границу, % — чтобы не считать касание
-SW_STOP     = [0.5, 0.75, 1.0, 1.5, None]   # стоп в %, None = за экстремум прокола + буфер
-SW_TP1      = [0.5, 0.75, 1.0, 1.5]  # первая цель, % от входа
-SW_MAXBARS  = 3                      # за сколько свечей цена должна вернуться внутрь
 # ── УДАЛЁННОСТЬ ТОЧКИ ВХОДА ОТ ГРАНИЦЫ КОРИДОРА ───────────────────────────────
 # ПРОБОЙ: насколько ДАЛЬШЕ за уровень должна уйти цена, прежде чем входим.
 #   Сейчас буфер max(0.3%, 0.15×ATR). Близко к уровню — ловим свипы; далеко —
 #   входим поздно и платим за движение. Где оптимум, не угадать, меряем.
 BENTRY_GRID = [0.1, 0.3, 0.5, 0.8, 1.2]
-# СВИП: насколько ГЛУБОКО внутрь коридора цена должна вернуться после прокола.
-#   0.0 = входим сразу по закрытию внутрь (как было); больше = ждём подтверждения
-#   разворота, вход хуже по цене, но меньше ложных.
-SENTRY_GRID = [0.0, 0.2, 0.5, 1.0]
 # Вся позиция до ОДНОЙ цели против деления пополам. Цель в % от входа, стоп 1%.
 SINGLE_GRID = [0.75, 1.0, 1.5, 2.0, 3.0]
+# ── ОБЪЕДИНЁННАЯ: вход по УКЛОНУ, ведём через пробой тремя целями ─────────────
+# Логика: заходим внутри коридора по уклону заряда (там вход дешёвый), первой целью
+# снимаем риск, второй забираем ход до границы, третьей едем уже за пробоем.
+# Стоп подтягивается дважды: после TP1 в безубыток, после TP2 на уровень TP1.
+# Так пробой торгуется НЕ отдельной сделкой (она убыточна), а как продолжение уклона.
+COMBO_TP1 = 1.0                              # первая цель, % — лучшая по сетке УКЛОНА
+COMBO_TP3 = [1.5, 2.0, 2.5, 3.0, 4.0]        # третья цель, % от входа — перебираем
+COMBO_PARTS = (1/3, 1/3, 1/3)                # доли позиции на три цели
 
 
 def _ts(c):
@@ -146,6 +141,49 @@ def _sim(bars, side, entry, stop, tp1, tp2, split=True):
     return acc + r * part - FEE_PCT / 100 * entry / risk
 
 
+def _sim3(bars, side, entry, stop, t1, t2, t3, parts=COMBO_PARTS, trail=True):
+    """Три цели, стоп подтягивается: после TP1 в безубыток, после TP2 на цену TP1.
+    trail=False — стоп не двигаем вовсе (для сравнения, что даёт подтяжка)."""
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    is_long = side == "long"
+    tgts = [t1, t2, t3]
+    # цели должны идти по возрастанию в сторону сделки, иначе сдвигаем
+    for i in range(1, 3):
+        if is_long and tgts[i] <= tgts[i - 1]:
+            tgts[i] = tgts[i - 1] * 1.001
+        if not is_long and tgts[i] >= tgts[i - 1]:
+            tgts[i] = tgts[i - 1] * 0.999
+    done = 0
+    cur_stop = stop
+    acc = 0.0
+    for c in bars:
+        hit_s = (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop)
+        if hit_s:
+            left = sum(parts[done:])
+            r = (cur_stop - entry) / risk if is_long else (entry - cur_stop) / risk
+            return acc + r * left - FEE_PCT / 100 * entry / risk
+        while done < 3:
+            t = tgts[done]
+            if (c["h"] >= t) if is_long else (c["l"] <= t):
+                acc += parts[done] * (abs(t - entry) / risk)
+                done += 1
+                if trail:
+                    if done == 1:
+                        cur_stop = entry                 # безубыток
+                    elif done == 2:
+                        cur_stop = tgts[0]               # фиксируем прибыль первой цели
+            else:
+                break
+        if done >= 3:
+            return acc - FEE_PCT / 100 * entry / risk
+    last = bars[-1]["c"] if bars else entry
+    left = sum(parts[done:])
+    r = (last - entry) / risk if is_long else (entry - last) / risk
+    return acc + r * left - FEE_PCT / 100 * entry / risk
+
+
 def _line(rs, label):
     if not rs:
         return f"  {label}: сделок нет"
@@ -199,15 +237,12 @@ def run():
         "brvol": {v: [] for v in BRVOL_GRID},
         "bscore": {v: [] for v in BSCORE_GRID},
         "btgt": {v: [] for v in BTGT_GRID},
-        "swp": {v: [] for v in SW_PIERCE},
-        "swstop": {v: [] for v in SW_STOP},
-        "swtp": {v: [] for v in SW_TP1},
-        "bentry": {v: [] for v in BENTRY_GRID},
-        "sentry": {v: [] for v in SENTRY_GRID},
         "t_single": {v: [] for v in SINGLE_GRID}, "t_split": [],
         "b_single": {v: [] for v in SINGLE_GRID}, "b_split": [],
+        "combo": {v: [] for v in COMBO_TP3},
+        "combo_nobe": {v: [] for v in COMBO_TP3},
     }
-    n_ch = n_tilt = n_brk = n_swp = 0
+    n_ch = n_tilt = n_brk = 0
     saved = B.ACC_MIN_SCORE
     B.ACC_MIN_SCORE = MIN_SCORE
     t0 = time.time()
@@ -308,6 +343,19 @@ def run():
                             if r1 is not None:
                                 res["t_single"][g].append(r1)
 
+                # объединённая: уклон + ведение через пробой
+                if d0 >= B.TILT_MIN_DIST_PCT and len(f0) >= 4:
+                    c1 = px0 * (1 + COMBO_TP1 / 100) if is_l else px0 * (1 - COMBO_TP1 / 100)
+                    c2 = bnd                                     # граница коридора
+                    for g3 in COMBO_TP3:
+                        c3 = px0 * (1 + g3 / 100) if is_l else px0 * (1 - g3 / 100)
+                        r3 = _sim3(f0, c["side"], e0, s0, c1, c2, c3, trail=True)
+                        if r3 is not None:
+                            res["combo"][g3].append(r3)
+                        r4 = _sim3(f0, c["side"], e0, s0, c1, c2, c3, trail=False)
+                        if r4 is not None:
+                            res["combo_nobe"][g3].append(r4)
+
                 fired = _enter(k0, base_slip, 1.0, B.TILT_TP1_PCT, B.TILT_TP2_MARGIN)
                 if fired is not None:
                     n_tilt += 1
@@ -335,102 +383,6 @@ def run():
                         if r is not None:
                             res["recheck"][rc].append(r)
                             break
-
-            # ── СВИП-РАЗВОРОТ ──
-            # Ищем первый прокол границы с возвратом внутрь коридора.
-            hi_c, lo_c = c["hi"], c["lo"]
-            swept = None
-            for k in range(k0 + 1, min(k0 + watch, len(fine) - hold - 2)):
-                bar = fine[k]
-                for up in (True, False):
-                    lvl = hi_c if up else lo_c
-                    pierce = ((bar["h"] - lvl) / lvl * 100) if up else ((lvl - bar["l"]) / lvl * 100)
-                    if pierce <= 0:
-                        continue
-                    # закрылась обратно внутрь — на этой свече или в ближайшие SW_MAXBARS
-                    back = None
-                    for j in range(k, min(k + SW_MAXBARS + 1, len(fine) - hold - 1)):
-                        cc = fine[j]["c"]
-                        if (up and cc < lvl) or ((not up) and cc > lvl):
-                            back = j
-                            break
-                    if back is None:
-                        continue
-                    ext = max(fine[x]["h"] for x in range(k, back + 1)) if up \
-                          else min(fine[x]["l"] for x in range(k, back + 1))
-                    swept = {"up": up, "lvl": lvl, "pierce": pierce, "k": back, "ext": ext}
-                    break
-                if swept:
-                    break
-            if swept:
-                side_s = "short" if swept["up"] else "long"   # входим ПРОТИВ прокола
-                kb = swept["k"]
-                sig_s = fine[kb]["c"]
-                ent_s = sig_s * (1 - 0.25 / 100) if side_s == "short" else sig_s * (1 + 0.25 / 100)
-                fut_s = fine[kb + 1:kb + 1 + hold]
-                opp = lo_c if swept["up"] else hi_c          # цель-максимум: другая граница
-                if len(fut_s) >= 4:
-                    n_swp += 1
-
-                    def _swp(stop_pct, tp1_pct):
-                        if stop_pct is None:                  # стоп за экстремум прокола
-                            stp = swept["ext"] * (1 + 0.1 / 100) if side_s == "short" \
-                                  else swept["ext"] * (1 - 0.1 / 100)
-                        else:
-                            stp = sig_s * (1 + stop_pct / 100) if side_s == "short" \
-                                  else sig_s * (1 - stop_pct / 100)
-                        t1 = sig_s * (1 - tp1_pct / 100) if side_s == "short" \
-                             else sig_s * (1 + tp1_pct / 100)
-                        t2 = opp
-                        if side_s == "short" and t2 >= t1:
-                            t2 = t1 * 0.999
-                        if side_s == "long" and t2 <= t1:
-                            t2 = t1 * 1.001
-                        return _sim(fut_s, side_s, ent_s, stp, t1, t2)
-
-                    # глубина возврата внутрь коридора перед входом
-                    for dep in SENTRY_GRID:
-                        if dep == 0.0:
-                            kk_ = kb
-                        else:
-                            need = swept["lvl"] * (1 - dep / 100) if swept["up"] \
-                                   else swept["lvl"] * (1 + dep / 100)
-                            kk_ = None
-                            for j in range(kb, min(kb + 8, len(fine) - hold - 1)):
-                                cc = fine[j]["c"]
-                                if (swept["up"] and cc <= need) or ((not swept["up"]) and cc >= need):
-                                    kk_ = j
-                                    break
-                        if kk_ is None:
-                            continue
-                        sg = fine[kk_]["c"]
-                        en = sg * (1 - 0.25 / 100) if side_s == "short" else sg * (1 + 0.25 / 100)
-                        st = sg * (1 + 1.0 / 100) if side_s == "short" else sg * (1 - 1.0 / 100)
-                        a1 = sg * (1 - 1.0 / 100) if side_s == "short" else sg * (1 + 1.0 / 100)
-                        a2 = opp
-                        if side_s == "short" and a2 >= a1:
-                            a2 = a1 * 0.999
-                        if side_s == "long" and a2 <= a1:
-                            a2 = a1 * 1.001
-                        ft = fine[kk_ + 1:kk_ + 1 + hold]
-                        if len(ft) >= 4:
-                            r = _sim(ft, side_s, en, st, a1, a2)
-                            if r is not None:
-                                res["sentry"][dep].append(r)
-                    for p_ in SW_PIERCE:
-                        if swept["pierce"] >= p_:
-                            r = _swp(1.0, 1.0)
-                            if r is not None:
-                                res["swp"][p_].append(r)
-                    if swept["pierce"] >= 0.1:
-                        for sp in SW_STOP:
-                            r = _swp(sp, 1.0)
-                            if r is not None:
-                                res["swstop"][sp].append(r)
-                        for tp in SW_TP1:
-                            r = _swp(1.0, tp)
-                            if r is not None:
-                                res["swtp"][tp].append(r)
 
             # ── ПРОБОЙ: удалённость точки входа за уровень ──
             for bd in BENTRY_GRID:
@@ -546,7 +498,7 @@ def run():
 
     L = [f"📚 <b>Длинный бэктест</b> (заряд 1h, сделки по {FINE_TF}, ~{cov:.0f} дн, {len(pairs)} пар)",
          f"Комиссия {FEE_PCT}%, время {took/60:.1f} мин",
-         f"Зарядов {n_ch} | сделок: УКЛОН {n_tilt}, ПРОБОЙ {n_brk}, СВИП {n_swp}",
+         f"Зарядов {n_ch} | сделок: УКЛОН {n_tilt}, ПРОБОЙ {n_brk}",
          "<i>✅ плюс уверенно · ❌ минус уверенно · пусто — неотличимо от нуля</i>",
          "", "<b>Порог VWAP (ПРОБОЙ):</b>"]
     for v in VWAP_GRID:
@@ -575,22 +527,23 @@ def run():
     for v in BENTRY_GRID:
         L.append(_line(res["bentry"][v], f"вход за {v}% от уровня"))
 
-    L += ["", "═══ <b>СВИП-РАЗВОРОТ</b> (вход ПРОТИВ прокола границы) ═══",
-          "  <i>цена проколола границу коридора и закрылась обратно внутрь — входим в обратную</i>",
-          "", "<b>Минимальная глубина прокола</b> (стоп 1%, TP1 1%)"]
-    for v in SW_PIERCE:
-        L.append(_line(res["swp"][v], f"прокол ≥{v}%"))
-    L += ["", "<b>Стоп</b> (TP1 1%)"]
-    for v in SW_STOP:
-        L.append(_line(res["swstop"][v], "за экстремум прокола" if v is None else f"стоп {v}%"))
-    L += ["", "<b>TP1</b> (стоп 1%), TP2 — противоположная граница коридора"]
-    for v in SW_TP1:
-        L.append(_line(res["swtp"][v], f"TP1 {v}%"))
-
-    L += ["", "<b>СВИП: как глубоко внутрь коридора ждать возврата?</b>",
-          "  <i>стоп 1%, TP1 1%; 0% = вход сразу по закрытию внутрь</i>"]
-    for v in SENTRY_GRID:
-        L.append(_line(res["sentry"][v], f"возврат на {v}% внутрь" + (" (как было)" if v == 0.0 else "")))
+    L += ["", "═══ <b>ОБЪЕДИНЁННАЯ: УКЛОН + ПРОБОЙ ОДНОЙ СДЕЛКОЙ</b> ═══",
+          f"  <i>вход по уклону внутри коридора, стоп 1%. Три цели по трети позиции:",
+          f"   TP1 {COMBO_TP1}% → стоп в безубыток; TP2 на границе коридора → стоп на TP1;",
+          f"   TP3 за пробоем. Пробой не отдельная сделка, а продолжение уклона</i>"]
+    for v in COMBO_TP3:
+        L.append(_line(res["combo"][v], f"TP3 {v}% (стоп подтягиваем)"))
+    L.append("  <i>то же, но стоп НЕ двигаем — видно, что даёт подтяжка:</i>")
+    for v in COMBO_TP3:
+        L.append(_line(res["combo_nobe"][v], f"TP3 {v}% (стоп на месте)"))
+    base_t = res.get("t_split") or []
+    if base_t:
+        bt_e = sum(base_t) / len(base_t)
+        best_c = max(res["combo"].items(), key=lambda kv: (sum(kv[1]) / len(kv[1])) if kv[1] else -9)
+        if best_c[1]:
+            be = sum(best_c[1]) / len(best_c[1])
+            L.append(f"  → лучшая объединённая: TP3 {best_c[0]}% = {be:+.3f}R против "
+                     f"{bt_e:+.3f}R у нынешнего УКЛОНА ({be - bt_e:+.3f}R)")
 
     L += ["", "═══ <b>ДЕЛИТЬ ПОЗИЦИЮ ПОПОЛАМ ИЛИ ВЕСТИ ЦЕЛИКОМ?</b> ═══",
           "  <i>при делении самый частый исход «TP1 + безубыток» даёт лишь ПОЛОВИНУ цели,",
