@@ -65,6 +65,14 @@ SINGLE_GRID = [0.75, 1.0, 1.5, 2.0, 3.0]
 COMBO_TP1 = 1.0                              # первая цель, % — лучшая по сетке УКЛОНА
 COMBO_TP3 = [1.5, 2.0, 2.5, 3.0, 4.0]        # третья цель, % от входа — перебираем
 COMBO_PARTS = (1/3, 1/3, 1/3)                # доли позиции на три цели
+# ── КАК ОПРЕДЕЛЯТЬ НАПРАВЛЕНИЕ УКЛОНА ────────────────────────────────────────
+# Сейчас: сумма очков (позиция в коридоре, структура, фандинг, тейкеры, BTC),
+# лонг при +2 и выше, шорт при −2 и ниже, иначе «both» — и такие заряды мы пропускаем.
+# Проблема: логика очков написана под ПРОБОЙ («цена прижата к верхней границе →
+# пробьёт вверх»), а УКЛОНУ нужен ХОД до границы, то есть ровно обратное.
+# Проверяем правила направления на ВСЕХ зарядах, не только с чётким уклоном.
+DIR_RULES = ["bias7", "bias6", "bias5", "bias_any",
+             "far", "near", "struct", "long_only", "short_only", "inverse"]
 
 
 def _ts(c):
@@ -242,6 +250,7 @@ def run():
         "b_single": {v: [] for v in SINGLE_GRID}, "b_split": [],
         "combo": {v: [] for v in COMBO_TP3},
         "combo_nobe": {v: [] for v in COMBO_TP3},
+        "dir": {r: [] for r in DIR_RULES},
     }
     n_ch = n_tilt = n_brk = 0
     saved = B.ACC_MIN_SCORE
@@ -293,6 +302,48 @@ def run():
                         break
             if k0 is None:
                 continue
+
+            # ── НАПРАВЛЕНИЕ: правила на ВСЕХ зарядах ──
+            px_d = fine[k0]["c"]
+            if c["hi"] > c["lo"] and px_d > 0:
+                posn = (px_d - c["lo"]) / (c["hi"] - c["lo"])     # 0 = у низа, 1 = у верха
+                to_hi = (c["hi"] - px_d) / px_d * 100
+                to_lo = (px_d - c["lo"]) / px_d * 100
+                bpts = c.get("bl", 0) - c.get("bs", 0)
+                fd = fine[k0 + 1:k0 + 1 + hold]
+                for rule in DIR_RULES:
+                    sd_ = None
+                    if rule.startswith("bias"):
+                        need = {"bias7": 7, "bias6": 6, "bias5": 5, "bias_any": 0}[rule]
+                        if c["side"] in ("long", "short") and c["score"] >= need:
+                            sd_ = c["side"]
+                    elif rule == "far":          # к ДАЛЬНЕЙ границе — там есть ход
+                        sd_ = "long" if to_hi > to_lo else "short"
+                    elif rule == "near":         # к БЛИЖНЕЙ границе — как у пробоя
+                        sd_ = "long" if to_hi < to_lo else "short"
+                    elif rule == "struct":       # только структура, без прочих очков
+                        sd_ = "long" if bpts > 0 else ("short" if bpts < 0 else None)
+                    elif rule == "long_only":
+                        sd_ = "long"
+                    elif rule == "short_only":
+                        sd_ = "short"
+                    elif rule == "inverse":      # обратно текущему уклону
+                        if c["side"] in ("long", "short"):
+                            sd_ = "short" if c["side"] == "long" else "long"
+                    if sd_ is None or len(fd) < 4:
+                        continue
+                    isl = sd_ == "long"
+                    room = to_hi if isl else to_lo
+                    if room < B.TILT_MIN_DIST_PCT:          # нужен ход до границы
+                        continue
+                    bnd_ = c["hi"] if isl else c["lo"]
+                    e_ = px_d * (1 + 0.25 / 100) if isl else px_d * (1 - 0.25 / 100)
+                    s_ = px_d * (1 - 1.0 / 100) if isl else px_d * (1 + 1.0 / 100)
+                    y1 = px_d * (1 + COMBO_TP1 / 100) if isl else px_d * (1 - COMBO_TP1 / 100)
+                    y3 = px_d * (1 + 2.0 / 100) if isl else px_d * (1 - 2.0 / 100)
+                    rr = _sim3(fd, sd_, e_, s_, y1, bnd_, y3, trail=True)
+                    if rr is not None:
+                        res["dir"][rule].append(rr)
 
             # ── УКЛОН ──
             if c["side"] in ("long", "short") and c["score"] >= TILT_SCORE:
@@ -545,6 +596,26 @@ def run():
             be = sum(best_c[1]) / len(best_c[1])
             L.append(f"  → лучшая объединённая: TP3 {best_c[0]}% = {be:+.3f}R против "
                      f"{bt_e:+.3f}R у нынешнего УКЛОНА ({be - bt_e:+.3f}R)")
+
+    L += ["", "═══ <b>КАК ОПРЕДЕЛЯТЬ НАПРАВЛЕНИЕ?</b> ═══",
+          "  <i>объединённая схема (3 цели, стоп подтягиваем) на ВСЕХ зарядах.",
+          "   Цель — найти правило, которое даёт БОЛЬШЕ входов без потери качества</i>"]
+    names = {"bias7": "очки, сила ≥7 (как сейчас)", "bias6": "очки, сила ≥6",
+             "bias5": "очки, сила ≥5", "bias_any": "очки, любая сила",
+             "far": "к ДАЛЬНЕЙ границе (где есть ход)", "near": "к БЛИЖНЕЙ границе (как у пробоя)",
+             "struct": "только структура (мин/макс)", "long_only": "всегда лонг",
+             "short_only": "всегда шорт", "inverse": "ОБРАТНО текущему уклону"}
+    for r in DIR_RULES:
+        L.append(_line(res["dir"][r], names[r]))
+    bb = res["dir"].get("bias7") or []
+    if bb:
+        be = sum(bb) / len(bb)
+        cand = [(k, v) for k, v in res["dir"].items() if len(v) > len(bb) * 1.3 and v]
+        if cand:
+            bst = max(cand, key=lambda kv: sum(kv[1]) / len(kv[1]))
+            L.append(f"  → больше входов при сопоставимом качестве: <b>{names[bst[0]]}</b> — "
+                     f"{len(bst[1])} сделок ({sum(bst[1])/len(bst[1]):+.3f}R) против "
+                     f"{len(bb)} ({be:+.3f}R)")
 
     L += ["", "═══ <b>ДЕЛИТЬ ПОЗИЦИЮ ПОПОЛАМ ИЛИ ВЕСТИ ЦЕЛИКОМ?</b> ═══",
           "  <i>при делении самый частый исход «TP1 + безубыток» даёт лишь ПОЛОВИНУ цели,",
