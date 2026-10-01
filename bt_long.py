@@ -68,6 +68,8 @@ BENTRY_GRID = [0.1, 0.3, 0.5, 0.8, 1.2]
 #   0.0 = входим сразу по закрытию внутрь (как было); больше = ждём подтверждения
 #   разворота, вход хуже по цене, но меньше ложных.
 SENTRY_GRID = [0.0, 0.2, 0.5, 1.0]
+# Вся позиция до ОДНОЙ цели против деления пополам. Цель в % от входа, стоп 1%.
+SINGLE_GRID = [0.75, 1.0, 1.5, 2.0, 3.0]
 
 
 def _ts(c):
@@ -100,12 +102,28 @@ def _fetch_chunked(sym, tf, days):
     return uniq
 
 
-def _sim(bars, side, entry, stop, tp1, tp2):
-    """Половина на TP1, стоп в безубыток, остаток на TP2. В спорной свече — стоп."""
+def _sim(bars, side, entry, stop, tp1, tp2, split=True):
+    """split=True: половина на TP1, стоп в безубыток, остаток на TP2 (как в боте).
+    split=False: ВСЯ позиция до одной цели tp1, без безубытка.
+    Зачем проверять: при делении пополам самый частый исход — «взяли TP1, остаток
+    вышел в ноль» — даёт лишь ПОЛОВИНУ от TP1, а проигрыш всегда полный −1R.
+    При TP1 = 0.5R для безубыточности нужен винрейт 80%, при 1R — 67%.
+    Без деления победа полная, но нет подстраховки безубытком."""
     risk = abs(entry - stop)
     if risk <= 0:
         return None
     is_long = side == "long"
+    if not split:
+        for c in bars:
+            hs = (c["l"] <= stop) if is_long else (c["h"] >= stop)
+            ht = (c["h"] >= tp1) if is_long else (c["l"] <= tp1)
+            if hs:
+                return -1.0 - FEE_PCT / 100 * entry / risk
+            if ht:
+                return abs(tp1 - entry) / risk - FEE_PCT / 100 * entry / risk
+        last = bars[-1]["c"] if bars else entry
+        r = (last - entry) / risk if is_long else (entry - last) / risk
+        return r - FEE_PCT / 100 * entry / risk
     half, cur_stop, acc = False, stop, 0.0
     for c in bars:
         hit_s = (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop)
@@ -186,6 +204,8 @@ def run():
         "swtp": {v: [] for v in SW_TP1},
         "bentry": {v: [] for v in BENTRY_GRID},
         "sentry": {v: [] for v in SENTRY_GRID},
+        "t_single": {v: [] for v in SINGLE_GRID}, "t_split": [],
+        "b_single": {v: [] for v in SINGLE_GRID}, "b_split": [],
     }
     n_ch = n_tilt = n_brk = n_swp = 0
     saved = B.ACC_MIN_SCORE
@@ -268,6 +288,25 @@ def run():
                     if len(fut) < 4:
                         return None
                     return _sim(fut, c["side"], ent, stp, t1, t2)
+
+                # вся позиция до одной цели против деления пополам
+                px0 = fine[k0]["c"]
+                d0 = (bnd - px0) / px0 * 100 if is_l else (px0 - bnd) / px0 * 100
+                if d0 >= B.TILT_MIN_DIST_PCT:
+                    e0 = px0 * (1 + base_slip / 100) if is_l else px0 * (1 - base_slip / 100)
+                    s0 = px0 * (1 - 1.0 / 100) if is_l else px0 * (1 + 1.0 / 100)
+                    f0 = fine[k0 + 1:k0 + 1 + hold]
+                    if len(f0) >= 4:
+                        rsp = _sim(f0, c["side"], e0, s0,
+                                   px0 * (1 + 1.0 / 100) if is_l else px0 * (1 - 1.0 / 100),
+                                   bnd, split=True)
+                        if rsp is not None:
+                            res["t_split"].append(rsp)
+                        for g in SINGLE_GRID:
+                            tg = px0 * (1 + g / 100) if is_l else px0 * (1 - g / 100)
+                            r1 = _sim(f0, c["side"], e0, s0, tg, tg, split=False)
+                            if r1 is not None:
+                                res["t_single"][g].append(r1)
 
                 fired = _enter(k0, base_slip, 1.0, B.TILT_TP1_PCT, B.TILT_TP2_MARGIN)
                 if fired is not None:
@@ -454,6 +493,19 @@ def run():
                     except Exception:
                         bsc = None
                     if inw and vw_ok:
+                        st_b = sig_px * (1 - 1.0 / 100) if side == "long" else sig_px * (1 + 1.0 / 100)
+                        t1_b = sig_px * (1 + 1.0 / 100) if side == "long" else sig_px * (1 - 1.0 / 100)
+                        hg = c["hi"] - c["lo"]
+                        t2_b = (c["hi"] + hg * 0.5) if side == "long" else (c["lo"] - hg * 0.5)
+                        rsp = _sim(fut, side, ent, st_b, t1_b, t2_b, split=True)
+                        if rsp is not None:
+                            res["b_split"].append(rsp)
+                        for g in SINGLE_GRID:
+                            tg = sig_px * (1 + g / 100) if side == "long" else sig_px * (1 - g / 100)
+                            r1 = _sim(fut, side, ent, st_b, tg, tg, split=False)
+                            if r1 is not None:
+                                res["b_single"][g].append(r1)
+                    if inw and vw_ok:
                         # цели пробоя: структурные против фиксированных, как у УКЛОНА
                         for tg in BTGT_GRID:
                             if tg is None:
@@ -539,6 +591,18 @@ def run():
           "  <i>стоп 1%, TP1 1%; 0% = вход сразу по закрытию внутрь</i>"]
     for v in SENTRY_GRID:
         L.append(_line(res["sentry"][v], f"возврат на {v}% внутрь" + (" (как было)" if v == 0.0 else "")))
+
+    L += ["", "═══ <b>ДЕЛИТЬ ПОЗИЦИЮ ПОПОЛАМ ИЛИ ВЕСТИ ЦЕЛИКОМ?</b> ═══",
+          "  <i>при делении самый частый исход «TP1 + безубыток» даёт лишь ПОЛОВИНУ цели,",
+          "   а проигрыш всегда полный −1R. Целиком: победа полная, но без подстраховки</i>",
+          "", "<b>УКЛОН</b> (стоп 1%)"]
+    L.append(_line(res["t_split"], "пополам: TP1 1% + TP2 на границе (как сейчас)"))
+    for g in SINGLE_GRID:
+        L.append(_line(res["t_single"][g], f"целиком до {g}%"))
+    L += ["", "<b>ПРОБОЙ</b> (стоп 1%, в окне + VWAP)"]
+    L.append(_line(res["b_split"], "пополам: TP1 1% + TP2 за коридором"))
+    for g in SINGLE_GRID:
+        L.append(_line(res["b_single"][g], f"целиком до {g}%"))
 
     L += ["", "<b>УКЛОН: стоп × проскальзывание</b> (живьём было 0.21-0.77%)"]
     for sp in TSTOP_GRID:
