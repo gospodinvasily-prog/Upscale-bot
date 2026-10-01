@@ -59,6 +59,15 @@ SW_PIERCE   = [0.1, 0.2, 0.3]        # мин. глубина прокола з�
 SW_STOP     = [0.5, 0.75, 1.0, 1.5, None]   # стоп в %, None = за экстремум прокола + буфер
 SW_TP1      = [0.5, 0.75, 1.0, 1.5]  # первая цель, % от входа
 SW_MAXBARS  = 3                      # за сколько свечей цена должна вернуться внутрь
+# ── УДАЛЁННОСТЬ ТОЧКИ ВХОДА ОТ ГРАНИЦЫ КОРИДОРА ───────────────────────────────
+# ПРОБОЙ: насколько ДАЛЬШЕ за уровень должна уйти цена, прежде чем входим.
+#   Сейчас буфер max(0.3%, 0.15×ATR). Близко к уровню — ловим свипы; далеко —
+#   входим поздно и платим за движение. Где оптимум, не угадать, меряем.
+BENTRY_GRID = [0.1, 0.3, 0.5, 0.8, 1.2]
+# СВИП: насколько ГЛУБОКО внутрь коридора цена должна вернуться после прокола.
+#   0.0 = входим сразу по закрытию внутрь (как было); больше = ждём подтверждения
+#   разворота, вход хуже по цене, но меньше ложных.
+SENTRY_GRID = [0.0, 0.2, 0.5, 1.0]
 
 
 def _ts(c):
@@ -175,6 +184,8 @@ def run():
         "swp": {v: [] for v in SW_PIERCE},
         "swstop": {v: [] for v in SW_STOP},
         "swtp": {v: [] for v in SW_TP1},
+        "bentry": {v: [] for v in BENTRY_GRID},
+        "sentry": {v: [] for v in SENTRY_GRID},
     }
     n_ch = n_tilt = n_brk = n_swp = 0
     saved = B.ACC_MIN_SCORE
@@ -338,6 +349,35 @@ def run():
                             t2 = t1 * 1.001
                         return _sim(fut_s, side_s, ent_s, stp, t1, t2)
 
+                    # глубина возврата внутрь коридора перед входом
+                    for dep in SENTRY_GRID:
+                        if dep == 0.0:
+                            kk_ = kb
+                        else:
+                            need = swept["lvl"] * (1 - dep / 100) if swept["up"] \
+                                   else swept["lvl"] * (1 + dep / 100)
+                            kk_ = None
+                            for j in range(kb, min(kb + 8, len(fine) - hold - 1)):
+                                cc = fine[j]["c"]
+                                if (swept["up"] and cc <= need) or ((not swept["up"]) and cc >= need):
+                                    kk_ = j
+                                    break
+                        if kk_ is None:
+                            continue
+                        sg = fine[kk_]["c"]
+                        en = sg * (1 - 0.25 / 100) if side_s == "short" else sg * (1 + 0.25 / 100)
+                        st = sg * (1 + 1.0 / 100) if side_s == "short" else sg * (1 - 1.0 / 100)
+                        a1 = sg * (1 - 1.0 / 100) if side_s == "short" else sg * (1 + 1.0 / 100)
+                        a2 = opp
+                        if side_s == "short" and a2 >= a1:
+                            a2 = a1 * 0.999
+                        if side_s == "long" and a2 <= a1:
+                            a2 = a1 * 1.001
+                        ft = fine[kk_ + 1:kk_ + 1 + hold]
+                        if len(ft) >= 4:
+                            r = _sim(ft, side_s, en, st, a1, a2)
+                            if r is not None:
+                                res["sentry"][dep].append(r)
                     for p_ in SW_PIERCE:
                         if swept["pierce"] >= p_:
                             r = _swp(1.0, 1.0)
@@ -352,6 +392,28 @@ def run():
                             r = _swp(1.0, tp)
                             if r is not None:
                                 res["swtp"][tp].append(r)
+
+            # ── ПРОБОЙ: удалённость точки входа за уровень ──
+            for bd in BENTRY_GRID:
+                for sd, lvl_ in (("long", c["hi"]), ("short", c["lo"])):
+                    trg = lvl_ * (1 + bd / 100) if sd == "long" else lvl_ * (1 - bd / 100)
+                    for k in range(k0 + 1, min(k0 + watch, len(fine) - hold - 2)):
+                        bar2 = fine[k]
+                        if not (bar2["c"] > trg if sd == "long" else bar2["c"] < trg):
+                            continue
+                        ft = fine[k + 1:k + 1 + hold]
+                        if len(ft) < 4:
+                            break
+                        sg = bar2["c"]
+                        en = sg * (1 + 0.25 / 100) if sd == "long" else sg * (1 - 0.25 / 100)
+                        st = sg * (1 - 1.0 / 100) if sd == "long" else sg * (1 + 1.0 / 100)
+                        a1 = sg * (1 + 1.0 / 100) if sd == "long" else sg * (1 - 1.0 / 100)
+                        hgt = c["hi"] - c["lo"]
+                        a2 = (c["hi"] + hgt * 0.5) if sd == "long" else (c["lo"] - hgt * 0.5)
+                        r = _sim(ft, sd, en, st, a1, a2)
+                        if r is not None:
+                            res["bentry"][bd].append(r)
+                        break
 
             # ── ПРОБОЙ: только сетка VWAP ──
             hi_t = B.order_trigger(c["hi"], True, c["atr"])
@@ -456,6 +518,11 @@ def run():
         lbl = "структурные (как сейчас)" if v is None else f"стоп {v[0]}% / TP1 {v[1]}%"
         L.append(_line(res["btgt"][v], lbl))
 
+    L += ["", "<b>ПРОБОЙ: как далеко за уровень входить?</b>",
+          "  <i>стоп 1%, TP1 1%; сейчас в боте буфер max(0.3%, 0.15×ATR)</i>"]
+    for v in BENTRY_GRID:
+        L.append(_line(res["bentry"][v], f"вход за {v}% от уровня"))
+
     L += ["", "═══ <b>СВИП-РАЗВОРОТ</b> (вход ПРОТИВ прокола границы) ═══",
           "  <i>цена проколола границу коридора и закрылась обратно внутрь — входим в обратную</i>",
           "", "<b>Минимальная глубина прокола</b> (стоп 1%, TP1 1%)"]
@@ -467,6 +534,11 @@ def run():
     L += ["", "<b>TP1</b> (стоп 1%), TP2 — противоположная граница коридора"]
     for v in SW_TP1:
         L.append(_line(res["swtp"][v], f"TP1 {v}%"))
+
+    L += ["", "<b>СВИП: как глубоко внутрь коридора ждать возврата?</b>",
+          "  <i>стоп 1%, TP1 1%; 0% = вход сразу по закрытию внутрь</i>"]
+    for v in SENTRY_GRID:
+        L.append(_line(res["sentry"][v], f"возврат на {v}% внутрь" + (" (как было)" if v == 0.0 else "")))
 
     L += ["", "<b>УКЛОН: стоп × проскальзывание</b> (живьём было 0.21-0.77%)"]
     for sp in TSTOP_GRID:
