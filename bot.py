@@ -19,6 +19,7 @@ import math
 import time
 import threading
 import traceback
+import json
 import requests
 import upscale_exec
 from concurrent.futures import ThreadPoolExecutor
@@ -128,7 +129,13 @@ def fmt_minutes(m: float) -> str:
     return f"{m:.0f}м"
 
 # ── RS Momentum (ИМПУЛЬС) ──
-SCAN_INTERVAL        = 5 if MOMENTUM_ENABLED else TF_MIN  # ИМПУЛЬС — каждые 5 мин, ЗАРЯД — на границе своего таймфрейма
+# v9.1: скан зарядов раз в CHARGE_SCAN_MIN минут (было — только на закрытии часовой свечи).
+# Коридор по-прежнему из закрытых часовых свечей, но сила и уклон зависят от текущей цены,
+# OI, фандинга и тейкеров — внутри часа они меняются, и монета может стать зарядом к :30.
+# ВАЖНО: вход даём только в НОВЫЕ заряды. Повторная перепроверка старых проверена
+# бэктестом и вредна (−0.09R против +0.29R), поэтому её не включаем.
+CHARGE_SCAN_MIN      = int(os.environ.get("CHARGE_SCAN_MIN", "30"))
+SCAN_INTERVAL        = 5 if MOMENTUM_ENABLED else min(CHARGE_SCAN_MIN, TF_MIN)
 BTC_DECORR_THRESHOLD = 1.5     # % раскорр для лонга
 BTC_DECORR_SHORT     = -1.5    # % раскорр для шорта
 DECORR_WATCH         = 1.0     # % сниженный порог для монет из watchlist ЗАРЯДа
@@ -286,6 +293,7 @@ LAST_SENT: dict = {}          # (kind, sym, side) -> (ts, score)
 OI_TICKER_HIST: list = []     # [(ts, {sym: oi})] — запасной источник OI (≤75 мин)
 LAST_BTC = {"chg15": 0.0, "chgwin": 0.0, "ts": 0}
 PENDING_OUTCOMES: list = []
+PENDING_FILE = os.path.join(LOG_DIR, "pending_v9.json")
 DAY_RESULTS: list = []
 CHARGE_PENDING: list = []     # эпизоды зарядов, ждущие оценки
 CHARGE_ACTIVE: dict = {}      # sym -> текущий эпизод заряда (для пометки «бот прислал пробой»)
@@ -863,6 +871,7 @@ def log_signal(kind: str, s: dict, side: str, score: int):
                              "score": score, "entry": s["price"], "stop": s["stop"],
                              "tp1": s["tp1_price"], "tp2": s["tp2_price"], "ts": now_ts,
                              "horizon": s.get("horizon", MOM_P["horizon"])})
+    pending_save()
 
 def evaluate_outcome(p: dict):
     raw = api_get("candlesticks", {"contract": f"{p['symbol']}_USDT", "interval": "1m",
@@ -934,6 +943,7 @@ def log_charge(c: dict):
           "eval_window": c["P"]["eval_window"], "follow_min": c["P"]["follow_min"], "tf": c["P"]["tf"],
           "bot_signal": "", "side_changes": 0}
     CHARGE_PENDING.append(ep)
+    pending_save()
     CHARGE_ACTIVE[c["symbol"]] = ep
 
 def evaluate_charge(ep: dict):
@@ -1005,6 +1015,7 @@ def process_outcomes(max_items: int = 5):
         if now_ts < p["ts"] + p.get("horizon", OUTCOME_HORIZON) + 90:
             continue
         PENDING_OUTCOMES.remove(p)
+        pending_save()
         try:
             res = evaluate_outcome(p)
         except Exception as e:
@@ -1021,6 +1032,7 @@ def process_outcomes(max_items: int = 5):
         if now_ts < ep["ts"] + ep["eval_window"] + 90:
             continue
         CHARGE_PENDING.remove(ep)
+        pending_save()
         if CHARGE_ACTIVE.get(ep["symbol"]) is ep:
             CHARGE_ACTIVE.pop(ep["symbol"], None)
         try:
@@ -2207,6 +2219,9 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
             print(f"[CHARGE] {c['symbol']}: вне окна — дошлю при открытии окна")
 
         # ── 🎯 УКЛОН: сразу при заряде ─────────────────────────────────────────
+        # Повторный вход в ту же монету закрыт дневным гейтом (ONE_PER_SYMBOL_DAY),
+        # который отмечает монету ТОЛЬКО после реально отправленного сигнала,
+        # и защитой TILT_LAST_STOP: после стопа не входим, пока цена не ушла дальше него.
         if not in_tilt_window():
             print(f"[TILT] {c['symbol']}: вне окна уклона — пропуск")
             continue
@@ -2328,8 +2343,14 @@ def tg_updates():
         for u in data.get("result", []) if data.get("ok") else []:
             TG_OFFSET[0] = max(TG_OFFSET[0], u.get("update_id", 0))
             msg = u.get("message") or u.get("channel_post") or {}
+            if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
+                continue
+            doc = msg.get("document")
+            if doc and "pending" in (doc.get("file_name") or "").lower():
+                out.append(("__doc__", doc.get("file_id")))   # файл очереди оценки
+                continue
             text = (msg.get("text") or "").strip()
-            if text and str(msg.get("chat", {}).get("id")) == str(CHAT_ID):
+            if text:
                 out.append(text)
         return out
     except requests.HTTPError as e:
@@ -2472,7 +2493,7 @@ HELP_TEXT = ("<b>Команды:</b>\n"
              "/stop SEI — выбило стопом\n"
              "/skip SEI причина — сигнал пропустил\n"
              "/stat — мои сделки и проскальзывание\n"
-             "/log — прислать журналы прямо сейчас\n"
+             "/log — прислать журналы прямо сейчас | /restore — вернуть очередь оценки\n"
              "/watch — что сейчас в зарядке\n"
              "/up — статус авто-слоя Upscale | /uptest — тест: открыть и закрыть BTC на демо | /risk — баланс, просадка, лимиты\n"
              "/halt — пауза исполнения | /resume — продолжить | /closeall — закрыть всё на демо")
@@ -2528,6 +2549,10 @@ def handle_command(text: str) -> str:
         return cmd_stat()
     if cmd == "/watch":
         return cmd_watch()
+    if cmd == "/restore":
+        return ("♻️ Пришли файл pending_v9.json (он приходит вместе с журналами) "
+                "ОДНИМ сообщением, и я подниму очередь оценки. Либо просто "
+                "перешли его сюда — я подхвачу сам.")
     if cmd in ("/log", "/files", "/journal"):
         today = datetime.now(MSK).strftime("%Y-%m-%d")
         sent = 0
@@ -2560,6 +2585,9 @@ def resend_pending_charges():
 
 def poll_commands():
     for text in tg_updates():
+        if isinstance(text, tuple) and text[0] == "__doc__":
+            send_telegram(restore_from_telegram(text[1]))
+            continue
         try:
             answer = handle_command(text)
         except Exception as e:
@@ -2593,13 +2621,87 @@ def send_status(signal_count=0, btc_chg=None):
 
 # ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 
+def pending_save():
+    """Очередь оценки живёт в памяти, а на Render файловая система стирается при
+    КАЖДОМ перезапуске. Из-за этого исходы сигналов терялись безвозвратно — поэтому
+    очередь пишем в файл и шлём его в телеграм вместе с журналами. Восстановить
+    автоматически бот не может (свои же сообщения ему недоступны), но файл можно
+    прислать обратно командой /restore — см. ниже."""
+    try:
+        with open(PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump({"signals": PENDING_OUTCOMES, "charges": CHARGE_PENDING,
+                       "saved_at": int(time.time()), "ver": BOT_VERSION}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[PENDING] не сохранил: {e}")
+
+def pending_load_local():
+    """Пробуем поднять очередь с диска: помогает, когда процесс перезапустился
+    без пересборки контейнера."""
+    try:
+        if not os.path.exists(PENDING_FILE):
+            return 0
+        with open(PENDING_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        now = time.time()
+        n = 0
+        for p in d.get("signals", []):
+            if p.get("ts", 0) + p.get("horizon", OUTCOME_HORIZON) > now and \
+               not any(x["id"] == p.get("id") for x in PENDING_OUTCOMES):
+                PENDING_OUTCOMES.append(p)
+                n += 1
+        for ep in d.get("charges", []):
+            if ep.get("ts", 0) + ep.get("eval_window", 24 * 3600) > now and \
+               not any(x["id"] == ep.get("id") for x in CHARGE_PENDING):
+                CHARGE_PENDING.append(ep)
+                n += 1
+        return n
+    except Exception as e:
+        print(f"[PENDING] не восстановил: {e}")
+        return 0
+
+def restore_from_telegram(file_id: str) -> str:
+    """Скачиваем присланный файл очереди и поднимаем из него оценку."""
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+                         params={"file_id": file_id}, timeout=10)
+        p = r.json()["result"]["file_path"]
+        data = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{p}", timeout=20)
+        tmp = os.path.join(LOG_DIR, "_restore.json")
+        with open(tmp, "wb") as f:
+            f.write(data.content)
+        return pending_restore_from_file(tmp)
+    except Exception as e:
+        return f"⚠️ Не смог скачать файл: {e}"
+
+def pending_restore_from_file(path: str) -> str:
+    """Восстановление из присланного файла (команда /restore)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception as e:
+        return f"⚠️ Не смог прочитать файл: {e}"
+    now, n = time.time(), 0
+    for p in d.get("signals", []):
+        if p.get("ts", 0) + p.get("horizon", OUTCOME_HORIZON) > now and \
+           not any(x["id"] == p.get("id") for x in PENDING_OUTCOMES):
+            PENDING_OUTCOMES.append(p)
+            n += 1
+    for ep in d.get("charges", []):
+        if ep.get("ts", 0) + ep.get("eval_window", 24 * 3600) > now and \
+           not any(x["id"] == ep.get("id") for x in CHARGE_PENDING):
+            CHARGE_PENDING.append(ep)
+            n += 1
+    pending_save()
+    return (f"♻️ Восстановлено записей: {n} (сигналов {len(PENDING_OUTCOMES)}, "
+            f"зарядов {len(CHARGE_PENDING)}). Истёкшие пропущены.")
+
 def send_logs(caption_prefix: str):
     """Отправляет журналы в Telegram. Вызывается и по сводке, и ПЕРЕД перезапуском —
     на Render файлы стираются при каждом деплое, иначе статистика теряется."""
     today = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
     for path, cap in ((SIGNALS_CSV, "сигналы"), (OUTCOMES_CSV, "исходы сигналов"),
                       (CHARGES_CSV, "заряды"), (CHARGE_OUTCOMES_CSV, "исходы зарядов"),
-                      (TRADES_CSV, "мои сделки"), (EXEC_CSV, "авто-слой (dry)")):
+                      (TRADES_CSV, "мои сделки"), (EXEC_CSV, "авто-слой"), (PENDING_FILE, "ОЧЕРЕДЬ ОЦЕНКИ — пришли обратно и набери /restore")):
         send_document(path, f"{caption_prefix} {today} — {cap}")
 
 def _on_shutdown(signum, frame):
@@ -2621,8 +2723,12 @@ def main():
     # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
     bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
+    _restored = pending_load_local()
+    if _restored:
+        print(f"[PENDING] поднял с диска записей: {_restored}")
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "ДИАГНОСТИКА зарядов (bt_why.py)" if bt_mode in ("why", "8")
            else "ДЛИННЫЙ бэктест (bt_long.py)" if bt_mode in ("long", "7")
            else "ПЕРЕБОР параметров (bt_sweep.py)" if bt_mode in ("sweep2", "6", "params")
            else "СДЕЛКИ по мелким свечам (bt_trades2.py)" if bt_mode in ("trades2", "5")
@@ -2630,7 +2736,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -2652,7 +2758,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("long", "7"):
+                if bt_mode in ("why", "8"):
+                    import bt_why
+                    bt_why.main()          # почему монета не стала зарядом
+                elif bt_mode in ("long", "7"):
                     import bt_long
                     bt_long.main()         # длинная история, только 1h
                 elif bt_mode in ("sweep2", "6", "params"):
@@ -2738,7 +2847,7 @@ def main():
                 # если fast_check затянулся из-за таймаута API, скан не пропадёт на 5 минут
                 if now_msk.minute % SCAN_INTERVAL == 0 and aligned != last_scan_key:
                     last_scan_key = aligned
-                    result = run_scan(do_charge=(now_msk.minute % TF_MIN == 0),
+                    result = run_scan(do_charge=(now_msk.minute % CHARGE_SCAN_MIN == 0),
                                       do_btc=(now_msk.minute % BTC_P["tf_min"] == 0))
                     if result:
                         last_signal_count, last_btc = result
