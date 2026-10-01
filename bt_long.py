@@ -42,6 +42,10 @@ TSTOP_GRID  = [0.5, 0.75, 1.0, 1.25]
 TP1_GRID    = [0.5, 0.75, 1.0, 1.5]         # % от входа
 TP2M_GRID   = [0.0, 0.2, 0.5]               # отступ TP2 от границы коридора, %
 RECHECK_MIN = [60, 30, 15, 5]               # как часто перепроверять вход УКЛОНА
+# ПРОБОЙ: живой бот торгует только в окна отправки и требует объём ≥2× на минутной
+# свече. Прошлый прогон этого не учитывал — туда попали все пробои подряд, круглосуточно.
+BRVOL_GRID  = [1.0, 1.3, 1.6, 2.0]          # объём свечи пробоя (на 15m, не равно порогу бота)
+BSCORE_GRID = [0, 1, 2, 3]                  # сила пробоя (в бэктесте ниже живой на 2-3)
 
 
 def _ts(c):
@@ -116,6 +120,14 @@ def _line(rs, label):
             f"(±{1.96*se:.3f}), ПФ {pf:.2f}, {sum(rs):+.0f}R")
 
 
+def _in_window(ts):
+    """Попадает ли время в окна отправки бота (МСК)."""
+    import datetime as _dt
+    t = _dt.datetime.fromtimestamp(ts, _dt.timezone.utc) + _dt.timedelta(hours=3)
+    nm = t.hour * 60 + t.minute
+    return any(h1 * 60 + m1 <= nm < h2 * 60 + m2 for h1, m1, h2, m2 in B.SIGNAL_WINDOWS)
+
+
 def _vwap_atr(fine, k, bars_day):
     lo = max(0, k - bars_day)
     seg = fine[lo:k + 1]
@@ -143,6 +155,9 @@ def run():
         "tp1": {v: [] for v in TP1_GRID},
         "tp2m": {v: [] for v in TP2M_GRID},
         "recheck": {v: [] for v in RECHECK_MIN},
+        "bwin": {True: [], False: []},
+        "brvol": {v: [] for v in BRVOL_GRID},
+        "bscore": {v: [] for v in BSCORE_GRID},
     }
     n_ch = n_tilt = n_brk = 0
     saved = B.ACC_MIN_SCORE
@@ -206,10 +221,16 @@ def run():
                     d = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
                     if d < B.TILT_MIN_DIST_PCT:
                         return None
+                    # ВАЖНО: стоп и TP1 бот считает от цены СИГНАЛА, а входит по
+                    # фактической (хуже на величину проскальзывания). Если считать
+                    # их от факта, бэктест льстит тесным стопам: при стопе 0.5% и
+                    # проскальзывании 0.25% реальная дистанция до стопа 0.75%, то есть
+                    # риск в полтора раза больше задуманного (живьём на SAND так и вышло:
+                    # план $15, факт $21.6). Поэтому уровни — от px, вход — по ent.
                     ent = px * (1 + slip / 100) if is_l else px * (1 - slip / 100)
-                    stp = ent * (1 - stop_pct / 100) if is_l else ent * (1 + stop_pct / 100)
-                    t1 = ent * (1 + tp1_pct / 100) if is_l else ent * (1 - tp1_pct / 100)
-                    m = ent * tp2_m / 100
+                    stp = px * (1 - stop_pct / 100) if is_l else px * (1 + stop_pct / 100)
+                    t1 = px * (1 + tp1_pct / 100) if is_l else px * (1 - tp1_pct / 100)
+                    m = px * tp2_m / 100
                     t2 = (bnd - m) if is_l else (bnd + m)
                     if is_l and t2 <= t1:
                         t2 = t1 * 1.001
@@ -264,8 +285,9 @@ def run():
                     for kk_, vv_ in (("created", 0), ("funding", 0.0), ("change_24h", 0.0),
                                      ("oi_win", None), ("oi_15m", None), ("P", B.ALT_P)):
                         w.setdefault(kk_, vv_)
-                    ent = bar["c"] * (1 + 0.25 / 100) if side == "long" else bar["c"] * (1 - 0.25 / 100)
-                    bo = B.build_breakout(dict(w), side, ent, 0.0, None)
+                    sig_px = bar["c"]                      # цена сигнала
+                    ent = sig_px * (1 + 0.25 / 100) if side == "long" else sig_px * (1 - 0.25 / 100)
+                    bo = B.build_breakout(dict(w), side, sig_px, 0.0, None)   # уровни от сигнала
                     r = _sim(fut, side, ent, bo["stop"], bo["tp1_price"], bo["tp2_price"])
                     if r is None:
                         continue
@@ -273,6 +295,26 @@ def run():
                     for thr in VWAP_GRID:
                         if thr is None or (va is not None and va <= thr):
                             res["vwap"][thr].append(r)
+                    # окно отправки по МСК — живой бот вне его не торгует
+                    inw = _in_window(_ts(bar))
+                    vw_ok = va is None or va <= B.VWAP_MAX_ATR
+                    res["bwin"][inw].append(r)
+                    rv_b = bar["v"] / vol_fine
+                    bo["pace"] = rv_b
+                    bo.setdefault("delta", None)
+                    bo.setdefault("ext_atr", 0.0)
+                    try:
+                        bsc = B.analyze_breakout(bo)[0]
+                    except Exception:
+                        bsc = None
+                    if inw and vw_ok:                       # база: окно + VWAP как в боте
+                        for rt in BRVOL_GRID:
+                            if rv_b >= rt:
+                                res["brvol"][rt].append(r)
+                        if bsc is not None:
+                            for bt_ in BSCORE_GRID:
+                                if bsc >= bt_:
+                                    res["bscore"][bt_].append(r)
                     n_brk += 1
                     last_ts = _ts(fut[-1])
                     done = True
@@ -294,6 +336,18 @@ def run():
     for v in VWAP_GRID:
         L.append(_line(res["vwap"][v], f"VWAP {'выкл' if v is None else f'≤{v}'}"))
 
+    L += ["", "<b>ПРОБОЙ: торговать только в окна отправки?</b>",
+          f"  <i>окна бота: {B.windows_txt()} МСК</i>"]
+    L.append(_line(res["bwin"][True], "в окне"))
+    L.append(_line(res["bwin"][False], "вне окна (бот туда не ходит)"))
+    L += ["", f"<b>ПРОБОЙ: фильтр объёма</b> (в окне + VWAP ≤{B.VWAP_MAX_ATR})"]
+    for v in BRVOL_GRID:
+        L.append(_line(res["brvol"][v], f"объём ≥{v}×" + (" (выкл)" if v <= 1.0 else "")))
+    L += ["", f"<b>ПРОБОЙ: порог силы</b> (в окне + VWAP ≤{B.VWAP_MAX_ATR})",
+          "  <i>в бэктесте сила ниже живой на 2-3 — живой порог ставить выше</i>"]
+    for v in BSCORE_GRID:
+        L.append(_line(res["bscore"][v], f"сила ≥{v}" + (" (как сейчас — фильтра нет)" if v == 0 else "")))
+
     L += ["", "<b>УКЛОН: стоп × проскальзывание</b> (живьём было 0.21-0.77%)"]
     for sp in TSTOP_GRID:
         row = []
@@ -303,7 +357,9 @@ def run():
         L.append(f"  стоп {sp:>5}% | " + " | ".join(f"{s} при {sl}%" for s, sl in zip(row, SLIP_GRID)))
     best = max(res["stop"].items(), key=lambda kv: (sum(kv[1]) / len(kv[1])) if kv[1] else -9)
     L.append(f"  → лучшее сочетание: стоп {best[0][0]}% при проскальзывании {best[0][1]}%")
-    L.append("  <i>смотри колонку 0.25% — она ближе всего к реальности</i>")
+    L.append("  <i>смотри колонку 0.25% — она ближе всего к реальности. Стоп и цели "
+             "считаются от цены СИГНАЛА, вход по факту — как в боте, поэтому "
+             "проскальзывание реально увеличивает дистанцию до стопа</i>")
 
     L += ["", "<b>УКЛОН: TP1</b> (стоп 1%, проскальзывание 0.25%)"]
     for v in TP1_GRID:
