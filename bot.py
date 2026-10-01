@@ -2576,13 +2576,14 @@ def main():
     bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "ДЛИННЫЙ бэктест (bt_long.py)" if bt_mode in ("long", "7")
            else "ПЕРЕБОР параметров (bt_sweep.py)" if bt_mode in ("sweep2", "6", "params")
            else "СДЕЛКИ по мелким свечам (bt_trades2.py)" if bt_mode in ("trades2", "5")
            else "СДЕЛКИ (bt_trades.py)" if bt_mode in ("trades", "4", "trade")
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -2604,7 +2605,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("sweep2", "6", "params"):
+                if bt_mode in ("long", "7"):
+                    import bt_long
+                    bt_long.main()         # длинная история, только 1h
+                elif bt_mode in ("sweep2", "6", "params"):
                     import bt_sweep
                     bt_sweep.main()        # перебор параметров (пункты 4-7)
                 elif bt_mode in ("trades2", "5"):
