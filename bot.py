@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v9.3"
+BOT_VERSION    = "v9.6"
 
 TRADING_START_MSK = 4          # v8.8: было 5 — но окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -89,10 +89,18 @@ TILT_LAST_STOP = {}   # {"SYM:long": stop_price, "SYM:short": stop_price}
 # Без них: 62 сделки в день, винрейт 68%, просадка −146%.
 # С ними:  4.6 сделки в день, винрейт 78%, просадка −4%, худший день −2.8%.
 VWAP_MAX_ATR       = 2.5   # v8.5: было 2.0 — не входить, если цена уже дальше 2.5 ATR от дневного VWAP (главный фильтр)
-DAILY_MAX_SIGNALS  = 15    # потолок на случай ненормального дня; обычно столько не набирается —
-                           # ограничения «1 монета в день» и «≤2 в сторону за 30 мин» держат 5–9 сигналов
+DAILY_MAX_SIGNALS  = 0     # v9.5: ВЫКЛЮЧЕНО (было 15). В бэктесте (+0.32R на 818 сделках)
+                           # лимита не было, а ориентир теперь — денежный риск, а не счётчик.
+                           # Защита по просадке в исполнителе остаётся: стоп входов при −$300,
+                           # аварийное закрытие при −$400.
 ONE_PER_SYMBOL_DAY = True  # одна монета — одна сделка в день
-MAX_SAME_SIDE_30M  = 2     # не больше 2 сигналов в одну сторону за 30 минут (против кластеров)
+MAX_SAME_SIDE_30M  = 5     # v9.6: было 2. Правило писалось под ПРОБОЙ. У УКЛОНА заряды
+                           # находятся пачкой раз в 30 мин по природе скана, и одна сторона
+                           # у них потому, что рынок разворачивается. На журнале за 30.09
+                           # порог 2 съедал 11 сделок из 29 (38%). Совсем снимать не стали:
+                           # пять шортов разом — это одна ставка на $100 риска, и при
+                           # отскоке выбьет все сразу (бэктест этого не видит, он считает
+                           # сделки независимыми).
 DAY_STOP_LOSSES    = 5     # после 5 закрытых убытков за день бот замолкает до завтра
                            # (5 × риск $20 = $100 из дневного лимита $150)
 MSK = timezone(timedelta(hours=3))
@@ -1369,6 +1377,9 @@ def order_trigger(level: float, is_long: bool, atr: float = 0.0) -> float:
     return level + buf if is_long else level - buf
 
 
+def tilt_windows_txt() -> str:
+    return ", ".join(f"{h1:02d}:{m1:02d}–{h2:02d}:{m2:02d}" for h1, m1, h2, m2 in TILT_WINDOWS)
+
 def in_tilt_window() -> bool:
     """Окно работы УКЛОНА: 4:00-21:00 МСК кроме 12:00-14:30."""
     now = datetime.now(MSK)
@@ -1472,9 +1483,11 @@ def charge_verdict(c: dict) -> str:
         facts.append(f"разогрета ({c['change_24h']:+.0f}% за сутки)")
     tail = ", ".join(facts[:3])
     if s >= 9:
-        act = f"Ставлю ордера {side}, полный размер."
+        act = (f"Ставлю ордера {side}, полный размер." if BREAKOUT_ENABLED
+               else f"Беру {side} по рынку, полный размер.")
     elif s >= 7:
-        act = f"Ставлю ордера {side}, веду строго по стопу."
+        act = (f"Ставлю ордера {side}, веду строго по стопу." if BREAKOUT_ENABLED
+               else f"Беру {side} по рынку, веду строго по стопу.")
     else:
         act = ("Слабоват: ордера только если по пути с BTC." if c["side"] != "both"
                else "Слабый и без направления — можно пропустить.")
@@ -1507,8 +1520,12 @@ def format_charge(c: dict) -> str:
         lines.append(f"Ликвидации {WT}: шортов {fmt_usd(c['liq_short_win'])} / лонгов {fmt_usd(c['liq_long_win'])}")
     # v8.3: готовые ордера — по бэктесту вход ПО УРОВНЮ даёт +0.21% на сделку,
     # а вход после закрытия свечи (то есть по факту сообщения) — минус.
-    lines.append("📥 <b>Ордера (Stop Market, ставить заранее):</b>")
-    for want, level, stop_lvl in (("long", c["hi"], up_stop), ("short", c["lo"], dn_stop)):
+    # v9.6: ПРОБОЙ отключён, ордера по уровням больше не ставим — блок показывался
+    # по инерции и путал: бот по этим ценам не торгует.
+    if BREAKOUT_ENABLED:
+        lines.append("📥 <b>Ордера (Stop Market, ставить заранее):</b>")
+    for want, level, stop_lvl in ((("long", c["hi"], up_stop), ("short", c["lo"], dn_stop))
+                                  if BREAKOUT_ENABLED else ()):
         if c["side"] not in (want, "both"):
             continue
         is_long = want == "long"
@@ -1525,13 +1542,33 @@ def format_charge(c: dict) -> str:
         pl = position_line(trig, dist)
         if pl:
             lines.append(pl.rstrip())
+    if TILT_ENABLED and c["side"] in ("long", "short"):
+        is_l = c["side"] == "long"
+        bnd = c["hi"] if is_l else c["lo"]
+        px = c["price"]
+        d = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
+        if d >= TILT_MIN_DIST_PCT:
+            st = px * (1 - TILT_STOP_PCT / 100) if is_l else px * (1 + TILT_STOP_PCT / 100)
+            t1 = px * (1 + TILT_TP1_PCT / 100) if is_l else px * (1 - TILT_TP1_PCT / 100)
+            t3 = px * (1 + TILT_TP3_PCT / 100) if is_l else px * (1 - TILT_TP3_PCT / 100)
+            lines.append(f"🎯 <b>УКЛОН — вход по рынку сейчас:</b> {px:.6g}")
+            lines.append(f"   стоп {st:.6g} (−{TILT_STOP_PCT}%) | до границы {d:.2f}%")
+            lines.append(f"   цели по трети: {t1:.6g} → {bnd:.6g} (граница) → {t3:.6g}")
+            lines.append(f"   стоп подтягивается после каждой из первых двух")
+            pl = position_line(px, TILT_STOP_PCT)
+            if pl:
+                lines.append(pl.rstrip())
+        else:
+            lines.append(f"⏭ УКЛОН не берём: до границы {d:.2f}% — меньше {TILT_MIN_DIST_PCT}%")
+    elif TILT_ENABLED:
+        lines.append("⏭ УКЛОН не берём: уклон неясен (both)")
     lines.append("🔎 <b>Анализ:</b>")
     for n in c["plus"][:3]:      lines.append(f"  ✅ {esc(n)}")
     for n in c["dir_notes"][:3]: lines.append(f"  🧭 {esc(n)}")
     for n in c["minus"][:3]:     lines.append(f"  ⚠️ {esc(n)}")
     lines.append(charge_verdict(c))
-    notes = [f"ордера действуют до {msk_time_str(time.time() + P['watch_ttl_min'] * 60)}"]
-    if c["side"] == "both":
+    notes = [f"заряд живёт до {msk_time_str(time.time() + P['watch_ttl_min'] * 60)}"]
+    if c["side"] == "both" and BREAKOUT_ENABLED:
         notes.append("направление неясно — ставь обе стороны")
     if c["symbol"] == "BTC":
         notes.append("пробой BTC задаёт направление альтам")
@@ -1799,7 +1836,9 @@ def fast_check():
                 reasons.append(f"вне окна отправки ({windows_txt()} МСК)")
             if reasons:
                 print(f"[BREAKOUT] {sym} {side}: уровень взят, но {'; '.join(reasons)}")
-                if not LAST_SENT.get(("warn", sym, side)):
+                # v9.6: предупреждение имело смысл, пока ты ставил отложенные ордера
+                # по сообщению заряда. ПРОБОЙ отключён, ордеров нет — сообщать не о чем.
+                if BREAKOUT_ENABLED and not LAST_SENT.get(("warn", sym, side)):
                     LAST_SENT[("warn", sym, side)] = (time.time(), 0)
                     arrow = "🟢 вверх" if side == "long" else "🔴 вниз"
                     send_telegram(
@@ -2230,20 +2269,38 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
         # Повторный вход в ту же монету закрыт дневным гейтом (ONE_PER_SYMBOL_DAY),
         # который отмечает монету ТОЛЬКО после реально отправленного сигнала,
         # и защитой TILT_LAST_STOP: после стопа не входим, пока цена не ушла дальше него.
+        # v9.4: причины отказа уходили только в лог Render — со стороны выглядело,
+        # будто бот молча игнорирует заряд. Теперь говорит, почему не зашёл.
+        skip = None
         if not in_tilt_window():
-            print(f"[TILT] {c['symbol']}: вне окна уклона — пропуск")
-            continue
-        tilt = build_tilt(c)
-        if tilt is None:
-            print(f"[TILT] {c['symbol']}: условия не выполнены (score={c['score']} side={c['side']})")
-            continue
-        ok, why = gate_allows(c["symbol"], c["side"])
-        if not ok:
-            print(f"[TILT] {c['symbol']}: гейт — {why}")
-            continue
-        vw_ok, vw_txt, _ = vwap_filter(c["symbol"], c["price"])
-        if not vw_ok:
-            print(f"[TILT] {c['symbol']}: VWAP — {vw_txt}")
+            skip = f"вне окна УКЛОНА ({tilt_windows_txt()} МСК)"
+        tilt = build_tilt(c) if not skip else None
+        if not skip and tilt is None:
+            if c["side"] == "both":
+                skip = "уклон неясен (both) — направление не определено"
+            else:
+                is_l = c["side"] == "long"
+                bnd = c["hi"] if is_l else c["lo"]
+                d = (bnd - c["price"]) / c["price"] * 100 if is_l else (c["price"] - bnd) / c["price"] * 100
+                key = f"{c['symbol']}:{c['side']}"
+                if key in TILT_LAST_STOP:
+                    skip = (f"после стопа на {TILT_LAST_STOP[key]:.6g} цена не ушла дальше "
+                            f"(сейчас {c['price']:.6g})")
+                elif d < TILT_MIN_DIST_PCT:
+                    skip = f"до границы {d:.2f}% — меньше {TILT_MIN_DIST_PCT}%"
+                else:
+                    skip = f"условия не выполнены (сила {c['score']}, уклон {c['side']})"
+        if not skip:
+            ok, why = gate_allows(c["symbol"], c["side"])
+            if not ok:
+                skip = why
+        if not skip:
+            vw_ok, vw_txt, _ = vwap_filter(c["symbol"], c["price"])
+            if not vw_ok:
+                skip = vw_txt
+        if skip:
+            print(f"[TILT] {c['symbol']}: {skip}")
+            send_telegram(f"⏭ <b>{c['symbol']}</b>: заряд есть, но в сделку не иду — {skip}")
             continue
         print(f"[TILT] {c['symbol']} {c['side']} score={c['score']} dist={tilt['dist_pct']:.2f}%")
         send_blocks(format_tilt(tilt).split("\n"))

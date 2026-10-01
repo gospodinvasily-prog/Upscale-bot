@@ -41,6 +41,14 @@ STOP = 1.0
 # на символические 0.1% за TP2 — то есть третья цель вырождается в дубль второй.
 # Проверяем вариант «от ГРАНИЦЫ»: граница + доля высоты коридора. Тогда цель всегда
 # стоит за пробоем, независимо от ширины.
+# Фильтр VWAP для УКЛОНА никогда не проверялся: бэктест (+0.32R) торговал заряды
+# подряд, без него. Сейчас в боте стоит 2.5 ATR по инерции от ПРОБОЯ, который отключён.
+VWAP_GRID = [None, 1.5, 2.0, 2.5, 3.0, 4.0]   # None = фильтра нет
+# Минимальный ход до границы коридора. Сейчас 1%. По живому журналу за 01.10 этот
+# фильтр отсеял 24 заряда из 46 — больше, чем все остальные вместе. Причина понятна:
+# когда уклон шортовый, цена прижата к НИЖНЕЙ границе, и ходу вниз мало по определению.
+# Но порог 1% стоял и в бэктесте, давшем +0.32R, — возможно, он не режет, а защищает.
+DIST_GRID = [0.0, 0.5, 0.75, 1.0, 1.5, 2.0]
 TP3_MODES = [("от входа +2% (как сейчас)", None),
              ("граница + 25% высоты", 0.25),
              ("граница + 50% высоты", 0.50),
@@ -70,6 +78,21 @@ def _fetch(sym, tf, days):
             seen.add(c.get("t"))
             uniq.append(c)
     return uniq
+
+
+def _vwap_dist(fine, k, bars_day):
+    """Насколько цена ушла от дневного VWAP, в ATR. Только прошлые свечи."""
+    lo = max(0, k - bars_day)
+    seg = fine[lo:k + 1]
+    if len(seg) < 10:
+        return None
+    vv = sum(c["v"] for c in seg)
+    if vv <= 0:
+        return None
+    vwap = sum((c["h"] + c["l"] + c["c"]) / 3 * c["v"] for c in seg) / vv
+    trs = B.true_ranges(seg)
+    atr = B.trimmed_mean(trs) if trs else 0
+    return abs(fine[k]["c"] - vwap) / atr if atr else None
 
 
 def _sim3(bars, side, entry, stop, t1, t2, t3):
@@ -128,6 +151,7 @@ def run():
     pairs = B.UPSCALE_PAIRS[:PAIRS_N] if PAIRS_N else B.UPSCALE_PAIRS
     step = TF_SEC[FINE_TF]
     hold = max(6, int(HOLD_H * 3600 / step))
+    bars_day = int(24 * 3600 / step)
 
     # один проход с самыми мягкими порогами, отбор — потом
     saved = (B.ACC_MIN_SCORE, B.ACC_RVOL_MIN, B.ACC_SQUEEZE_PCTL, B.ACC_MAX_RANGE_ABS)
@@ -138,6 +162,8 @@ def run():
 
     trades = []          # (score, rvol, sq, tr, rng, R)
     tp3res = {name: [] for name, _ in TP3_MODES}
+    vwres = {v: [] for v in VWAP_GRID}
+    distres = {v: [] for v in DIST_GRID}
     # КОНТРОЛЬ: то же самое, но вход в СЛУЧАЙНЫЙ момент. Если преимущество даёт схема
     # выходов (три цели + двойная подтяжка), а не сигнал, случайный вход покажет тот же
     # плюс. Если сигнал настоящий — случайный уйдёт в ноль или минус.
@@ -195,7 +221,7 @@ def run():
                 is_l = c["side"] == "long"
                 bnd = c["hi"] if is_l else c["lo"]
                 room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
-                if room < B.TILT_MIN_DIST_PCT:
+                if room < min(DIST_GRID):          # самый мягкий порог сетки
                     continue
                 fut = fine[k0 + 1:k0 + 1 + hold]
                 if len(fut) < 4:
@@ -207,6 +233,16 @@ def run():
                 r = _sim3(fut, c["side"], ent, stp, y1, bnd, y3)
                 if r is None:
                     continue
+                for dt_ in DIST_GRID:
+                    if room >= dt_:
+                        distres[dt_].append(r)
+                if room < B.TILT_MIN_DIST_PCT:     # дальше — только то, что берёт бот
+                    continue
+                # фильтр VWAP: на тех же входах, разные пороги
+                vd = _vwap_dist(fine, k0, bars_day)
+                for vt in VWAP_GRID:
+                    if vt is None or vd is None or vd <= vt:
+                        vwres[vt].append(r)
                 # варианты третьей цели — на тех же входах
                 hgt = c["hi"] - c["lo"]
                 for name, frac in TP3_MODES:
@@ -307,6 +343,39 @@ def run():
           "   код отодвигает её на 0.1% за вторую — и третья цель вырождается в дубль второй</i>"]
     for name, _f in TP3_MODES:
         L.append(_line(tp3res[name], name))
+
+    L += ["", "<b>МИНИМАЛЬНЫЙ ХОД ДО ГРАНИЦЫ</b> — главный резак по живому журналу",
+          "  <i>за 01.10 отсеял 24 заряда из 46. При шортовом уклоне цена прижата",
+          "   к нижней границе, и ходу мало по определению. Режет или защищает?</i>"]
+    for dt_ in DIST_GRID:
+        L.append(_line(distres[dt_], ("без фильтра" if dt_ == 0 else f"ход ≥{dt_}%")
+                       + (" (сейчас)" if dt_ == 1.0 else "")))
+    cur = distres.get(1.0) or []
+    if cur:
+        e_cur = sum(cur) / len(cur)
+        best = max(((v, a) for v, a in distres.items() if len(a) >= 100),
+                   key=lambda kv: sum(kv[1]) / len(kv[1]), default=None)
+        if best:
+            e_b = sum(best[1]) / len(best[1])
+            L.append(f"  → лучший порог {best[0]}%: {len(best[1])} сд, {e_b:+.3f}R против "
+                     f"{len(cur)} сд и {e_cur:+.3f}R при нынешнем 1%")
+
+    L += ["", "<b>ФИЛЬТР VWAP для УКЛОНА</b> — никогда не проверялся",
+          "  <i>в боте стоит 2.5 ATR по инерции от ПРОБОЯ. Бэктест, давший +0.32R,",
+          "   работал БЕЗ него — торговал заряды подряд</i>"]
+    for vt in VWAP_GRID:
+        L.append(_line(vwres[vt], "без фильтра" if vt is None else
+                       f"не дальше {vt} ATR от VWAP" + (" (сейчас)" if vt == 2.5 else "")))
+    _off = vwres.get(None) or []
+    if _off:
+        e_off = sum(_off) / len(_off)
+        cand = [(v, a) for v, a in vwres.items() if v is not None and len(a) >= 100]
+        if cand:
+            bv, ba = max(cand, key=lambda kv: sum(kv[1]) / len(kv[1]))
+            e_b = sum(ba) / len(ba)
+            L.append(f"  → лучший порог {bv} ATR: {len(ba)} сд, {e_b:+.3f}R против "
+                     f"{len(_off)} сд и {e_off:+.3f}R без фильтра "
+                     f"({'стоит оставить' if e_b - e_off > 0.02 else 'разницы нет — можно снять'})")
 
     L += ["", "═══ <b>КОНТРОЛЬ: а не схема ли выходов даёт плюс?</b> ═══",
           "  <i>та же схема (3 цели по трети, двойная подтяжка стопа), но вход",
