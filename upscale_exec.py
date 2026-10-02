@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "2.3"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.4"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -41,6 +41,12 @@ MARGIN_BUFFER = Decimal(os.environ.get("EXEC_MARGIN_BUFFER", "0.005"))  # зап
 MAX_CHASE_ATR = float(os.environ.get("EXEC_MAX_CHASE_ATR", "0.3"))
 TP_DELAY_SEC  = int(os.environ.get("EXEC_TP_DELAY_SEC", "65"))
 MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "0"))       # 0 = без лимита, ориентир только на риск
+# v2.4: лимит на ОДНОВРЕМЕННО открытые позиции в одну сторону. В боте есть похожее
+# правило, но оно считает СИГНАЛЫ за последние 30 минут, а не открытые позиции:
+# три сделки, открытые 40 минут назад, из счётчика выпадали, и пачка проходила заново —
+# так набиралось 6 позиций в одну сторону вместо пяти. Здесь считаем то, что реально
+# висит на счёте, и это уже не обойти временем.
+MAX_SAME_SIDE_OPEN = int(os.environ.get("EXEC_MAX_SAME_SIDE", "5"))
 MAX_TRADES_DAY = int(os.environ.get("EXEC_MAX_TRADES_DAY", "0"))  # 0 = без лимита, ориентир только на риск
 # Защита по просадке — доли от лимитов счёта (при 5%/10%: стоп входов 3%/6%, аварийное закрытие 4%/7%)
 DAY_SOFT_FRAC = Decimal(os.environ.get("EXEC_DAY_SOFT_FRAC", "0.6"))
@@ -597,6 +603,11 @@ class Executor:
             return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
         if any(_pos_market(p) == mid for p in pos_now):
             return "пропуск: по монете уже есть позиция"
+        if MAX_SAME_SIDE_OPEN:
+            same = sum(1 for p in pos_now if _pos_dir(p) == side)
+            if same >= MAX_SAME_SIDE_OPEN:
+                return (f"пропуск: уже {same} открытых позиций в {side} "
+                        f"(лимит {MAX_SAME_SIDE_OPEN}) — не набираем одну ставку")
         before = {_pos_id(p) for p in pos_now}
         live = set(before)
         self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
