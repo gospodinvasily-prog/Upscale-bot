@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "2.1"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.2"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -965,29 +965,47 @@ class Executor:
 
         L.append(f"Рынков опрошено: {len(want)} | записей: {len(rows)}")
         if fields:
-            L.append("Поля записи: " + ", ".join(fields[:18]))
+            L.append(f"Поля записи ({len(fields)}): " + ", ".join(fields))
+            ex0 = rows[0]
+            L.append("Пример записи: " + _trunc({k: ex0.get(k) for k in fields[:14]}, 600))
         if not rows:
             return "\n".join(L + ["Записей нет. Если поля выше пустые — пришли мне эту строку."])
 
         # 3) считаем, если есть поле с результатом
+        def _money(pv):
+            """v2.2: значения приходят в fp9 (×10⁹) и БЕЗ точки. Прошлая проверка
+            по длине строки срабатывала не всегда — получались миллиарды долларов.
+            Теперь: целое без точки считаем fp9 всегда, дробное берём как есть."""
+            if pv is None:
+                return None
+            t = str(pv).strip()
+            if not t or t in ("None", "null"):
+                return None
+            try:
+                if "." in t or "e" in t.lower():
+                    return Decimal(t)
+                return from_fp9(t)          # целое → это fp9
+            except Exception:
+                return None
+
+        pnl_field = None
+        for cand in ("pnl", "realizedPnl", "realized_pnl", "profit", "netPnl",
+                     "closedPnl", "pnlRealized", "income"):
+            if any(cand in o for o in rows):
+                pnl_field = cand
+                break
         wins, losses, pnl = [], [], Decimal(0)
         for o in rows:
-            pv = pick(o, "pnl", "realizedPnl", "profit", "netPnl", "realized_pnl")
-            if pv is None:
-                continue
-            try:
-                t = str(pv).lstrip("-")
-                v = from_fp9(pv) if t.isdigit() and len(t) > 9 else Decimal(str(pv))
-            except Exception:
-                continue
-            if v == 0:
+            v = _money(o.get(pnl_field)) if pnl_field else None
+            if v is None or v == 0:
                 continue
             pnl += v
             (wins if v > 0 else losses).append(v)
         n = len(wins) + len(losses)
         if not n:
-            return "\n".join(L + ["", "В ордерах нет поля с результатом сделки — "
-                                   "пришли мне строку «Поля записи», подстрою разбор."])
+            return "\n".join(L + ["", "В ордерах нет поля с результатом сделки "
+                                   f"(искал: pnl, realizedPnl, profit, netPnl; нашёл {pnl_field}). "
+                                   "Пришли мне строки «Поля записи» и «Пример записи»."])
         risk = Decimal(str(self.risk_usd)) or Decimal(1)
         gl = abs(sum(losses)) or Decimal(0)
         pf = (sum(wins) / gl) if gl > 0 else Decimal(0)
@@ -996,6 +1014,7 @@ class Executor:
               f"Итог: <b>${pnl:+.2f}</b> = <b>{pnl/risk:+.2f}R</b>",
               f"Средняя сделка: ${pnl/n:+.2f} = <b>{pnl/n/risk:+.3f}R</b>",
               f"Профит-фактор: {pf:.2f} | плюсовых {len(wins)}, минусовых {len(losses)}",
+              f"<i>поле результата: {pnl_field}</i>",
               "",
               "<i>Бэктест обещает +0.32R на сделку — сравнивай со «средней сделкой»</i>"]
         return "\n".join(L)
