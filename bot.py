@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v9.9"
+BOT_VERSION    = "v9.10"
 
 TRADING_START_MSK = 4          # окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -299,6 +299,11 @@ MOM_P = tf_profile("5m")        # ИМПУЛЬС всегда на 5м — ег�
 
 # ─── UPSCALE PAIRS ────────────────────────────────────────────────────────────
 
+# v9.10: монеты, которые не торгуем. Задаётся переменной EXCLUDE_SYMBOLS через запятую,
+# например EXCLUDE_SYMBOLS=ENA,POPCAT. Кода менять не надо.
+EXCLUDE_SYMBOLS = {x.strip().upper() for x in
+                   (os.environ.get("EXCLUDE_SYMBOLS") or "").split(",") if x.strip()}
+
 UPSCALE_PAIRS = [
     "ETH","BNB","XRP","SOL","AAVE","ADA","AERO","ALGO","APT","ARB",
     "ASTER","ATOM","AVAX","AXS","BCH","BERA","BONK","BRETT","BSV",
@@ -312,6 +317,8 @@ UPSCALE_PAIRS = [
     "TAO","TIA","TRUMP","TRX","TURBO","UNI","VET","VIRTUAL","WAL",
     "WIF","WLD","XLM","XMR","XTZ","ZEC","ZRO","0G"
 ]
+if EXCLUDE_SYMBOLS:                      # v9.10: монеты из EXCLUDE_SYMBOLS не торгуем
+    UPSCALE_PAIRS = [p for p in UPSCALE_PAIRS if p.upper() not in EXCLUDE_SYMBOLS]
 
 # ─── ГЛОБАЛЬНОЕ СОСТОЯНИЕ ────────────────────────────────────────────────────
 
@@ -321,6 +328,7 @@ OI_TICKER_HIST: list = []     # [(ts, {sym: oi})] — запасной исто�
 LAST_BTC = {"chg15": 0.0, "chgwin": 0.0, "ts": 0}
 PENDING_OUTCOMES: list = []
 PENDING_FILE = os.path.join(LOG_DIR, "pending_v9.json")
+GATE_FILE    = os.path.join(LOG_DIR, "daygate_v9.json")
 DAY_RESULTS: list = []
 CHARGE_PENDING: list = []     # эпизоды зарядов, ждущие оценки
 CHARGE_ACTIVE: dict = {}      # sym -> текущий эпизод заряда (для пометки «бот прислал пробой»)
@@ -1144,11 +1152,40 @@ def gate_allows(sym: str, side: str) -> tuple:
         return False, f"уже {MAX_SAME_SIDE_30M} сигнала в {side} за последние 30 мин"
     return True, ""
 
+def gate_save():
+    """v9.10: дневной гейт жил только в памяти — после перезапуска обнулялся,
+    и бот заново входил в монеты, по которым сегодня уже торговал (так ENA
+    набрала четыре входа). Теперь пишем на диск вместе с очередью оценки."""
+    try:
+        with open(GATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({**DAY_GATE, "syms": sorted(DAY_GATE["syms"])}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[GATE] не сохранил: {e}")
+
+def gate_load():
+    """Поднимаем дневной гейт с диска, если он за сегодня."""
+    try:
+        if not os.path.exists(GATE_FILE):
+            return 0
+        with open(GATE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("date") != datetime.now(MSK).strftime("%Y-%m-%d"):
+            return 0
+        DAY_GATE.update({"date": d["date"], "sent": int(d.get("sent", 0)),
+                         "losses": int(d.get("losses", 0)),
+                         "syms": set(d.get("syms") or []),
+                         "recent": [tuple(x) for x in (d.get("recent") or [])]})
+        return len(DAY_GATE["syms"])
+    except Exception as e:
+        print(f"[GATE] не восстановил: {e}")
+        return 0
+
 def gate_register(sym: str, side: str):
     _day_reset()
     DAY_GATE["sent"] += 1
     DAY_GATE["syms"].add(sym)
     DAY_GATE["recent"].append((time.time(), side))
+    gate_save()
 
 def gate_loss():
     """Вызывается, когда бот сам оценил исход сигнала как убыточный."""
@@ -2807,6 +2844,9 @@ def main():
     # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
     bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
+    _g = gate_load()
+    if _g:
+        print(f"[GATE] поднял дневной гейт: {_g} монет уже торговались сегодня")
     _restored = pending_load_local()
     if _restored:
         print(f"[PENDING] поднял с диска записей: {_restored}")
@@ -2881,15 +2921,24 @@ def main():
     mom_lvl = "🟢" if MOMENTUM_MIN_SCORE >= 8 else "🟡/🟢"
     start_lines = [
         f"🚀 <b>Upscale Bot {BOT_VERSION} запущен</b>",
-        f"⏳ ЗАРЯД {CHARGE_TF} — сжатие + объём/OI при стоящей цене, коридор {WIN_TXT} ({ACC_WINDOW} свечей), скан каждые {TF_MIN} мин",
+        f"⏳ ЗАРЯД {CHARGE_TF} — сжатие + объём/OI при стоящей цене, коридор {WIN_TXT} ({ACC_WINDOW} свечей), скан каждые {CHARGE_SCAN_MIN} мин",
         f"📏 Потолок размаха: адаптивный {ACC_RANGE_ATR_K}×ATR×√окно (предел {ACC_MAX_RANGE_ABS}%, пол {ACC_RANGE_FLOOR_PCT}%)",
     ]
     if BTC_CHARGE_ENABLED:
         start_lines.append(f"🟠 BTC — отдельный ЗАРЯД→ПРОБОЙ на {BTC_CHARGE_TF}, окно {BTC_P['win_txt']}, скан раз в час")
-    start_lines.append(f"⚡ ПРОБОЙ — подтверждение: закрытие {BREAK_CONFIRM_TF} свечи за уровнем, объём ≥{BREAK_MIN_RVOL}×")
-    start_lines.append(f"🎯 Правила v8.3: не дальше {VWAP_MAX_ATR} ATR от дневного VWAP | "
-                       f"≤{DAILY_MAX_SIGNALS} сигналов в день | 1 монета в день | "
-                       f"≤{MAX_SAME_SIDE_30M} в сторону за 30 мин | стоп дня после {DAY_STOP_LOSSES} убытков")
+    if BREAKOUT_ENABLED:
+        start_lines.append(f"⚡ ПРОБОЙ — подтверждение: закрытие {BREAK_CONFIRM_TF} свечи "
+                           f"за уровнем, объём ≥{BREAK_MIN_RVOL}×")
+    else:
+        start_lines.append("⚡ ПРОБОЙ — отключён (убыточен по бэктесту), работает только УКЛОН")
+    start_lines.append(
+        f"🎯 Фильтры: VWAP ≤{VWAP_MAX_ATR} ATR | ход до границы ≥{TILT_MIN_DIST_PCT}% | "
+        + ("1 монета в день | " if ONE_PER_SYMBOL_DAY else "")
+        + (f"≤{DAILY_MAX_SIGNALS} сигналов в день | " if DAILY_MAX_SIGNALS else "")
+        + (f"≤{MAX_SAME_SIDE_30M} в сторону | " if MAX_SAME_SIDE_30M else "")
+        + f"стоп дня после {DAY_STOP_LOSSES} убытков")
+    if EXCLUDE_SYMBOLS:
+        start_lines.append(f"🚫 Не торгуем: {', '.join(sorted(EXCLUDE_SYMBOLS))}")
     start_lines.append(f"💰 Риск ${RISK_USD:.0f} на сделку (лимиты: ${DAY_LOSS_USD:.0f} в день)")
     start_lines.append(f"🤖 Авто-слой Upscale: {EXECUTOR.mode}" + ({"dry": " (только сообщения, ордеров нет)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""))
                        + " | /up статус, /halt пауза")

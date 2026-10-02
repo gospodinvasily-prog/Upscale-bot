@@ -195,6 +195,7 @@ def run():
     brk = {(sc, rv, vw): [] for sc in BRK_SCORE for rv in BRK_RVOL for vw in BRK_VWAP}
     byhour = {h: [] for h in range(24)}     # час входа по МСК -> результаты
     byday = {d: [] for d in range(7)}       # день недели (0=пн) -> результаты
+    bydate = {1.0: {}, 1.5: {}}             # дата -> [результаты] для двух порогов
     # КОНТРОЛЬ: то же самое, но вход в СЛУЧАЙНЫЙ момент. Если преимущество даёт схема
     # выходов (три цели + двойная подтяжка), а не сигнал, случайный вход покажет тот же
     # плюс. Если сигнал настоящий — случайный уйдёт в ноль или минус.
@@ -362,7 +363,11 @@ def run():
                 byhour[hmsk].append((r, room, vd0))
                 _dt = datetime.fromtimestamp(cts, timezone.utc)
                 _msk = _dt.timestamp() + 3 * 3600
-                byday[datetime.fromtimestamp(_msk, timezone.utc).weekday()].append((r, room, vd0))
+                _d = datetime.fromtimestamp(_msk, timezone.utc)
+                byday[_d.weekday()].append((r, room, vd0))
+                for thr in (1.0, 1.5):      # кривая счёта по дням для двух порогов
+                    if room >= thr and (vd0 is None or vd0 <= B.VWAP_MAX_ATR):
+                        bydate[thr].setdefault(_d.strftime("%Y-%m-%d"), []).append(r)
                 trades.append((c["score"], c.get("rvol_half", 0),
                                c.get("sq_pct"), c.get("tr_ratio", 9),
                                c.get("rng_pct", 0), r))
@@ -543,6 +548,60 @@ def run():
                  f"→ разница {ee - ew:+.3f}R")
     L.append("  <i>гипотезы без объяснения лучше не принимать: на ~160 сделках в день "
              "погрешность ±0.09R, и один день почти наверняка вылезет случайно</i>")
+
+    # ── кривая счёта по ДНЯМ: пачка считается целиком, как на счёте ──
+    L += ["", "═══ <b>ПО ДНЯМ: насколько больно бывает</b> ═══",
+          "  <i>сделки одного дня складываются целиком — пять позиций в одну сторону",
+          "   это одно событие, а не пять независимых. Риск $20, счёт $10 000,",
+          "   лимиты Upscale: −$500 за день, −$1000 всего</i>"]
+    for thr in (1.0, 1.5):
+        dd = bydate[thr]
+        if not dd:
+            continue
+        days_sorted = sorted(dd)
+        dres = [(d, sum(dd[d]) * 20, len(dd[d])) for d in days_sorted]   # день -> $, сделок
+        tot_ = sum(x[1] for x in dres)
+        plus = [x for x in dres if x[1] > 0]
+        worst = min(dres, key=lambda x: x[1])
+        best = max(dres, key=lambda x: x[1])
+        # просадка эквити по дням
+        eq, peak, dd_max = 0.0, 0.0, 0.0
+        streak, worst_streak = 0, 0
+        hit500 = hit1000 = 0
+        for _, p_, _n in dres:
+            eq += p_
+            peak = max(peak, eq)
+            dd_max = min(dd_max, eq - peak)
+            if p_ < 0:
+                streak += 1
+                worst_streak = max(worst_streak, streak)
+            else:
+                streak = 0
+            if p_ <= -500:
+                hit500 += 1
+            if eq - peak <= -1000:
+                hit1000 += 1
+        # сколько дней до +$500 по реальной кривой
+        run, to_goal = 0.0, None
+        for i_, (_, p_, _n) in enumerate(dres, 1):
+            run += p_
+            if run >= 500 and to_goal is None:
+                to_goal = i_
+        mark = "ПОРОГ 1.0%" if thr == 1.0 else "ПОРОГ 1.5% (сейчас)"
+        L += ["", f"  <b>{mark}</b> — {len(dres)} дней, {sum(x[2] for x in dres)} сделок",
+              f"    итого ${tot_:+.0f} | прибыльных дней {len(plus)}/{len(dres)} "
+              f"({len(plus)/len(dres)*100:.0f}%)",
+              f"    лучший день ${best[1]:+.0f} ({best[2]} сд) | "
+              f"худший ${worst[1]:+.0f} ({worst[2]} сд)",
+              f"    макс. просадка эквити <b>${dd_max:.0f}</b> | "
+              f"убыточных дней подряд максимум {worst_streak}",
+              f"    дней с убытком ≥$500: <b>{hit500}</b> | "
+              f"пробитий общего лимита −$1000: <b>{hit1000}</b>",
+              f"    до цели +$500 дошли бы за <b>{to_goal if to_goal else '—'}</b> дней"]
+        big = [x for x in dres if x[2] >= 5]
+        if big:
+            avgb = sum(x[1] for x in big) / len(big)
+            L.append(f"    дни с 5+ сделками: {len(big)} шт, в среднем ${avgb:+.0f} за день")
 
     L += ["", "═══ <b>ПРОБОЙ на новых зарядах и по новой схеме</b> ═══",
           "  <i>раньше его гоняли при старых порогах и со старыми целями. Здесь —",
