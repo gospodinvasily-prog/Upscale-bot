@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "1.9"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.0"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -125,6 +125,28 @@ class UpscaleClient:
     def accounts(self):            return self._get("/accounts/with-risk-status")
     def markets(self, acc_id):     return self._get("/v2/markets", {"accountId": acc_id})
     def positions(self, acc_id):   return self._get(f"/positions/{acc_id}/active")
+
+    def closed_positions(self, acc_id, limit=200):
+        """История ЗАКРЫТЫХ позиций. В документации этот эндпоинт не описан, поэтому
+        перебираем вероятные адреса и возвращаем первый, который ответил.
+        Зачем: очередь оценки живёт в памяти, а на Render файловая система стирается
+        при каждом перезапуске — исходы терялись. У биржи эта история не теряется никогда."""
+        last = None
+        for path, params in (
+            (f"/positions/{acc_id}/closed",  {"limit": limit}),
+            (f"/positions/{acc_id}/history", {"limit": limit}),
+            (f"/positions/{acc_id}/all",     {"limit": limit}),
+            ("/positions",                   {"accountId": acc_id, "status": "closed", "limit": limit}),
+            ("/positions/closed",            {"accountId": acc_id, "limit": limit}),
+            ("/orders",                      {"accountId": acc_id, "limit": limit}),
+        ):
+            try:
+                data = self._get(path, params)
+                if data:
+                    return {"path": path, "params": params, "data": data}
+            except UpscaleError as e:
+                last = f"{path}: {e}"
+        raise UpscaleError(f"история закрытых позиций не найдена (последняя ошибка — {last})")
     def risk_status(self, acc_id): return self._get(f"/accounts/{acc_id}/risk-status")
 
 
@@ -869,6 +891,75 @@ class Executor:
             L.append("risk-status: " + _trunc(self.client.risk_status(self.account_id), 1800))
         except Exception as e:
             L.append(f"⚠️ risk-status: {_trunc(e, 200)}")
+        return "\n".join(L)
+
+    def history(self, days: int = 7) -> str:
+        """Статистика по ЗАКРЫТЫМ позициям прямо с биржи — она переживает любые
+        перезапуски бота, в отличие от очереди оценки в памяти."""
+        L = [f"upscale_exec v{EXEC_VERSION}"]
+        try:
+            self._ensure_account()
+            if not self.client or not self.account_id:
+                return "⛔ нет ключа или счёта"
+            res = self.client.closed_positions(self.account_id)
+        except Exception as e:
+            return "\n".join(L + [f"⚠️ {_trunc(e, 400)}",
+                                   "Эндпоинт истории не угадан — пришли мне этот текст, "
+                                   "допишу разбор под нужный адрес."])
+        rows = [p for p in _as_list(res.get("data")) if isinstance(p, dict)]
+        L.append(f"Источник: {res['path']} | записей: {len(rows)}")
+        if not rows:
+            return "\n".join(L + ["Пусто — возможно, адрес не тот. Пришли мне эту строку."])
+        first = rows[0]
+        L.append("Поля записи: " + ", ".join(list(first.keys())[:18]))
+
+        cutoff = time.time() - days * 86400
+        wins, losses, pnl_sum, n = [], [], Decimal(0), 0
+        for p in rows:
+            # время закрытия: ищем любое похожее поле
+            ts = 0
+            for k in ("closedAt", "closed_at", "updatedAt", "lastUpdatedAt", "ts", "time"):
+                v = p.get(k)
+                if not v:
+                    continue
+                try:
+                    if isinstance(v, str) and "T" in v:
+                        ts = datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                    else:
+                        ts = float(v) / (1000 if float(v) > 1e11 else 1)
+                    break
+                except Exception:
+                    continue
+            if ts and ts < cutoff:
+                continue
+            pv = pick(p, "pnl", "realizedPnl", "profit", "netPnl")
+            if pv is None:
+                continue
+            try:
+                v = from_fp9(pv) if str(pv).lstrip("-").isdigit() and len(str(pv).lstrip("-")) > 9 \
+                    else Decimal(str(pv))
+            except Exception:
+                continue
+            n += 1
+            pnl_sum += v
+            (wins if v > 0 else losses).append(v)
+        if not n:
+            return "\n".join(L + [f"За {days} дн закрытых позиций с результатом не нашёл. "
+                                   "Пришли мне строку «Поля записи» — подстрою разбор."])
+        wr = len(wins) / n * 100
+        gp = sum(wins) or Decimal(0)
+        gl = abs(sum(losses)) or Decimal(0)
+        pf = (gp / gl) if gl > 0 else Decimal(0)
+        risk = Decimal(str(self.risk_usd)) or Decimal(1)
+        L += ["",
+              f"<b>За {days} дн: сделок {n}, винрейт {wr:.0f}%</b>",
+              f"Итог: <b>${pnl_sum:+.2f}</b> | в единицах риска: <b>{pnl_sum/risk:+.2f}R</b>",
+              f"Средняя сделка: ${pnl_sum/n:+.2f} = <b>{pnl_sum/n/risk:+.3f}R</b>",
+              f"Профит-фактор: {pf:.2f} | плюсовых {len(wins)}, минусовых {len(losses)}"]
+        if wins:
+            L.append(f"Лучшая +${max(wins):.2f}, худшая ${min(losses) if losses else 0:.2f}")
+        L.append("")
+        L.append("<i>Бэктест обещает +0.32R на сделку — сравнивай со строкой «средняя сделка»</i>")
         return "\n".join(L)
 
     def status(self) -> str:
