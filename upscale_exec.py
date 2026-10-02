@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "2.2"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.3"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -878,10 +878,14 @@ class Executor:
             L.append(f"⚠️ risk-status: {_trunc(e, 200)}")
         return "\n".join(L)
 
-    def history(self, days: int = 7, max_markets: int = 40) -> str:
-        """Результаты по истории ордеров с биржи. Эндпоинт работает ПО ОДНОМУ рынку
-        (/orders/{acc}/{asset}/history), поэтому обходим рынки, где мы торговали.
-        Эти данные переживают любые перезапуски бота, в отличие от очереди в памяти."""
+    def history(self, days: int = 7, max_markets: int = 0) -> str:
+        """Результаты с биржи: по сделкам, по монетам и по дням — чтобы сверять с журналом.
+
+        v2.3: ордера группируются по positionId. Раньше считался каждый ордер
+        отдельно, а в одной сделке их несколько (три тейка, стоп) — поэтому
+        «средняя сделка» получалась вдвое меньше реальной. Плюс добавлены открытые
+        позиции и снято ограничение на число рынков: без них итог не сходился
+        с балансом счёта."""
         L = [f"upscale_exec v{EXEC_VERSION}"]
         try:
             self._ensure_account()
@@ -893,49 +897,57 @@ class Executor:
         if not self._mk:
             return "⛔ список рынков не получен"
 
-        # 1) разведка: что подставлять вместо {asset} — id рынка или тикер
-        form, probe_err = None, []
+        form = None
         for sym, m in list(self._mk.items())[:6]:
-            for name, asset in (("id рынка", str(m.get("id", ""))), ("тикер", sym)):
+            for name, asset in (("тикер", sym), ("id рынка", str(m.get("id", "")))):
                 if not asset:
                     continue
                 try:
                     self.client.orders_history(self.account_id, asset, 5)
                     form = name
                     break
-                except UpscaleError as e:
-                    probe_err.append(f"{name}: {_trunc(e, 90)}")
+                except UpscaleError:
+                    pass
             if form:
                 break
         if not form:
-            return "\n".join(L + ["⚠️ эндпоинт не ответил ни на id рынка, ни на тикер:"]
-                              + [f"  {x}" for x in probe_err[:4]]
-                              + ["Пришли мне этот текст."])
-        L.append(f"Источник: /orders/{{acc}}/{{asset}}/history, подставляем {form}")
+            return "\n".join(L + ["⚠️ эндпоинт истории не ответил ни на тикер, ни на id рынка"])
 
-        # 2) обходим рынки: сначала те, где у нас есть/были позиции
-        want = []
-        try:
-            for p in self._positions():
-                mid = _pos_market(p)
-                for sym, m in self._mk.items():
-                    if str(m.get("id")) == mid:
-                        want.append(sym)
-        except Exception:
-            pass
-        for sym in self.pairs:
-            k = _norm_sym(sym)
-            if k in self._mk and k not in want:
-                want.append(k)
-        want = want[:max_markets]
-
+        syms = list(self._mk.keys())
+        if max_markets:
+            syms = syms[:max_markets]
         cutoff = time.time() - days * 86400
-        rows, fields = [], None
-        for sym in want:
+
+        def _money(pv):
+            if pv is None:
+                return None
+            t = str(pv).strip()
+            if not t or t in ("None", "null"):
+                return None
+            try:
+                return Decimal(t) if ("." in t or "e" in t.lower()) else from_fp9(t)
+            except Exception:
+                return None
+
+        def _when(o):
+            for k in ("closedAt", "filledAt", "updatedAt", "createdAt"):
+                v = o.get(k)
+                if not v:
+                    continue
+                try:
+                    if isinstance(v, str) and "T" in v:
+                        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                    return float(v) / (1000 if float(v) > 1e11 else 1)
+                except Exception:
+                    continue
+            return 0
+
+        trades, adj_cnt, n_ord = {}, 0, 0
+        for sym in syms:
             m = self._mk.get(sym)
             if not m:
                 continue
-            asset = str(m.get("id", "")) if form == "id рынка" else sym
+            asset = sym if form == "тикер" else str(m.get("id", ""))
             try:
                 data = self.client.orders_history(self.account_id, asset, 100)
             except UpscaleError:
@@ -943,80 +955,82 @@ class Executor:
             for o in _as_list(data):
                 if not isinstance(o, dict):
                     continue
-                if fields is None:
-                    fields = list(o.keys())
-                ts = 0
-                for k in ("closedAt", "filledAt", "updatedAt", "lastUpdatedAt", "createdAt", "ts"):
-                    v = o.get(k)
-                    if not v:
-                        continue
-                    try:
-                        if isinstance(v, str) and "T" in v:
-                            ts = datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-                        else:
-                            ts = float(v) / (1000 if float(v) > 1e11 else 1)
-                        break
-                    except Exception:
-                        continue
+                ts = _when(o)
                 if ts and ts < cutoff:
                     continue
-                o["_sym"] = sym
-                rows.append(o)
+                v = _money(o.get("realizedPnl"))
+                if v is None:
+                    continue
+                n_ord += 1
+                if o.get("profitAdjustmentApplied"):
+                    adj_cnt += 1
+                key = o.get("positionId") or o.get("id")      # сделка = позиция
+                t = trades.setdefault(key, {"sym": sym, "pnl": Decimal(0), "ts": ts, "n": 0})
+                t["pnl"] += v
+                t["n"] += 1
+                t["ts"] = max(t["ts"], ts)
 
-        L.append(f"Рынков опрошено: {len(want)} | записей: {len(rows)}")
-        if fields:
-            L.append(f"Поля записи ({len(fields)}): " + ", ".join(fields))
-            ex0 = rows[0]
-            L.append("Пример записи: " + _trunc({k: ex0.get(k) for k in fields[:14]}, 600))
-        if not rows:
-            return "\n".join(L + ["Записей нет. Если поля выше пустые — пришли мне эту строку."])
+        closed = [t for t in trades.values() if t["pnl"] != 0]
+        # открытые позиции — их прибыль уже в балансе, но ордеров ещё нет
+        open_pnl, open_n = Decimal(0), 0
+        try:
+            for p in self._positions():
+                v = _money(p.get("pnl"))
+                if v is not None:
+                    open_pnl += v
+                    open_n += 1
+        except Exception:
+            pass
 
-        # 3) считаем, если есть поле с результатом
-        def _money(pv):
-            """v2.2: значения приходят в fp9 (×10⁹) и БЕЗ точки. Прошлая проверка
-            по длине строки срабатывала не всегда — получались миллиарды долларов.
-            Теперь: целое без точки считаем fp9 всегда, дробное берём как есть."""
-            if pv is None:
-                return None
-            t = str(pv).strip()
-            if not t or t in ("None", "null"):
-                return None
-            try:
-                if "." in t or "e" in t.lower():
-                    return Decimal(t)
-                return from_fp9(t)          # целое → это fp9
-            except Exception:
-                return None
+        L.append(f"Опрошено рынков: {len(syms)} | ордеров с результатом: {n_ord} | "
+                 f"сделок (по позициям): {len(closed)}")
+        if not closed and not open_n:
+            return "\n".join(L + ["За период сделок нет."])
 
-        pnl_field = None
-        for cand in ("pnl", "realizedPnl", "realized_pnl", "profit", "netPnl",
-                     "closedPnl", "pnlRealized", "income"):
-            if any(cand in o for o in rows):
-                pnl_field = cand
-                break
-        wins, losses, pnl = [], [], Decimal(0)
-        for o in rows:
-            v = _money(o.get(pnl_field)) if pnl_field else None
-            if v is None or v == 0:
-                continue
-            pnl += v
-            (wins if v > 0 else losses).append(v)
-        n = len(wins) + len(losses)
-        if not n:
-            return "\n".join(L + ["", "В ордерах нет поля с результатом сделки "
-                                   f"(искал: pnl, realizedPnl, profit, netPnl; нашёл {pnl_field}). "
-                                   "Пришли мне строки «Поля записи» и «Пример записи»."])
+        tot = sum((t["pnl"] for t in closed), Decimal(0))
+        wins = [t for t in closed if t["pnl"] > 0]
         risk = Decimal(str(self.risk_usd)) or Decimal(1)
-        gl = abs(sum(losses)) or Decimal(0)
-        pf = (sum(wins) / gl) if gl > 0 else Decimal(0)
-        L += ["",
-              f"<b>За {days} дн: сделок {n}, винрейт {len(wins)/n*100:.0f}%</b>",
-              f"Итог: <b>${pnl:+.2f}</b> = <b>{pnl/risk:+.2f}R</b>",
-              f"Средняя сделка: ${pnl/n:+.2f} = <b>{pnl/n/risk:+.3f}R</b>",
-              f"Профит-фактор: {pf:.2f} | плюсовых {len(wins)}, минусовых {len(losses)}",
-              f"<i>поле результата: {pnl_field}</i>",
-              "",
-              "<i>Бэктест обещает +0.32R на сделку — сравнивай со «средней сделкой»</i>"]
+        n = len(closed)
+        if n:
+            gl = abs(sum((t["pnl"] for t in closed if t["pnl"] <= 0), Decimal(0)))
+            pf = (sum((t["pnl"] for t in wins), Decimal(0)) / gl) if gl > 0 else Decimal(0)
+            L += ["",
+                  f"<b>ЗАКРЫТО за {days} дн: {n} сделок, винрейт {len(wins)/n*100:.0f}%</b>",
+                  f"Итог: <b>${tot:+.2f}</b> = {tot/risk:+.2f}R | "
+                  f"средняя <b>{tot/n/risk:+.3f}R</b> (${tot/n:+.2f})",
+                  f"Профит-фактор: {pf:.2f}"]
+        if open_n:
+            L.append(f"ОТКРЫТО сейчас: {open_n} поз, ${open_pnl:+.2f} (в балансе уже есть)")
+            L.append(f"<b>ВСЕГО: ${tot + open_pnl:+.2f}</b> — должно сойтись с балансом счёта")
+        if adj_cnt:
+            L.append(f"⚠️ корректировка 60с применена к {adj_cnt} ордерам — "
+                     f"эта прибыль не засчитана Upscale")
+
+        # по дням
+        byday = {}
+        for t in closed:
+            d = datetime.fromtimestamp(t["ts"], timezone.utc).strftime("%d.%m")
+            a = byday.setdefault(d, [0, Decimal(0)])
+            a[0] += 1
+            a[1] += t["pnl"]
+        if byday:
+            L += ["", "<b>По дням (UTC):</b>"]
+            for d in sorted(byday):
+                c_, p_ = byday[d]
+                L.append(f"  {d}: {c_:2} сд, ${p_:+7.2f} = {p_/risk:+.2f}R")
+
+        # по монетам
+        bysym = {}
+        for t in closed:
+            a = bysym.setdefault(t["sym"], [0, Decimal(0)])
+            a[0] += 1
+            a[1] += t["pnl"]
+        if bysym:
+            L += ["", "<b>По монетам:</b>"]
+            for sym, (c_, p_) in sorted(bysym.items(), key=lambda kv: -kv[1][1]):
+                L.append(f"  {sym:10} {c_:2} сд  ${p_:+7.2f}")
+
+        L += ["", "<i>Бэктест обещает +0.32R на сделку — сравнивай со «средней»</i>"]
         return "\n".join(L)
 
     def status(self) -> str:
