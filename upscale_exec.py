@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "2.0"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.1"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -126,27 +126,12 @@ class UpscaleClient:
     def markets(self, acc_id):     return self._get("/v2/markets", {"accountId": acc_id})
     def positions(self, acc_id):   return self._get(f"/positions/{acc_id}/active")
 
-    def closed_positions(self, acc_id, limit=200):
-        """История ЗАКРЫТЫХ позиций. В документации этот эндпоинт не описан, поэтому
-        перебираем вероятные адреса и возвращаем первый, который ответил.
-        Зачем: очередь оценки живёт в памяти, а на Render файловая система стирается
-        при каждом перезапуске — исходы терялись. У биржи эта история не теряется никогда."""
-        last = None
-        for path, params in (
-            (f"/positions/{acc_id}/closed",  {"limit": limit}),
-            (f"/positions/{acc_id}/history", {"limit": limit}),
-            (f"/positions/{acc_id}/all",     {"limit": limit}),
-            ("/positions",                   {"accountId": acc_id, "status": "closed", "limit": limit}),
-            ("/positions/closed",            {"accountId": acc_id, "limit": limit}),
-            ("/orders",                      {"accountId": acc_id, "limit": limit}),
-        ):
-            try:
-                data = self._get(path, params)
-                if data:
-                    return {"path": path, "params": params, "data": data}
-            except UpscaleError as e:
-                last = f"{path}: {e}"
-        raise UpscaleError(f"история закрытых позиций не найдена (последняя ошибка — {last})")
+    def orders_history(self, acc_id, asset, limit=100):
+        """История ордеров ПО ОДНОМУ рынку: GET /orders/{accountId}/{asset}/history
+        (из документации Upscale). Что подставлять вместо {asset} — id рынка или
+        тикер — выясняется перебором при первом вызове, см. Executor.history."""
+        return self._get(f"/orders/{acc_id}/{asset}/history", {"limit": limit})
+
     def risk_status(self, acc_id): return self._get(f"/accounts/{acc_id}/risk-status")
 
 
@@ -893,73 +878,126 @@ class Executor:
             L.append(f"⚠️ risk-status: {_trunc(e, 200)}")
         return "\n".join(L)
 
-    def history(self, days: int = 7) -> str:
-        """Статистика по ЗАКРЫТЫМ позициям прямо с биржи — она переживает любые
-        перезапуски бота, в отличие от очереди оценки в памяти."""
+    def history(self, days: int = 7, max_markets: int = 40) -> str:
+        """Результаты по истории ордеров с биржи. Эндпоинт работает ПО ОДНОМУ рынку
+        (/orders/{acc}/{asset}/history), поэтому обходим рынки, где мы торговали.
+        Эти данные переживают любые перезапуски бота, в отличие от очереди в памяти."""
         L = [f"upscale_exec v{EXEC_VERSION}"]
         try:
             self._ensure_account()
+            self._refresh_markets()
             if not self.client or not self.account_id:
                 return "⛔ нет ключа или счёта"
-            res = self.client.closed_positions(self.account_id)
         except Exception as e:
-            return "\n".join(L + [f"⚠️ {_trunc(e, 400)}",
-                                   "Эндпоинт истории не угадан — пришли мне этот текст, "
-                                   "допишу разбор под нужный адрес."])
-        rows = [p for p in _as_list(res.get("data")) if isinstance(p, dict)]
-        L.append(f"Источник: {res['path']} | записей: {len(rows)}")
-        if not rows:
-            return "\n".join(L + ["Пусто — возможно, адрес не тот. Пришли мне эту строку."])
-        first = rows[0]
-        L.append("Поля записи: " + ", ".join(list(first.keys())[:18]))
+            return f"⚠️ {_trunc(e, 300)}"
+        if not self._mk:
+            return "⛔ список рынков не получен"
 
-        cutoff = time.time() - days * 86400
-        wins, losses, pnl_sum, n = [], [], Decimal(0), 0
-        for p in rows:
-            # время закрытия: ищем любое похожее поле
-            ts = 0
-            for k in ("closedAt", "closed_at", "updatedAt", "lastUpdatedAt", "ts", "time"):
-                v = p.get(k)
-                if not v:
+        # 1) разведка: что подставлять вместо {asset} — id рынка или тикер
+        form, probe_err = None, []
+        for sym, m in list(self._mk.items())[:6]:
+            for name, asset in (("id рынка", str(m.get("id", ""))), ("тикер", sym)):
+                if not asset:
                     continue
                 try:
-                    if isinstance(v, str) and "T" in v:
-                        ts = datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-                    else:
-                        ts = float(v) / (1000 if float(v) > 1e11 else 1)
+                    self.client.orders_history(self.account_id, asset, 5)
+                    form = name
                     break
-                except Exception:
-                    continue
-            if ts and ts < cutoff:
+                except UpscaleError as e:
+                    probe_err.append(f"{name}: {_trunc(e, 90)}")
+            if form:
+                break
+        if not form:
+            return "\n".join(L + ["⚠️ эндпоинт не ответил ни на id рынка, ни на тикер:"]
+                              + [f"  {x}" for x in probe_err[:4]]
+                              + ["Пришли мне этот текст."])
+        L.append(f"Источник: /orders/{{acc}}/{{asset}}/history, подставляем {form}")
+
+        # 2) обходим рынки: сначала те, где у нас есть/были позиции
+        want = []
+        try:
+            for p in self._positions():
+                mid = _pos_market(p)
+                for sym, m in self._mk.items():
+                    if str(m.get("id")) == mid:
+                        want.append(sym)
+        except Exception:
+            pass
+        for sym in self.pairs:
+            k = _norm_sym(sym)
+            if k in self._mk and k not in want:
+                want.append(k)
+        want = want[:max_markets]
+
+        cutoff = time.time() - days * 86400
+        rows, fields = [], None
+        for sym in want:
+            m = self._mk.get(sym)
+            if not m:
                 continue
-            pv = pick(p, "pnl", "realizedPnl", "profit", "netPnl")
+            asset = str(m.get("id", "")) if form == "id рынка" else sym
+            try:
+                data = self.client.orders_history(self.account_id, asset, 100)
+            except UpscaleError:
+                continue
+            for o in _as_list(data):
+                if not isinstance(o, dict):
+                    continue
+                if fields is None:
+                    fields = list(o.keys())
+                ts = 0
+                for k in ("closedAt", "filledAt", "updatedAt", "lastUpdatedAt", "createdAt", "ts"):
+                    v = o.get(k)
+                    if not v:
+                        continue
+                    try:
+                        if isinstance(v, str) and "T" in v:
+                            ts = datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                        else:
+                            ts = float(v) / (1000 if float(v) > 1e11 else 1)
+                        break
+                    except Exception:
+                        continue
+                if ts and ts < cutoff:
+                    continue
+                o["_sym"] = sym
+                rows.append(o)
+
+        L.append(f"Рынков опрошено: {len(want)} | записей: {len(rows)}")
+        if fields:
+            L.append("Поля записи: " + ", ".join(fields[:18]))
+        if not rows:
+            return "\n".join(L + ["Записей нет. Если поля выше пустые — пришли мне эту строку."])
+
+        # 3) считаем, если есть поле с результатом
+        wins, losses, pnl = [], [], Decimal(0)
+        for o in rows:
+            pv = pick(o, "pnl", "realizedPnl", "profit", "netPnl", "realized_pnl")
             if pv is None:
                 continue
             try:
-                v = from_fp9(pv) if str(pv).lstrip("-").isdigit() and len(str(pv).lstrip("-")) > 9 \
-                    else Decimal(str(pv))
+                t = str(pv).lstrip("-")
+                v = from_fp9(pv) if t.isdigit() and len(t) > 9 else Decimal(str(pv))
             except Exception:
                 continue
-            n += 1
-            pnl_sum += v
+            if v == 0:
+                continue
+            pnl += v
             (wins if v > 0 else losses).append(v)
+        n = len(wins) + len(losses)
         if not n:
-            return "\n".join(L + [f"За {days} дн закрытых позиций с результатом не нашёл. "
-                                   "Пришли мне строку «Поля записи» — подстрою разбор."])
-        wr = len(wins) / n * 100
-        gp = sum(wins) or Decimal(0)
-        gl = abs(sum(losses)) or Decimal(0)
-        pf = (gp / gl) if gl > 0 else Decimal(0)
+            return "\n".join(L + ["", "В ордерах нет поля с результатом сделки — "
+                                   "пришли мне строку «Поля записи», подстрою разбор."])
         risk = Decimal(str(self.risk_usd)) or Decimal(1)
+        gl = abs(sum(losses)) or Decimal(0)
+        pf = (sum(wins) / gl) if gl > 0 else Decimal(0)
         L += ["",
-              f"<b>За {days} дн: сделок {n}, винрейт {wr:.0f}%</b>",
-              f"Итог: <b>${pnl_sum:+.2f}</b> | в единицах риска: <b>{pnl_sum/risk:+.2f}R</b>",
-              f"Средняя сделка: ${pnl_sum/n:+.2f} = <b>{pnl_sum/n/risk:+.3f}R</b>",
-              f"Профит-фактор: {pf:.2f} | плюсовых {len(wins)}, минусовых {len(losses)}"]
-        if wins:
-            L.append(f"Лучшая +${max(wins):.2f}, худшая ${min(losses) if losses else 0:.2f}")
-        L.append("")
-        L.append("<i>Бэктест обещает +0.32R на сделку — сравнивай со строкой «средняя сделка»</i>")
+              f"<b>За {days} дн: сделок {n}, винрейт {len(wins)/n*100:.0f}%</b>",
+              f"Итог: <b>${pnl:+.2f}</b> = <b>{pnl/risk:+.2f}R</b>",
+              f"Средняя сделка: ${pnl/n:+.2f} = <b>{pnl/n/risk:+.3f}R</b>",
+              f"Профит-фактор: {pf:.2f} | плюсовых {len(wins)}, минусовых {len(losses)}",
+              "",
+              "<i>Бэктест обещает +0.32R на сделку — сравнивай со «средней сделкой»</i>"]
         return "\n".join(L)
 
     def status(self) -> str:
