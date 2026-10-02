@@ -19,6 +19,7 @@ bt_loose.py — что будет, если ослабить условия за
 import os
 import time
 import statistics
+from datetime import datetime, timezone
 
 import bot as B
 
@@ -61,6 +62,19 @@ CROSS_VWAP = [2.0, 2.5]
 BRK_SCORE = [2, 4]               # порог силы заряда (шкала бэктеста, живая выше на 2-3)
 BRK_RVOL  = [1.0, 1.5]           # объём свечи пробоя на мелком ТФ
 BRK_VWAP  = [None, 2.0, 2.5, 3.0]  # VWAP для ПРОБОЯ: None = без фильтра
+# Разбор по часам МСК. Наборы окон для сравнения целиком — отдельные часы шумят
+# (на ~60 сделках погрешность ±0.15R), поэтому смотрим и зоны, и итог по набору.
+WINDOW_SETS = {
+    "сейчас (04-08:30, 10:30-11:30, 14:30-21:30)":
+        [(4, 0, 8, 30), (10, 30, 11, 30), (14, 30, 21, 30)],
+    "без окон (круглосуточно)": [(0, 0, 24, 0)],
+    "сейчас минус 16:00-17:00":
+        [(4, 0, 8, 30), (10, 30, 11, 30), (14, 30, 16, 0), (17, 0, 21, 30)],
+    "сейчас + Нью-Йорк до 00:00":
+        [(4, 0, 8, 30), (10, 30, 11, 30), (14, 30, 24, 0)],
+    "только Европа+NY (14:30-23:00)": [(14, 30, 23, 0)],
+    "только Азия (04:00-11:30)": [(4, 0, 11, 30)],
+}
 TP3_MODES = [("от входа +2% (как сейчас)", None),
              ("граница + 25% высоты", 0.25),
              ("граница + 50% высоты", 0.50),
@@ -179,6 +193,8 @@ def run():
     cross = {(d_, v_): [] for d_ in CROSS_DIST for v_ in CROSS_VWAP}
     batches = {(d_, v_): {} for d_ in CROSS_DIST for v_ in CROSS_VWAP}
     brk = {(sc, rv, vw): [] for sc in BRK_SCORE for rv in BRK_RVOL for vw in BRK_VWAP}
+    byhour = {h: [] for h in range(24)}     # час входа по МСК -> результаты
+    byday = {d: [] for d in range(7)}       # день недели (0=пн) -> результаты
     # КОНТРОЛЬ: то же самое, но вход в СЛУЧАЙНЫЙ момент. Если преимущество даёт схема
     # выходов (три цели + двойная подтяжка), а не сигнал, случайный вход покажет тот же
     # плюс. Если сигнал настоящий — случайный уйдёт в ноль или минус.
@@ -342,6 +358,11 @@ def run():
                                         brk[(sc_, rv_, vw_)].append(rb)
                     break
 
+                hmsk = (datetime.fromtimestamp(cts, timezone.utc).hour + 3) % 24
+                byhour[hmsk].append((r, room, vd0))
+                _dt = datetime.fromtimestamp(cts, timezone.utc)
+                _msk = _dt.timestamp() + 3 * 3600
+                byday[datetime.fromtimestamp(_msk, timezone.utc).weekday()].append((r, room, vd0))
                 trades.append((c["score"], c.get("rvol_half", 0),
                                c.get("sq_pct"), c.get("tr_ratio", 9),
                                c.get("rng_pct", 0), r))
@@ -465,6 +486,63 @@ def run():
             L.append(f"  → лучший порог {bv} ATR: {len(ba)} сд, {e_b:+.3f}R против "
                      f"{len(_off)} сд и {e_off:+.3f}R без фильтра "
                      f"({'стоит оставить' if e_b - e_off > 0.02 else 'разницы нет — можно снять'})")
+
+    # ── разбор по часам ──
+    def _st(rs):
+        if not rs:
+            return 0, 0.0, 0.0, 0.0
+        n = len(rs)
+        e = sum(rs) / n
+        se = (statistics.pstdev(rs) / (n ** 0.5)) if n > 1 else 0
+        return n, e, 1.96 * se, sum(1 for x in rs if x > 0) / n * 100
+
+    cur_d, cur_v = B.TILT_MIN_DIST_PCT, B.VWAP_MAX_ATR
+    hr = {h: [r for r, room, vd in byhour[h]
+              if room >= cur_d and (vd is None or vd <= cur_v)] for h in range(24)}
+    L += ["", "═══ <b>РАЗБОР ПО ЧАСАМ (МСК)</b> ═══",
+          f"  <i>при нынешних настройках: ход ≥{cur_d}%, VWAP ≤{cur_v}</i>",
+          "  час | сделок | ВР  | матожидание      | 3 часа подряд"]
+    for h in range(24):
+        n, e, ci, wr = _st(hr[h])
+        if not n:
+            continue
+        # скользящее по трём часам — сглаживает шум одиночного часа
+        sm = hr[(h - 1) % 24] + hr[h] + hr[(h + 1) % 24]
+        n3, e3, _, _ = _st(sm)
+        mark = "✅" if e - ci > 0 else "❌" if e + ci < 0 else "  "
+        inw = "●" if any(h1 * 60 <= h * 60 + 30 < h2 * 60 + m2
+                         for h1, m1, h2, m2 in B.TILT_WINDOWS) else "○"
+        L.append(f"  {mark}{inw} {h:02d} | {n:5} | {wr:3.0f}% | {e:+.3f}R ±{ci:.3f} | "
+                 f"{e3:+.3f}R ({n3})")
+    L.append("  <i>● — час внутри нынешних окон, ○ — вне. ✅/❌ — отличие от нуля значимо</i>")
+
+    L += ["", "<b>Наборы окон целиком:</b>"]
+    def _in_set(h, mins, wins):
+        t = h * 60 + mins
+        return any(h1 * 60 + m1 <= t < h2 * 60 + m2 for h1, m1, h2, m2 in wins)
+    for name, wins in WINDOW_SETS.items():
+        rs = [r for h in range(24) for r in hr[h] if _in_set(h, 30, wins)]
+        L.append(_line(rs, name))
+
+    DN = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    dr = {d: [r for r, room, vd in byday[d]
+              if room >= cur_d and (vd is None or vd <= cur_v)] for d in range(7)}
+    L += ["", "<b>По дням недели (МСК):</b>"]
+    for d in range(7):
+        n, e, ci, wr = _st(dr[d])
+        if not n:
+            L.append(f"  {DN[d]}: сделок нет")
+            continue
+        mark = "✅" if e - ci > 0 else "❌" if e + ci < 0 else "  "
+        L.append(f"  {mark} {DN[d]:13} {n:4} сд, ВР {wr:3.0f}%, {e:+.3f}R ±{ci:.3f}")
+    wd = [r for d in range(5) for r in dr[d]]
+    we = [r for d in (5, 6) for r in dr[d]]
+    if wd and we:
+        ew, ee = sum(wd) / len(wd), sum(we) / len(we)
+        L.append(f"  будни {len(wd)} сд {ew:+.3f}R | выходные {len(we)} сд {ee:+.3f}R "
+                 f"→ разница {ee - ew:+.3f}R")
+    L.append("  <i>гипотезы без объяснения лучше не принимать: на ~160 сделках в день "
+             "погрешность ±0.09R, и один день почти наверняка вылезет случайно</i>")
 
     L += ["", "═══ <b>ПРОБОЙ на новых зарядах и по новой схеме</b> ═══",
           "  <i>раньше его гоняли при старых порогах и со старыми целями. Здесь —",
