@@ -49,6 +49,12 @@ VWAP_GRID = [None, 1.5, 2.0, 2.5, 3.0, 4.0]   # None = фильтра нет
 # когда уклон шортовый, цена прижата к НИЖНЕЙ границе, и ходу вниз мало по определению.
 # Но порог 1% стоял и в бэктесте, давшем +0.32R, — возможно, он не режет, а защищает.
 DIST_GRID = [0.0, 0.5, 0.75, 1.0, 1.5, 2.0]
+# Перекрёстная таблица: расстояние до границы × порог VWAP. Плюс замер ПАЧЕК —
+# сколько входов приходится на один скан в одну сторону. Пачка из пяти позиций
+# это одна ставка: при развороте выбивает все разом, и бэктест этого не видит,
+# потому что считает сделки независимыми.
+CROSS_DIST = [1.0, 1.5, 2.0]
+CROSS_VWAP = [2.0, 2.5]
 TP3_MODES = [("от входа +2% (как сейчас)", None),
              ("граница + 25% высоты", 0.25),
              ("граница + 50% высоты", 0.50),
@@ -164,6 +170,8 @@ def run():
     tp3res = {name: [] for name, _ in TP3_MODES}
     vwres = {v: [] for v in VWAP_GRID}
     distres = {v: [] for v in DIST_GRID}
+    cross = {(d_, v_): [] for d_ in CROSS_DIST for v_ in CROSS_VWAP}
+    batches = {(d_, v_): {} for d_ in CROSS_DIST for v_ in CROSS_VWAP}
     # КОНТРОЛЬ: то же самое, но вход в СЛУЧАЙНЫЙ момент. Если преимущество даёт схема
     # выходов (три цели + двойная подтяжка), а не сигнал, случайный вход покажет тот же
     # плюс. Если сигнал настоящий — случайный уйдёт в ноль или минус.
@@ -236,6 +244,14 @@ def run():
                 for dt_ in DIST_GRID:
                     if room >= dt_:
                         distres[dt_].append(r)
+                vd0 = _vwap_dist(fine, k0, bars_day)
+                scan_key = (int(cts) // 1800, c["side"])   # скан раз в 30 мин + сторона
+                for d_ in CROSS_DIST:
+                    for v_ in CROSS_VWAP:
+                        if room >= d_ and (vd0 is None or vd0 <= v_):
+                            cross[(d_, v_)].append(r)
+                            b = batches[(d_, v_)]
+                            b[scan_key] = b.get(scan_key, 0) + 1
                 if room < B.TILT_MIN_DIST_PCT:     # дальше — только то, что берёт бот
                     continue
                 # фильтр VWAP: на тех же входах, разные пороги
@@ -359,6 +375,37 @@ def run():
             e_b = sum(best[1]) / len(best[1])
             L.append(f"  → лучший порог {best[0]}%: {len(best[1])} сд, {e_b:+.3f}R против "
                      f"{len(cur)} сд и {e_cur:+.3f}R при нынешнем 1%")
+
+    L += ["", "═══ <b>РАССТОЯНИЕ × VWAP: меньше ли станет пачек?</b> ═══",
+          "  <i>пачка — сколько входов в одну сторону на одном скане. Пять позиций",
+          "   разом это одна ставка: разворот выбивает все сразу</i>", ""]
+    for d_ in CROSS_DIST:
+        for v_ in CROSS_VWAP:
+            rs = cross[(d_, v_)]
+            b = batches[(d_, v_)]
+            if not rs:
+                L.append(f"  ход ≥{d_}% + VWAP ≤{v_}: сделок нет")
+                continue
+            n_ = len(rs)
+            e_ = sum(rs) / n_
+            se = (statistics.pstdev(rs) / (n_ ** 0.5)) if n_ > 1 else 0
+            mark = "✅" if e_ - 1.96 * se > 0 else "  "
+            sizes = sorted(b.values())
+            avg_b = sum(sizes) / len(sizes) if sizes else 0
+            big = sum(1 for x in sizes if x >= 4)
+            L.append(f"  {mark} <b>ход ≥{d_}% + VWAP ≤{v_}</b>: {n_:4} сд, "
+                     f"ВР {sum(1 for x in rs if x > 0)/n_*100:3.0f}%, <b>{e_:+.3f}R</b> "
+                     f"(±{1.96*se:.3f}), итого {sum(rs):+.0f}R")
+            L.append(f"       пачки: в среднем {avg_b:.1f} входа на скан, "
+                     f"максимум {max(sizes)}, пачек по 4+ — {big}")
+    base_c = cross.get((1.0, 2.5)) or []
+    if base_c:
+        e0 = sum(base_c) / len(base_c)
+        b0 = batches[(1.0, 2.5)]
+        s0 = sorted(b0.values())
+        L.append("")
+        L.append(f"  <i>сейчас в боте: ход ≥1.0% + VWAP ≤2.5 — {len(base_c)} сд, {e0:+.3f}R, "
+                 f"пачки в среднем {sum(s0)/len(s0):.1f}, максимум {max(s0)}</i>")
 
     L += ["", "<b>ФИЛЬТР VWAP для УКЛОНА</b> — никогда не проверялся",
           "  <i>в боте стоит 2.5 ATR по инерции от ПРОБОЯ. Бэктест, давший +0.32R,",
