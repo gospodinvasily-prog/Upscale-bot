@@ -427,16 +427,37 @@ def send_document(path: str, caption: str = ""):
     except Exception as e:
         print(f"[TG DOC ERROR] {path}: {e}")
 
+def _balance_html(text: str) -> str:
+    """Закрывает теги, оставшиеся открытыми в куске. Нужно потому, что в отчётах
+    бывают многострочные пояснения вида <i>…три строки…</i>: если разделитель
+    режет пачку между ними, обе половины получаются с непарными тегами, и
+    Telegram отвечает 400 Bad Request вместо отправки."""
+    for tag in ("b", "i", "code", "pre", "u", "s"):
+        opened = text.count(f"<{tag}>") - text.count(f"</{tag}>")
+        if opened > 0:
+            text += f"</{tag}>" * opened
+        elif opened < 0:                      # кусок начался с закрывающего тега
+            text = f"<{tag}>" * (-opened) + text
+    return text
+
 def send_blocks(blocks: list, limit: int = 3800):
-    """Telegram режет сообщения > 4096 символов — собираем блоки в пачки."""
+    """Telegram режет сообщения > 4096 символов — собираем блоки в пачки.
+    Слишком длинную одиночную строку режем по словам, теги балансируем."""
     buf = ""
     for b in blocks:
+        while len(b) > limit:                 # одна строка длиннее лимита
+            cut = b.rfind(" ", 0, limit) or limit
+            if buf:
+                send_telegram(_balance_html(buf))
+                buf = ""
+            send_telegram(_balance_html(b[:cut]))
+            b = b[cut:].lstrip()
         if buf and len(buf) + len(b) + 1 > limit:
-            send_telegram(buf)
+            send_telegram(_balance_html(buf))
             buf = ""
         buf = f"{buf}\n{b}" if buf else b
     if buf:
-        send_telegram(buf)
+        send_telegram(_balance_html(buf))
 
 # ─── СВЕЧИ ────────────────────────────────────────────────────────────────────
 

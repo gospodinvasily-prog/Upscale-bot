@@ -57,12 +57,6 @@ DIST_GRID = [0.0, 0.5, 0.75, 1.0, 1.5, 2.0]
 # потому что считает сделки независимыми.
 CROSS_DIST = [1.0, 1.5, 2.0]
 CROSS_VWAP = [2.0, 2.5]
-# ПРОБОЙ на новых зарядах и по НОВОЙ схеме выходов. Раньше его гоняли при старых
-# порогах заряда и со старыми целями — схему «три цели по трети + двойная подтяжка»
-# на нём не проверяли ни разу, а именно она вытащила УКЛОН (+0.174R → +0.264R).
-BRK_SCORE = [2, 4]               # порог силы заряда (шкала бэктеста, живая выше на 2-3)
-BRK_RVOL  = [1.0, 1.5]           # объём свечи пробоя на мелком ТФ
-BRK_VWAP  = [None, 2.0, 2.5, 3.0]  # VWAP для ПРОБОЯ: None = без фильтра
 # Разбор по часам МСК. Наборы окон для сравнения целиком — отдельные часы шумят
 # (на ~60 сделках погрешность ±0.15R), поэтому смотрим и зоны, и итог по набору.
 WINDOW_SETS = {
@@ -195,7 +189,6 @@ def run():
     distres = {v: [] for v in DIST_GRID}
     cross = {(d_, v_): [] for d_ in CROSS_DIST for v_ in CROSS_VWAP}
     batches = {(d_, v_): {} for d_ in CROSS_DIST for v_ in CROSS_VWAP}
-    brk = {(sc, rv, vw): [] for sc in BRK_SCORE for rv in BRK_RVOL for vw in BRK_VWAP}
     byhour = {h: [] for h in range(24)}     # час входа по МСК -> результаты
     byday = {d: [] for d in range(7)}       # день недели (0=пн) -> результаты
     bydate = {1.0: {}, 1.5: {}}             # дата -> [результаты] для двух порогов
@@ -346,39 +339,6 @@ def run():
                     rr_ = _sim3(fut, sd_r, er, sr, a1, bndr, a3)
                     if rr_ is not None:
                         ctl_dir.append(rr_)
-                # ── ПРОБОЙ по новой схеме: ждём закрытия за уровнем ──
-                watch_n = max(6, int(B.WATCH_TTL_HOURS * 3600 / step))
-                hi_t = B.order_trigger(c["hi"], True, c["atr"])
-                lo_t = B.order_trigger(c["lo"], False, c["atr"])
-                for kb in range(k0 + 1, min(k0 + watch_n, len(fine) - hold - 2)):
-                    bar_b = fine[kb]
-                    sd_b = ("long" if bar_b["c"] > hi_t else
-                            "short" if bar_b["c"] < lo_t else None)
-                    if sd_b is None:
-                        continue
-                    fb = fine[kb + 1:kb + 1 + hold]
-                    if len(fb) < 4:
-                        break
-                    pxb = bar_b["c"]
-                    ilb = sd_b == "long"
-                    eb = pxb * (1 + SLIP / 100) if ilb else pxb * (1 - SLIP / 100)
-                    sb = pxb * (1 - STOP / 100) if ilb else pxb * (1 + STOP / 100)
-                    b1 = pxb * (1 + TP1 / 100) if ilb else pxb * (1 - TP1 / 100)
-                    b2 = c["hi"] if ilb else c["lo"]          # граница, из которой вышли
-                    hg = c["hi"] - c["lo"]
-                    b3 = (c["hi"] + hg * 0.5) if ilb else (c["lo"] - hg * 0.5)
-                    rb = _sim3(fb, sd_b, eb, sb, b1, b2, b3)
-                    if rb is not None:
-                        rvb = bar_b["v"] / vol_fine if vol_fine else 0
-                        vdb = _vwap_dist(fine, kb, bars_day)   # VWAP в момент ПРОБОЯ
-                        for sc_ in BRK_SCORE:
-                            for rv_ in BRK_RVOL:
-                                for vw_ in BRK_VWAP:
-                                    if (c["score"] >= sc_ and rvb >= rv_
-                                            and (vw_ is None or vdb is None or vdb <= vw_)):
-                                        brk[(sc_, rv_, vw_)].append(rb)
-                    break
-
                 trades.append((c["score"], c.get("rvol_half", 0),
                                c.get("sq_pct"), c.get("tr_ratio", 9),
                                c.get("rng_pct", 0), r))
@@ -622,28 +582,6 @@ def run():
         if big:
             avgb = sum(x[1] for x in big) / len(big)
             L.append(f"    дни с 5+ сделками: {len(big)} шт, в среднем ${avgb:+.0f} за день")
-
-    L += ["", "═══ <b>ПРОБОЙ на новых зарядах и по новой схеме</b> ═══",
-          "  <i>раньше его гоняли при старых порогах и со старыми целями. Здесь —",
-          "   три цели по трети (1% → граница коридора → +половина высоты) и двойная",
-          "   подтяжка стопа, то есть ровно то, что вытащило УКЛОН</i>"]
-    for sc_ in BRK_SCORE:
-        for rv_ in BRK_RVOL:
-            L.append(f"  <b>сила ≥{sc_}, объём свечи ≥{rv_}×:</b>")
-            for vw_ in BRK_VWAP:
-                lbl = "без VWAP" if vw_ is None else f"VWAP ≤{vw_}"
-                L.append(_line(brk[(sc_, rv_, vw_)], "   " + lbl))
-    allb = [r for v in brk.values() for r in v]
-    if allb:
-        best_b = max(((k, v) for k, v in brk.items() if len(v) >= 100),
-                     key=lambda kv: sum(kv[1]) / len(kv[1]), default=None)
-        if best_b:
-            eb_ = sum(best_b[1]) / len(best_b[1])
-            vwtxt = "без VWAP" if best_b[0][2] is None else f"VWAP ≤{best_b[0][2]}"
-            L.append(f"  → лучшее: сила ≥{best_b[0][0]}, объём ≥{best_b[0][1]}×, {vwtxt} — "
-                     f"{len(best_b[1])} сд, {eb_:+.3f}R")
-            L.append("  <i>для сравнения: УКЛОН на тех же зарядах даёт около +0.3R. "
-                     "Если ПРОБОЙ в плюсе — его можно вернуть вторым сигналом</i>")
 
     L += ["", "═══ <b>КОНТРОЛЬ: а не схема ли выходов даёт плюс?</b> ═══",
           "  <i>та же схема (3 цели по трети, двойная подтяжка стопа), но вход",
