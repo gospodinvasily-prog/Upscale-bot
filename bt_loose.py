@@ -57,6 +57,17 @@ DIST_GRID = [0.0, 0.5, 0.75, 1.0, 1.5, 2.0]
 # потому что считает сделки независимыми.
 CROSS_DIST = [1.0, 1.5, 2.0]
 CROSS_VWAP = [2.0, 2.5]
+# ── СТОП ЗА ГРАНИЦЕЙ КОРИДОРА ────────────────────────────────────────────────
+# Идея: стоп внутри коридора выбивает обычный шум, а стоп ЗА границей — только
+# слом структуры. Для лонга это значит, что вход должен быть близко к НИЖНЕЙ
+# границе: тогда стоп в 1% ниже входа провалится под неё.
+# Сетка — насколько глубоко стоп должен уходить за границу.
+STOPOUT_GRID = [None, 0.0, 0.25, 0.5, 1.0]   # None = не требуем (как сейчас)
+# Доли позиции на три цели. Сейчас равные трети; 50/25/25 — половина сразу.
+PARTS_GRID = {"по трети (сейчас)": (1/3, 1/3, 1/3),
+              "50/25/25": (0.5, 0.25, 0.25),
+              "50/50 (без третьей)": (0.5, 0.5, 0.0),
+              "25/25/50": (0.25, 0.25, 0.5)}
 # Разбор по часам МСК. Наборы окон для сравнения целиком — отдельные часы шумят
 # (на ~60 сделках погрешность ±0.15R), поэтому смотрим и зоны, и итог по набору.
 WINDOW_SETS = {
@@ -118,8 +129,9 @@ def _vwap_dist(fine, k, bars_day):
     return abs(fine[k]["c"] - vwap) / atr if atr else None
 
 
-def _sim3(bars, side, entry, stop, t1, t2, t3):
-    """Три цели по трети, стоп: после TP1 в безубыток, после TP2 на цену TP1."""
+def _sim3(bars, side, entry, stop, t1, t2, t3, parts=(1/3, 1/3, 1/3)):
+    """Три цели, стоп: после TP1 в безубыток, после TP2 на цену TP1.
+    parts — доли позиции на каждую цель; нулевая доля означает, что цели нет."""
     risk = abs(entry - stop)
     if risk <= 0:
         return None
@@ -130,7 +142,6 @@ def _sim3(bars, side, entry, stop, t1, t2, t3):
             tg[i] = tg[i - 1] * 1.001
         if not is_long and tg[i] >= tg[i - 1]:
             tg[i] = tg[i - 1] * 0.999
-    parts = (1 / 3, 1 / 3, 1 / 3)
     done, cur_stop, acc = 0, stop, 0.0
     for c in bars:
         if (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop):
@@ -193,6 +204,8 @@ def run():
     byday = {d: [] for d in range(7)}       # день недели (0=пн) -> результаты
     bydate = {1.0: {}, 1.5: {}}             # дата -> [результаты] для двух порогов
     bywidth = {}                            # ширина коридора -> результаты
+    stopout = {v: [] for v in STOPOUT_GRID}     # запас стопа за границей
+    partres = {k: [] for k in PARTS_GRID}       # доли позиции на цели
     # КОНТРОЛЬ: то же самое, но вход в СЛУЧАЙНЫЙ момент. Если преимущество даёт схема
     # выходов (три цели + двойная подтяжка), а не сигнал, случайный вход покажет тот же
     # плюс. Если сигнал настоящий — случайный уйдёт в ноль или минус.
@@ -264,10 +277,30 @@ def run():
                 r = _sim3(fut, c["side"], ent, stp, y1, bnd, y3)
                 if r is None:
                     continue
+                vd0 = _vwap_dist(fine, k0, bars_day)
                 for dt_ in DIST_GRID:
                     if room >= dt_:
                         distres[dt_].append(r)
-                vd0 = _vwap_dist(fine, k0, bars_day)
+
+                # ── стоп за границей коридора ──
+                # Для лонга цель — верхняя граница, стоп на 1% НИЖЕ входа.
+                # Чтобы стоп оказался за НИЖНЕЙ границей, вход должен быть к ней близко.
+                far = c["lo"] if is_l else c["hi"]          # ближняя граница (откуда идём)
+                gap = (px - far) / px * 100 if is_l else (far - px) / px * 100
+                # stp_pct — на сколько стоп ниже входа; запас = stp_pct - gap
+                margin = STOP - gap                          # >0 → стоп ЗА границей
+                if room >= B.TILT_MIN_DIST_PCT and (vd0 is None or vd0 <= B.VWAP_MAX_ATR):
+                    for so in STOPOUT_GRID:
+                        if so is None or margin >= so:
+                            stopout[so].append(r)
+                    # доли позиции — на тех же входах
+                    bnd_ = c["hi"] if is_l else c["lo"]
+                    y1_ = px * (1 + TP1 / 100) if is_l else px * (1 - TP1 / 100)
+                    y3_ = px * (1 + TP3 / 100) if is_l else px * (1 - TP3 / 100)
+                    for nm_, pr_ in PARTS_GRID.items():
+                        rr_ = _sim3(fut, c["side"], ent, stp, y1_, bnd_, y3_, pr_)
+                        if rr_ is not None:
+                            partres[nm_].append(rr_)
                 scan_key = (int(cts) // 1800, c["side"])   # скан раз в 30 мин + сторона
                 for d_ in CROSS_DIST:
                     for v_ in CROSS_VWAP:
@@ -529,6 +562,31 @@ def run():
         for k_ in sorted(bywidth):
             lbl = f"{k_[0]}–{k_[1]}%" if k_[1] < 99 else f"от {k_[0]}%"
             L.append(_line(bywidth[k_], f"коридор {lbl}"))
+
+    L += ["", "═══ <b>СТОП ЗА ГРАНИЦЕЙ КОРИДОРА</b> ═══",
+          "  <i>стоп внутри коридора выбивает обычный шум; за границей — только слом",
+          "   структуры. Для лонга это значит вход близко к НИЖНЕЙ границе.",
+          "   Запас — на сколько стоп уходит за границу</i>"]
+    for so in STOPOUT_GRID:
+        lbl = "без требования (как сейчас)" if so is None else (
+              "стоп ровно за границей" if so == 0 else f"стоп за границей с запасом {so}%")
+        L.append(_line(stopout[so], lbl))
+    base_so = stopout.get(None) or []
+    if base_so:
+        e0 = sum(base_so) / len(base_so)
+        for so in STOPOUT_GRID:
+            if so is None or not stopout[so]:
+                continue
+            n_ = len(stopout[so])
+            L.append(f"  <i>запас {so}%: осталось {n_/len(base_so)*100:.0f}% сделок "
+                     f"({n_} из {len(base_so)})</i>")
+            break
+
+    L += ["", "<b>ДОЛИ ПОЗИЦИИ НА ЦЕЛИ</b>",
+          "  <i>сейчас по трети. 50 на первую цель — быстрее фиксируем,",
+          "   но вторая подтяжка стопа работает только при трёх частях</i>"]
+    for nm_ in PARTS_GRID:
+        L.append(_line(partres[nm_], nm_))
 
     L += ["", "═══ <b>ПО ДНЯМ: насколько больно бывает</b> ═══",
           "  <i>сделки одного дня складываются целиком — пять позиций в одну сторону",
