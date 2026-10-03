@@ -29,6 +29,7 @@ PAIRS_N = int(os.environ.get("LO_PAIRS", "0"))
 FEE_PCT = float(os.environ.get("LO_FEE", "0.05"))
 SLIP    = float(os.environ.get("LO_SLIP", "0.25"))
 HOLD_H  = int(os.environ.get("LO_HOLD_H", "12"))
+OFFSET  = int(os.environ.get("LO_OFFSET", "0"))   # на сколько дней сдвинуть окно назад
 TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 
 SCORE_GRID = [6, 5, 4, 3, 2]      # 6 — как было до v9.2
@@ -83,8 +84,10 @@ TP3_MODES = [("от входа +2% (как сейчас)", None),
 
 
 def _fetch(sym, tf, days):
+    """OFFSET сдвигает окно НАЗАД: LO_OFFSET=60 даст предыдущие 60 дней, а не последние.
+    Это проверка на подгонку — если на другом периоде цифры похожие, эдж настоящий."""
     sec = TF_SEC[tf]
-    now = int(time.time())
+    now = int(time.time()) - OFFSET * 86400
     out, cur = [], now - days * 86400
     while cur < now:
         to = min(now, cur + 1900 * sec)
@@ -279,6 +282,22 @@ def run():
                             cross[(d_, v_)].append(r)
                             b = batches[(d_, v_)]
                             b[scan_key] = b.get(scan_key, 0) + 1
+                hmsk = (datetime.fromtimestamp(cts, timezone.utc).hour + 3) % 24
+                byhour[hmsk].append((r, room, vd0))
+                _dt = datetime.fromtimestamp(cts, timezone.utc)
+                _msk = _dt.timestamp() + 3 * 3600
+                _d = datetime.fromtimestamp(_msk, timezone.utc)
+                byday[_d.weekday()].append((r, room, vd0))
+                # ширина коридора: влияет ли она на результат?
+                if room >= B.TILT_MIN_DIST_PCT and (vd0 is None or vd0 <= B.VWAP_MAX_ATR):
+                    w_ = (c["hi"] - c["lo"]) / c["lo"] * 100 if c["lo"] > 0 else 0
+                    for lo_w, hi_w in ((0, 2), (2, 3), (3, 4), (4, 5), (5, 7), (7, 99)):
+                        if lo_w <= w_ < hi_w:
+                            bywidth.setdefault((lo_w, hi_w), []).append(r)
+                            break
+                for thr in (1.0, 1.5):      # кривая счёта по дням для двух порогов
+                    if room >= thr and (vd0 is None or vd0 <= B.VWAP_MAX_ATR):
+                        bydate[thr].setdefault(_d.strftime("%Y-%m-%d"), []).append(r)
                 if room < B.TILT_MIN_DIST_PCT:     # дальше — только то, что берёт бот
                     continue
                 # фильтр VWAP: на тех же входах, разные пороги
@@ -360,22 +379,6 @@ def run():
                                         brk[(sc_, rv_, vw_)].append(rb)
                     break
 
-                hmsk = (datetime.fromtimestamp(cts, timezone.utc).hour + 3) % 24
-                byhour[hmsk].append((r, room, vd0))
-                _dt = datetime.fromtimestamp(cts, timezone.utc)
-                _msk = _dt.timestamp() + 3 * 3600
-                _d = datetime.fromtimestamp(_msk, timezone.utc)
-                byday[_d.weekday()].append((r, room, vd0))
-                # ширина коридора: влияет ли она на результат?
-                if room >= B.TILT_MIN_DIST_PCT and (vd0 is None or vd0 <= B.VWAP_MAX_ATR):
-                    w_ = (c["hi"] - c["lo"]) / c["lo"] * 100 if c["lo"] > 0 else 0
-                    for lo_w, hi_w in ((0, 2), (2, 3), (3, 4), (4, 5), (5, 7), (7, 99)):
-                        if lo_w <= w_ < hi_w:
-                            bywidth.setdefault((lo_w, hi_w), []).append(r)
-                            break
-                for thr in (1.0, 1.5):      # кривая счёта по дням для двух порогов
-                    if room >= thr and (vd0 is None or vd0 <= B.VWAP_MAX_ATR):
-                        bydate[thr].setdefault(_d.strftime("%Y-%m-%d"), []).append(r)
                 trades.append((c["score"], c.get("rvol_half", 0),
                                c.get("sq_pct"), c.get("tr_ratio", 9),
                                c.get("rng_pct", 0), r))
@@ -389,7 +392,9 @@ def run():
 
     took = time.time() - t0
     L = [f"🔓 <b>Что даст ослабление условий заряда</b> (1h заряд, сделки по {FINE_TF}, "
-         f"~{cov:.0f} дн, {len(pairs)} пар)",
+         f"~{cov:.0f} дн, {len(pairs)} пар)"
+         + (f"\n⏪ <b>ПЕРИОД СДВИНУТ НАЗАД НА {OFFSET} ДНЕЙ</b> — проверка на подгонку: "
+            f"сравнивай с прогоном без сдвига" if OFFSET else ""),
          f"Схема: вход по уклону, стоп {STOP}%, три цели по трети "
          f"({TP1}% → граница → {TP3}%), стоп подтягивается",
          f"Проскальзывание {SLIP}%, комиссия {FEE_PCT}%, время {took/60:.1f} мин",
