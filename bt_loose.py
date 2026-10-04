@@ -30,6 +30,11 @@ FEE_PCT = float(os.environ.get("LO_FEE", "0.05"))
 SLIP    = float(os.environ.get("LO_SLIP", "0.25"))
 HOLD_H  = int(os.environ.get("LO_HOLD_H", "12"))
 OFFSET  = int(os.environ.get("LO_OFFSET", "0"))   # на сколько дней сдвинуть окно назад
+# Проскальзывание СТОПА: стоп-маркет на быстром движении исполняется хуже уровня.
+# Раньше считали исполнение ровно по цене стопа — убытки были занижены.
+STOP_SLIP = float(os.environ.get("LO_STOP_SLIP", "0.15"))   # % сверх стопа
+# Фандинг: позиция живёт до 12ч, это 1-2 периода по ~0.01% за период.
+FUNDING_PCT = float(os.environ.get("LO_FUNDING", "0.015"))  # % от номинала за сделку
 TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 
 SCORE_GRID = [6, 5, 4, 3, 2]      # 6 — как было до v9.2
@@ -146,8 +151,10 @@ def _sim3(bars, side, entry, stop, t1, t2, t3, parts=(1/3, 1/3, 1/3)):
     for c in bars:
         if (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop):
             left = sum(parts[done:])
-            r = (cur_stop - entry) / risk if is_long else (entry - cur_stop) / risk
-            return acc + r * left - FEE_PCT / 100 * entry / risk
+            # стоп-маркет исполняется хуже уровня — закладываем проскальзывание
+            fill_stop = cur_stop * (1 - STOP_SLIP / 100) if is_long else cur_stop * (1 + STOP_SLIP / 100)
+            r = (fill_stop - entry) / risk if is_long else (entry - fill_stop) / risk
+            return acc + r * left - (FEE_PCT + FUNDING_PCT) / 100 * entry / risk
         while done < 3:
             t = tg[done]
             if (c["h"] >= t) if is_long else (c["l"] <= t):
@@ -160,11 +167,11 @@ def _sim3(bars, side, entry, stop, t1, t2, t3, parts=(1/3, 1/3, 1/3)):
             else:
                 break
         if done >= 3:
-            return acc - FEE_PCT / 100 * entry / risk
+            return acc - (FEE_PCT + FUNDING_PCT) / 100 * entry / risk
     last = bars[-1]["c"] if bars else entry
     left = sum(parts[done:])
     r = (last - entry) / risk if is_long else (entry - last) / risk
-    return acc + r * left - FEE_PCT / 100 * entry / risk
+    return acc + r * left - (FEE_PCT + FUNDING_PCT) / 100 * entry / risk
 
 
 def _line(rs, label):
@@ -195,6 +202,7 @@ def run():
     B.ACC_MAX_RANGE_ABS = max(RNG_GRID)
 
     trades = []          # (score, rvol, sq, tr, rng, R)
+    day_syms = {}        # дата -> монеты, по которым сегодня уже торговали
     tp3res = {name: [] for name, _ in TP3_MODES}
     vwres = {v: [] for v in VWAP_GRID}
     distres = {v: [] for v in DIST_GRID}
@@ -253,21 +261,34 @@ def run():
                 if not c or c["side"] not in ("long", "short"):
                     continue
                 n_ch += 1
-                k0 = idx.get(cts)
+                # ИСПРАВЛЕНО: часовая свеча с t=cts ЗАКРЫВАЕТСЯ в cts+3600 — только тогда
+                # сигнал и существует. Раньше брали 15м свечу с тем же t и входили по её
+                # закрытию (cts+900), то есть на 45 минут РАНЬШЕ появления сигнала.
+                # Это подглядывание в будущее и систематическое завышение результата:
+                # для лонга цена внутри часа растёт, значит вход был дешевле реального.
+                # Теперь вход по ОТКРЫТИЮ первой 15м свечи после закрытия часовой —
+                # это и есть момент скана живого бота.
+                sig_ts = cts + 3600
+                k0 = idx.get(sig_ts)
                 if k0 is None:
                     for off in range(1, int(3600 / step) + 1):
-                        k0 = idx.get(cts + off * step)
+                        k0 = idx.get(sig_ts + off * step)
                         if k0 is not None:
                             break
                 if k0 is None:
                     continue
-                px = fine[k0]["c"]
+                px = fine[k0]["o"]          # цена на момент скана, а не через 15 минут
+                # правило бота «одна монета — одна сделка в день» в модели не было
+                _day = datetime.fromtimestamp(sig_ts + 3 * 3600, timezone.utc).strftime("%Y-%m-%d")
+                if sym in day_syms.setdefault(_day, set()):
+                    continue
+                day_syms[_day].add(sym)
                 is_l = c["side"] == "long"
                 bnd = c["hi"] if is_l else c["lo"]
                 room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
                 if room < min(DIST_GRID):          # самый мягкий порог сетки
                     continue
-                fut = fine[k0 + 1:k0 + 1 + hold]
+                fut = fine[k0:k0 + hold]      # свеча входа включена: вошли по её открытию
                 if len(fut) < 4:
                     continue
                 ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)

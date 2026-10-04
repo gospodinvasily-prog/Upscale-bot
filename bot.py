@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v9.13"
+BOT_VERSION    = "v9.14"
 
 TRADING_START_MSK = 4          # окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -1561,15 +1561,20 @@ def charge_verdict(c: dict) -> str:
     if abs(c["change_24h"]) >= 15:
         facts.append(f"разогрета ({c['change_24h']:+.0f}% за сутки)")
     tail = ", ".join(facts[:3])
-    if s >= 9:
-        act = (f"Ставлю ордера {side}, полный размер." if BREAKOUT_ENABLED
-               else f"Беру {side} по рынку, полный размер.")
-    elif s >= 7:
-        act = (f"Ставлю ордера {side}, веду строго по стопу." if BREAKOUT_ENABLED
-               else f"Беру {side} по рынку, веду строго по стопу.")
+    # v9.14: вердикт должен совпадать с реальным решением. Раньше писал «Беру по рынку»
+    # даже когда УКЛОН отказывался входить — сообщение противоречило само себе.
+    takes = False
+    if TILT_ENABLED and c["side"] in ("long", "short"):
+        is_l = c["side"] == "long"
+        bnd = c["hi"] if is_l else c["lo"]
+        d = (bnd - c["price"]) / c["price"] * 100 if is_l else (c["price"] - bnd) / c["price"] * 100
+        takes = d >= TILT_MIN_DIST_PCT
+    if not takes:
+        act = "Вход не беру — смотрю дальше."
+    elif s >= 9:
+        act = f"Беру {side} по рынку, полный размер."
     else:
-        act = ("Слабоват: ордера только если по пути с BTC." if c["side"] != "both"
-               else "Слабый и без направления — можно пропустить.")
+        act = f"Беру {side} по рынку, веду строго по стопу."
     return f"💬 {act}" + (f" Нравится: {tail}." if tail else "")
 
 def format_charge(c: dict) -> str:
@@ -1584,19 +1589,20 @@ def format_charge(c: dict) -> str:
     up_stop = max(c["lo"], c["hi"] - c["atr"])
     dn_stop = min(c["hi"], c["lo"] + c["atr"])
     sq = f"BB в нижних {c['sq_pct']:.0f}%" if c["sq_pct"] is not None else "BB —"
+    # v9.14: оставляем только то, что реально участвует в решении. Ликвидации,
+    # фандинг, изменение за 24ч и 15-минутный OI в расчёте не используются —
+    # это был информационный шум, который мешал читать сообщение.
     lines = [
-        f"⏳ <b>ЗАРЯД {P['tf']} — {c['symbol']}/USDT</b> | {msk_time_str()}",
-        f"Направление: <b>{side_txt}</b>",
-        f"Сила заряда: {bat} ({c['score']}/{ACC_MAX_SCORE})",
-        f"Таймфрейм: {P['tf']} | Диапазон {WT}: {c['lo']:.6g} – {c['hi']:.6g} (ширина {c['rng_pct']:.2f}%)",
-        f"Цена: {c['price']:.6g} — {c['pos']*100:.0f}% диапазона | за {WT} {c['chg_win']:+.2f}%",
-        f"Сжатие: {sq} | свечи {c['tr_ratio']*100:.0f}% от нормы",
-        f"Объём {HT}: {c['rvol_half']:.1f}× нормы{' 📈 растёт' if c['vol_rising'] else ''}",
-        oi_line,
-        f"Taker L/S {WT}: {taker} | Фандинг: {c['funding']:+.3f}% | 24ч: {c['change_24h']:+.1f}%",
+        f"⏳ <b>ЗАРЯД {c['symbol']}/USDT</b> | {msk_time_str()}",
+        f"<b>{side_txt}</b> | сила {bat} {c['score']}/{ACC_MAX_SCORE}",
+        f"Коридор {WT}: {c['lo']:.6g} – {c['hi']:.6g} (ширина {c['rng_pct']:.2f}%)",
+        f"Цена {c['price']:.6g} — {c['pos']*100:.0f}% диапазона",
+        f"Сжатие: {sq} | свечи {c['tr_ratio']*100:.0f}% от нормы | "
+        f"объём {c['rvol_half']:.1f}×{' 📈' if c['vol_rising'] else ''}",
     ]
-    if c["liq_short_win"] or c["liq_long_win"]:
-        lines.append(f"Ликвидации {WT}: шортов {fmt_usd(c['liq_short_win'])} / лонгов {fmt_usd(c['liq_long_win'])}")
+    if c["oi_win"] is not None:
+        lines.append(f"OI {WT}: <b>{c['oi_win']:+.2f}%</b>"
+                     + (f" | Taker L/S: {taker}" if c["taker_win"] is not None else ""))
     # v8.3: готовые ордера — по бэктесту вход ПО УРОВНЮ даёт +0.21% на сделку,
     # а вход после закрытия свечи (то есть по факту сообщения) — минус.
     # v9.6: ПРОБОЙ отключён, ордера по уровням больше не ставим — блок показывался
@@ -2635,17 +2641,30 @@ def cmd_watch():
                    f"{w['lo']:.6g}–{w['hi']:.6g}")
     return "\n".join(out)
 
-HELP_TEXT = ("<b>Команды:</b>\n"
-             "/fill SEI 0.28462 — реальная цена входа\n"
-             "/tp1 SEI — забрал половину по TP1 (стоп в безубыток)\n"
-             "/out SEI 0.2901 — закрыл остаток\n"
-             "/stop SEI — выбило стопом\n"
-             "/skip SEI причина — сигнал пропустил\n"
-             "/stat — мои сделки и проскальзывание\n"
-             "/log — прислать журналы прямо сейчас | /restore — вернуть очередь оценки\n"
-             "/watch — что сейчас в зарядке\n"
-             "/up — статус авто-слоя Upscale | /uptest — тест: открыть и закрыть BTC на демо | /risk — баланс, просадка, лимиты\n"
-             "/halt — пауза исполнения | /resume — продолжить | /closeall — закрыть всё на демо")
+HELP_TEXT = (
+    "<b>📊 СТАТИСТИКА С БИРЖИ</b>\n"
+    "/hist — результаты закрытых сделок: по дням, по монетам, в единицах риска\n"
+    "        <i>/hist 30 — за 30 дней (по умолчанию 7). Эти данные не теряются при перезапуске</i>\n"
+    "/up — версия, режим, эквити, открытые позиции\n"
+    "/risk — баланс, просадка, до лимитов\n"
+    "/riskraw — то же сырым ответом API (для разбора проблем)\n"
+    "\n<b>⚙️ УПРАВЛЕНИЕ</b>\n"
+    "/halt — пауза: новых входов не будет, открытые позиции и их ордера остаются\n"
+    "/resume — снять паузу\n"
+    "/closeall — закрыть все позиции на демо\n"
+    "/uptest — тест связи: открыть и сразу закрыть BTC на демо\n"
+    "\n<b>📒 ЖУРНАЛЫ</b>\n"
+    "/log — прислать все файлы прямо сейчас\n"
+    "/restore — вернуть очередь оценки (перешли боту файл pending_v9.json)\n"
+    "/watch — что сейчас в зарядке\n"
+    "\n<b>✍️ РУЧНОЙ УЧЁТ</b> <i>(если вмешиваешься в сделку руками)</i>\n"
+    "/fill SEI 0.28462 — реальная цена входа\n"
+    "/tp1 SEI — забрал первую цель\n"
+    "/out SEI 0.2901 — закрыл остаток\n"
+    "/stop SEI — выбило стопом\n"
+    "/skip SEI причина — сигнал пропустил\n"
+    "/stat — мои сделки и проскальзывание")
+
 
 # ── Авто-слой Upscale (v0: dry, ордера не отправляет). AUTO_TRADE=off|dry в переменных Render ──
 EXECUTOR = upscale_exec.Executor(send_telegram, lambda row: _append_csv(EXEC_CSV, row), RISK_USD, MAX_POS_USD, UPSCALE_PAIRS + ["BTC"])
@@ -2758,7 +2777,9 @@ def send_status(signal_count=0, btc_chg=None):
     lines = [f"🤖 <b>Upscale Bot {BOT_VERSION}</b> | {now.strftime('%H:%M МСК')}",
              get_market_context().lstrip("\n")]
     if WATCHLIST:
-        lines.append(f"\n⏳ <b>В зарядке ({len(WATCHLIST)}):</b>")
+        lines.append(f"\n⏳ <b>В зарядке ({len(WATCHLIST)}):</b> "
+                     f"<i>найдены за последние {WATCH_TTL_HOURS}ч; решение по входу "
+                     f"принималось в момент находки</i>")
         for s, w in sorted(WATCHLIST.items(), key=lambda x: -x[1]["score"]):
             side = {"long": "🟢 уклон вверх", "short": "🔴 уклон вниз"}.get(w["side"], "⚪ уклон неясен")
             tf = w["P"]["tf"] if "P" in w else CHARGE_TF
@@ -2949,41 +2970,32 @@ def main():
                 traceback.print_exc()
                 send_telegram(f"⚠️ Бэктест не отработал: {esc(str(e))}\nБот продолжает работу в обычном режиме.")
 
-    mom_lvl = "🟢" if MOMENTUM_MIN_SCORE >= 8 else "🟡/🟢"
     start_lines = [
-        f"🚀 <b>Upscale Bot {BOT_VERSION} запущен</b>",
-        f"⏳ ЗАРЯД {CHARGE_TF} — сжатие + объём/OI при стоящей цене, коридор {WIN_TXT} ({ACC_WINDOW} свечей), скан каждые {CHARGE_SCAN_MIN} мин",
-        f"📏 Потолок размаха: адаптивный {ACC_RANGE_ATR_K}×ATR×√окно (предел {ACC_MAX_RANGE_ABS}%, пол {ACC_RANGE_FLOOR_PCT}%)",
-    ]
-    if BTC_CHARGE_ENABLED:
-        start_lines.append(f"🟠 BTC — отдельный ЗАРЯД→ПРОБОЙ на {BTC_CHARGE_TF}, окно {BTC_P['win_txt']}, скан раз в час")
-    if BREAKOUT_ENABLED:
-        start_lines.append(f"⚡ ПРОБОЙ — подтверждение: закрытие {BREAK_CONFIRM_TF} свечи "
-                           f"за уровнем, объём ≥{BREAK_MIN_RVOL}×")
-    else:
-        start_lines.append("⚡ ПРОБОЙ — отключён (убыточен по бэктесту), работает только УКЛОН")
-    start_lines.append(
-        f"🎯 Фильтры: VWAP ≤{VWAP_MAX_ATR} ATR | ход до границы ≥{TILT_MIN_DIST_PCT}% | "
+        f"🚀 <b>Upscale Bot {BOT_VERSION}</b> | режим: <b>{EXECUTOR.mode}</b>"
+        + {"dry": " (только сообщения)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""),
+        "",
+        f"⏳ <b>ЗАРЯД</b> {CHARGE_TF} — сжатие при стоящей цене, коридор {WIN_TXT}, скан раз в {CHARGE_SCAN_MIN} мин",
+        f"   сила ≥{ACC_MIN_SCORE}/{ACC_MAX_SCORE} | объём ≥{ACC_RVOL_MIN}× | "
+        f"размах ≤{ACC_RANGE_ATR_K}×ATR×√окно (до {ACC_MAX_RANGE_ABS}%)",
+        "",
+        f"🎯 <b>УКЛОН</b> — вход по рынку сразу при заряде (ПРОБОЙ отключён)",
+        f"   ход до границы ≥{TILT_MIN_DIST_PCT}% | VWAP ≤{VWAP_MAX_ATR} ATR",
+        f"   стоп {TILT_STOP_PCT}% | цели по трети: {TILT_TP1_PCT}% → граница → {TILT_TP3_PCT}%",
+        f"   стоп подтягивается после первой и второй цели",
+        "",
+        f"🛡 <b>Ограничения:</b> "
         + ("1 монета в день | " if ONE_PER_SYMBOL_DAY else "")
-        + (f"≤{DAILY_MAX_SIGNALS} сигналов в день | " if DAILY_MAX_SIGNALS else "")
-        + (f"≤{MAX_SAME_SIDE_30M} в сторону | " if MAX_SAME_SIDE_30M else "")
-        + f"стоп дня после {DAY_STOP_LOSSES} убытков")
+        + (f"≤{MAX_SAME_SIDE_30M} в одну сторону | " if MAX_SAME_SIDE_30M else "")
+        + f"стоп дня после {DAY_STOP_LOSSES} убытков",
+        f"💰 Риск ${RISK_USD:.0f} на сделку | дневной лимит ${DAY_LOSS_USD:.0f}",
+    ]
     if EXCLUDE_SYMBOLS:
         start_lines.append(f"🚫 Не торгуем: {', '.join(sorted(EXCLUDE_SYMBOLS))}")
-    start_lines.append(f"💰 Риск ${RISK_USD:.0f} на сделку (лимиты: ${DAY_LOSS_USD:.0f} в день)")
-    start_lines.append(f"🤖 Авто-слой Upscale: {EXECUTOR.mode}" + ({"dry": " (только сообщения, ордеров нет)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""))
-                       + " | /up статус, /halt пауза")
-    if MOMENTUM_ENABLED:
-        start_lines.append(f"🚀 ИМПУЛЬС 5М — только оценка от {MOMENTUM_MIN_SCORE} ({mom_lvl}), скан каждые 5 мин")
-    else:
-        start_lines.append("🚀 ИМПУЛЬС — выключен")
     start_lines += [
-        "📊 BTC контекст: 1D + 4H + изменение цены и OI за 12ч + EQH/EQL",
-        f"📒 Лог сигналов и исходов: {os.path.basename(SIGNALS_CSV)}",
-        f"📨 Сигналы шлём: {windows_txt()} МСК (вне окон бот работает молча)",
-        f"📒 Сводка и файлы: {SUMMARY_HHMM[0]:02d}:{SUMMARY_HHMM[1]:02d} МСК",
-        "💬 Команды: /fill /tp1 /out /stop /skip /stat /watch (/help — подсказка)",
-        f"Пар: {len(UPSCALE_PAIRS)} | Бот активен: {TRADING_START_MSK}:00–{TRADING_END_MSK}:00 МСК",
+        "",
+        f"📨 Окно сигналов: {windows_txt()} МСК | сводка {SUMMARY_HHMM[0]:02d}:{SUMMARY_HHMM[1]:02d}",
+        f"📊 Пар: {len(UPSCALE_PAIRS)}",
+        "💬 /help — все команды | /up статус | /halt пауза",
     ]
     send_telegram("\n".join(start_lines))
 

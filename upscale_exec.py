@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "2.4"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.6"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -954,14 +954,27 @@ class Executor:
             return 0
 
         trades, adj_cnt, n_ord = {}, 0, 0
+        failed = []
         for sym in syms:
             m = self._mk.get(sym)
             if not m:
                 continue
             asset = sym if form == "тикер" else str(m.get("id", ""))
-            try:
-                data = self.client.orders_history(self.account_id, asset, 100)
-            except UpscaleError:
+            # v2.6: раньше сбойный рынок молча пропускался (`except: continue`),
+            # и при 152 запросах часть падала по лимиту частоты — КАЖДЫЙ РАЗ РАЗНАЯ.
+            # Из-за этого монеты то появлялись, то исчезали между вызовами /hist,
+            # и итог был неполным. Теперь повторяем и считаем несобранное.
+            data = None
+            for attempt in range(3):
+                try:
+                    data = self.client.orders_history(self.account_id, asset, 100)
+                    break
+                except UpscaleError as e:
+                    if attempt == 2:
+                        failed.append(f"{sym}: {_trunc(e, 60)}")
+                    else:
+                        time.sleep(0.4 * (attempt + 1))
+            if data is None:
                 continue
             for o in _as_list(data):
                 if not isinstance(o, dict):
@@ -993,8 +1006,12 @@ class Executor:
         except Exception:
             pass
 
-        L.append(f"Опрошено рынков: {len(syms)} | ордеров с результатом: {n_ord} | "
-                 f"сделок (по позициям): {len(closed)}")
+        L.append(f"Опрошено рынков: {len(syms) - len(failed)} из {len(syms)} | "
+                 f"ордеров с результатом: {n_ord} | сделок (по позициям): {len(closed)}")
+        if failed:
+            L.append(f"⚠️ <b>не ответили {len(failed)} рынков</b> — итог неполный: "
+                     + ", ".join(f.split(":")[0] for f in failed[:12])
+                     + (" и др." if len(failed) > 12 else ""))
         if not closed and not open_n:
             return "\n".join(L + ["За период сделок нет."])
 
@@ -1012,7 +1029,19 @@ class Executor:
                   f"Профит-фактор: {pf:.2f}"]
         if open_n:
             L.append(f"ОТКРЫТО сейчас: {open_n} поз, ${open_pnl:+.2f} (в балансе уже есть)")
-            L.append(f"<b>ВСЕГО: ${tot + open_pnl:+.2f}</b> — должно сойтись с балансом счёта")
+            L.append(f"За период всего: ${tot + open_pnl:+.2f}")
+        # v2.5: баланс берём из API — он за ВСЁ время, а не за выбранный период.
+        # Раньше строка «должно сойтись с балансом» вводила в заблуждение: окно в 7 дней
+        # могло начинаться в середине истории счёта, и суммы не совпадали.
+        try:
+            snap = self._snapshot()
+            if snap:
+                eq, start = snap.get("equity"), snap.get("base")
+                if eq is not None and start:
+                    L.append(f"<b>СЧЁТ: ${eq:,.2f}</b> из ${start:,.2f} "
+                             f"(<b>${eq - start:+,.2f}</b> за всё время)")
+        except Exception:
+            pass
         if adj_cnt:
             L.append(f"⚠️ корректировка 60с применена к {adj_cnt} ордерам — "
                      f"эта прибыль не засчитана Upscale")
