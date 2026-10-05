@@ -12,6 +12,7 @@ Upscale Bot v8.1 — воронка (Gate.io USDT-фьючерсы):
 """
 
 import os
+import re
 import csv
 import signal as _signal
 import html
@@ -29,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v10.3"
+BOT_VERSION    = "v10.4"
 
 TRADING_START_MSK = 4          # окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -457,11 +458,39 @@ def send_document(path: str, caption: str = ""):
     except Exception as e:
         print(f"[TG DOC ERROR] {path}: {e}")
 
+_HTML_OK = ("b", "i", "u", "s", "code", "pre", "a")
+
+def _escape_stray(text: str) -> str:
+    """Экранирует «<» и «&», которые НЕ являются частью разрешённого тега.
+    Telegram отвечает 400 «can\'t parse entities», если встретит одиночный «<» —
+    так пропал отчёт bt_pairs со строкой «(ATR < 1.06%)»."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "&":
+            m = re.match(r"&(amp|lt|gt|quot|#\d+);", text[i:])
+            out.append(text[i:i + m.end()] if m else "&amp;")
+            i += m.end() if m else 1
+            continue
+        if ch == "<":
+            m = re.match(r"</?([a-zA-Z0-9]+)(\s[^<>]*)?/?>", text[i:])
+            if m and m.group(1).lower() in _HTML_OK:
+                out.append(text[i:i + m.end()])
+                i += m.end()
+                continue
+            out.append("&lt;")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
 def _balance_html(text: str) -> str:
     """Закрывает теги, оставшиеся открытыми в куске. Нужно потому, что в отчётах
     бывают многострочные пояснения вида <i>…три строки…</i>: если разделитель
     режет пачку между ними, обе половины получаются с непарными тегами, и
     Telegram отвечает 400 Bad Request вместо отправки."""
+    text = _escape_stray(text)
     for tag in ("b", "i", "code", "pre", "u", "s"):
         opened = text.count(f"<{tag}>") - text.count(f"</{tag}>")
         if opened > 0:

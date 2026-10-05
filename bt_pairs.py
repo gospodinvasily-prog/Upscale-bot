@@ -210,7 +210,7 @@ def run():
                     continue
                 atr_pct = c["atr"] / px * 100 if px > 0 else 0
                 per.setdefault(sym, []).append((ts, side, px, bnd, atr_pct,
-                                                fine[k:k + hold]))
+                                                fine[k:k + hold], fine[k:k + 49]))
                 last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
                 break
         if i % 20 == 0:
@@ -219,7 +219,7 @@ def run():
                   f"{time.time()-t0:.0f}с")
 
     def run_trade(rec, stop_pct=None, atr_k=None, coin=False):
-        ts, side, px, bnd, atr_pct, seg = rec
+        ts, side, px, bnd, atr_pct, seg = rec[:6]
         sd = rng.choice(("long", "short")) if coin else side
         is_l = sd == "long"
         b = bnd if sd == side else (px * (1 + DIST / 100) if is_l else px * (1 - DIST / 100))
@@ -246,26 +246,79 @@ def run():
          f"Сделок всего: {len(all_recs)} | пар с сделками: {len(per)}",
          f"Проскальзывание {SLIP}%, издержки {COST}%", ""]
 
+    # ── 0. ЕСТЬ ЛИ ВООБЩЕ ДВИЖЕНИЕ В НАШУ СТОРОНУ ──
+    # Главная проверка: убираем стопы, цели, подтяжки и комиссии. Остаётся вопрос,
+    # на который всё опирается: уходит ли цена после заряда в сторону уклона?
+    # Если движения нет, никакая схема выхода его не создаст — и тогда все переборы
+    # фильтров были перестановкой без смысла. Ломаться тут почти нечему: две цены и вычитание.
+    HORIZONS = [(1, 4), (2, 8), (4, 16), (8, 32), (12, 48)]      # часы → 15м свечей
+    L.append("<b>0. ЕСТЬ ЛИ ДВИЖЕНИЕ В НАШУ СТОРОНУ</b> (без стопов и целей)")
+    L.append("  <i>средний ход цены в сторону уклона через N часов, в % от входа. "
+             "Рядом — то же при случайном направлении</i>")
+    any_edge = False
+    for hh, nb in HORIZONS:
+        mine, rnd_ = [], []
+        for s_, v in per.items():
+            for rec in v:
+                ts, side, px, bnd, atr_pct, seg = rec[:6]
+                tail = rec[6] if len(rec) > 6 else seg
+                if len(tail) <= nb or px <= 0:
+                    continue
+                move = (tail[nb]["c"] - px) / px * 100
+                mine.append(move if side == "long" else -move)
+                rnd_.append(move if rng.random() < 0.5 else -move)
+        if not mine:
+            continue
+        n = len(mine)
+        avg = sum(mine) / n
+        se = (statistics.pstdev(mine) / (n ** 0.5)) if n > 1 else 0.0
+        pos = sum(1 for x in mine if x > 0) / n * 100
+        ravg = sum(rnd_) / len(rnd_) if rnd_ else 0.0
+        mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
+        if avg - 1.96 * se > 0:
+            any_edge = True
+        L.append(f"  {mark} через {hh:2}ч: {n:4} набл., средний ход <b>{avg:+.3f}%</b> "
+                 f"(±{1.96*se:.3f}), в плюс {pos:.0f}% | случайно {ravg:+.3f}%")
+    L.append("  <i>" + ("есть горизонт со значимым плюсом — сигнал существует, "
+                        "дальше имеет смысл подбирать схему выхода"
+                        if any_edge else
+                        "ни на одном горизонте значимого плюса нет — движения в нашу сторону "
+                        "не обнаружено, и схемой выхода это не лечится") + "</i>")
+    L.append("")
+
     # ── 1. группы по волатильности ──
     vol_of = {s: statistics.median([r[4] for r in v]) for s, v in per.items() if v}
-    groups = [("спокойные (ATR < 0.6%)", lambda a: a < 0.6),
-              ("средние (0.6–1.0%)", lambda a: 0.6 <= a < 1.0),
-              ("живые (1.0–1.5%)", lambda a: 1.0 <= a < 1.5),
-              ("дёрганые (≥1.5%)", lambda a: a >= 1.5)]
-    L.append("<b>1. ГРУППЫ ПО ВОЛАТИЛЬНОСТИ</b> (ATR пары в % от цены, медиана)")
+    vals = sorted(vol_of.values())
+    # Границы берём ПО ДАННЫМ (квартили), а не выдуманные: так в каждой группе примерно
+    # поровну пар при любом распределении волатильности. Раньше пороги 0.6/1.0/1.5%
+    # были взяты на глаз и при другом рынке могли оставить группы пустыми.
+    def q(p):
+        return vals[min(len(vals) - 1, int(len(vals) * p))] if vals else 0.0
+    q1, q2, q3 = q(0.25), q(0.50), q(0.75)
+    groups = [(f"1 самые спокойные (ATR < {q1:.2f}%)", lambda a, x=q1: a < x),
+              (f"2 ниже среднего ({q1:.2f}–{q2:.2f}%)", lambda a, x=q1, y=q2: x <= a < y),
+              (f"3 выше среднего ({q2:.2f}–{q3:.2f}%)", lambda a, x=q2, y=q3: x <= a < y),
+              (f"4 самые дёрганые (≥{q3:.2f}%)", lambda a, x=q3: a >= x)]
+    if vals:
+        L.append(f"<b>РАЗБРОС ВОЛАТИЛЬНОСТИ</b> (медианный ATR пары, % от цены): "
+                 f"мин {vals[0]:.2f} | 25% {q1:.2f} | медиана {q2:.2f} | 75% {q3:.2f} | "
+                 f"макс {vals[-1]:.2f}")
+        L.append("")
+    L.append("<b>1. ГРУППЫ ПО ВОЛАТИЛЬНОСТИ</b> (границы — квартили по самим парам)")
+    L.append("  <i>рядом монетка на тех же сделках: если наш результат не лучше её, "
+             "группа ничего не доказывает</i>")
     for gname, cond in groups:
         syms = [s for s, a in vol_of.items() if cond(a)]
-        rs = [run_trade(r) for s in syms for r in per[s]]
-        rs = [x for x in rs if x is not None]
-        cl = [run_trade(r, coin=True) for s in syms for r in per[s]]
-        cl = [x for x in cl if x is not None]
+        rs = [x for x in (run_trade(r) for s in syms for r in per[s]) if x is not None]
+        cl = [x for x in (run_trade(r, coin=True) for s in syms for r in per[s]) if x is not None]
         st, sc = _stat(rs), _stat(cl)
         if not st:
             L.append(f"  {gname}: сделок нет")
             continue
         mark = "✅" if st[1] - st[2] > 0 else "❌" if st[1] + st[2] < 0 else "  "
+        tail = f" | монетка {sc[1]:+.3f}R, эдж {st[1]-sc[1]:+.3f}R" if sc else ""
         L.append(f"  {mark} {gname}: {len(syms)} пар, {st[0]:4} сд, ВР {st[3]:3.0f}%, "
-                 f"<b>{st[1]:+.3f}R</b> (±{st[2]:.3f}) | монетка {sc[1]:+.3f}R" if sc else "")
+                 f"<b>{st[1]:+.3f}R</b> (±{st[2]:.3f}){tail}")
     L.append("")
 
     # ── 2. персональный стоп по группам ──
