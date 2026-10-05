@@ -2904,6 +2904,7 @@ def main():
         print(f"[PENDING] поднял с диска записей: {_restored}")
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "СХЕМА ВХОДА (bt_entry.py)" if bt_mode in ("entry", "10")
            else "ОСЛАБЛЕНИЯ (bt_loose.py)" if bt_mode in ("loose", "9")
            else "ДИАГНОСТИКА зарядов (bt_why.py)" if bt_mode in ("why", "8")
            else "ДЛИННЫЙ бэктест (bt_long.py)" if bt_mode in ("long", "7")
@@ -2913,7 +2914,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -2935,7 +2936,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("loose", "9"):
+                if bt_mode in ("entry", "10"):
+                    import bt_entry
+                    bt_entry.main()        # новая схема входа с подтверждением
+                elif bt_mode in ("loose", "9"):
                     import bt_loose
                     bt_loose.main()        # что даст ослабление условий заряда
                 elif bt_mode in ("why", "8"):
