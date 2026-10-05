@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v10.2"
+BOT_VERSION    = "v10.3"
 
 TRADING_START_MSK = 4          # окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -177,6 +177,12 @@ CHARGE_SCAN_OFFSET_MIN = int(os.environ.get("CHARGE_SCAN_OFFSET_MIN", "0"))
 # Но доверительный интервал ±0.20R, то есть плюс НЕ доказан; на чужом периоде не проверен.
 BTC_FILTER_ENABLED  = os.environ.get("BTC_FILTER", "1") == "1"
 BTC_VWAP_MARGIN_PCT = float(os.environ.get("BTC_VWAP_MARGIN_PCT", "0.2"))
+# v10.3: сторона VWAP у САМОЙ ПАРЫ. Лонг — только когда цена пары выше её VWAP, шорт — ниже.
+# Запас в % от VWAP; между границами сторона считается неопределённой и вход пропускается.
+# Для зарядов без уклона пары направление задаёт BTC, но сторона VWAP пары всё равно должна
+# совпасть. В бэктесте bt_btc этот фильтр отдельно НЕ проверялся — ставим по твоему решению.
+PAIR_VWAP_SIDE_ENABLED = os.environ.get("PAIR_VWAP_SIDE", "1") == "1"
+PAIR_VWAP_SIDE_MARGIN  = float(os.environ.get("PAIR_VWAP_SIDE_MARGIN", "0.0"))
 VWAP_WINDOW_BARS    = 97      # ≈ сутки 15м свечей, как в бэктесте
 # v9.11: вернули 60 (было 30). Бэктест проверяет заряды на ЗАКРЫТЫХ часовых свечах,
 # то есть раз в час. При скане раз в полчаса бот брал входы в середине часа по
@@ -2370,6 +2376,20 @@ def pair_vwap_dist(sym: str, price: float, atr: float):
     ok, _txt, d = vwap_filter(sym, price)
     return ok, (f"{d:.1f}" if d is not None else "н/д"), d
 
+def pair_vwap_side(sym: str):
+    """Сторона пары относительно её VWAP по ПОСЛЕДНЕЙ ЗАКРЫТОЙ 15м свече.
+    Возвращает (сторона, отклонение в %): long / short / neutral / None, если данных нет."""
+    raw = get_candles(sym, "15m", VWAP_WINDOW_BARS + 8)
+    closed, _, _ = split_closed(raw, 900, time.time())
+    if len(closed) < 40:
+        return None, 0.0
+    vw = vwap_rolling(closed)
+    if not vw:
+        return None, 0.0
+    dev = (closed[-1]["c"] - vw) / vw * 100
+    m = PAIR_VWAP_SIDE_MARGIN
+    return ("long" if dev > m else "short" if dev < -m else "neutral"), dev
+
 def tilt_decision(c: dict, btc: dict) -> dict:
     """Решение по ОДНОМУ заряду. status: enter / skip. Порядок проверок: окно → BTC →
     расстояние до границы и защита после стопа → VWAP пары. Лимиты и «одна монета в день»
@@ -2395,6 +2415,17 @@ def tilt_decision(c: dict, btc: dict) -> dict:
     elif side == "both":
         return {"status": "skip", "group": "уклон неясен", "detail": ""}
 
+    if PAIR_VWAP_SIDE_ENABLED:
+        ps, pdev = pair_vwap_side(sym)
+        if ps is None:
+            return {"status": "skip", "group": "нет данных VWAP пары", "detail": ""}
+        if ps == "neutral":
+            return {"status": "skip", "group": "пара на своём VWAP", "detail": f"{pdev:+.2f}%"}
+        if ps != side:
+            where = "выше" if pdev > 0 else "ниже"
+            return {"status": "skip",
+                    "group": f"пара {where} своего VWAP, а вход в {RU_SIDE[side]}",
+                    "detail": f"{pdev:+.2f}%"}
     tilt = build_tilt(dict(c, side=side))
     if tilt is None:
         is_l = side == "long"
@@ -3034,6 +3065,7 @@ def main():
         print(f"[PENDING] поднял с диска записей: {_restored}")
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "РАЗБОР ПО ПАРАМ (bt_pairs.py)" if bt_mode in ("pairs", "17")
            else "ФИЛЬТР ПО BTC (bt_btc.py)" if bt_mode in ("btc", "16")
            else "ПРОБОЙ VWAP (bt_vbreak.py)" if bt_mode in ("vbreak", "15")
            else "VWAP КАК МАГНИТ (bt_vwap.py)" if bt_mode in ("vwap", "14")
@@ -3050,7 +3082,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -3072,7 +3104,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("btc", "16"):
+                if bt_mode in ("pairs", "17"):
+                    import bt_pairs
+                    bt_pairs.main()        # разбор по парам и группам
+                elif bt_mode in ("btc", "16"):
                     import bt_btc
                     bt_btc.main()          # фильтр по уклону BTC
                 elif bt_mode in ("vbreak", "15"):
@@ -3141,6 +3176,10 @@ def main():
         (f"₿ <b>Фильтр BTC:</b> выше своего VWAP на ≥{BTC_VWAP_MARGIN_PCT}% → только лонги, "
          f"ниже → только шорты, между → пропуск. Уклон пары неясен — берём направление BTC")
         if BTC_FILTER_ENABLED else "₿ Фильтр BTC выключен",
+        (f"📍 <b>Сторона VWAP пары:</b> лонг только когда цена пары выше её VWAP"
+         + (f" на ≥{PAIR_VWAP_SIDE_MARGIN}%" if PAIR_VWAP_SIDE_MARGIN else "")
+         + ", шорт — ниже. Касается и зарядов без уклона")
+        if PAIR_VWAP_SIDE_ENABLED else "📍 Сторона VWAP пары не проверяется",
         f"   ход до границы ≥{TILT_MIN_DIST_PCT}% | VWAP пары ≤"
         f"{VWAP_ALIGNED_MAX_ATR if PAIR_VWAP_MODE == 'aligned' else VWAP_MAX_ATR} ATR",
         f"   стоп {TILT_STOP_PCT}% | цели по трети: {TILT_TP1_PCT}% → граница → {TILT_TP3_PCT}%",

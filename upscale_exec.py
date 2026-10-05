@@ -33,7 +33,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "2.6"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.7"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -661,7 +661,9 @@ class Executor:
                   f"вход {fill:.6g} (проскальзывание {slip:+.2f}% к сигналу), "
                   f"риск по стопу ≈ ${real_risk:.1f} (план ${plan['real_risk_usd']:.1f}, "
                   f"стоп {real_stop_pct:.2f}% от входа). "
-                  f"Стоп {b['stop']:.6g} со входом. TP {b['tp1_price']:.6g} / {b['tp2_price']:.6g} "
+                  f"Стоп {b['stop']:.6g} со входом. TP "
+                  + " / ".join(f"{b[k]:.6g}" for k in ("tp1_price", "tp2_price", "tp3_price") if b.get(k))
+                  + " "
                   f"(реальное RR к TP1 = 1:{float(rr1_real):.1f}) через {TP_DELAY_SEC}с.")
         if rr1_real < Decimal("1"):
             self.send(f"⚠️ {sym}: проскальзывание {slip:+.2f}% срезало RR до 1:{float(rr1_real):.1f} — "
