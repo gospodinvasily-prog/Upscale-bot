@@ -34,7 +34,13 @@ FINE_SEC = 900
 TP1, TP3 = 1.0, 2.0              # цели пока не трогаем — это следующий шаг
 PARTS = (1 / 3, 1 / 3, 1 / 3)
 
-STOP_GRID = [0.5, 0.75, 1.0, 1.5, 2.0, 2.5]
+STOP_GRID = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]      # фиксированный стоп, % от цены
+# Стоп по ATR монеты: подстраивается под её волатильность. Дёрганую не выбьет шумом,
+# спокойную не заставит рисковать лишним.
+ATR_GRID  = [0.75, 1.0, 1.5, 2.0, 2.5, 3.0]     # во сколько ATR ставим стоп
+# Цели: фиксированные проценты ломаются при плавающем стопе (при стопе 2.5%
+# цель в 1% даёт всего 0.34R). Поэтому второй вариант — цели кратно РИСКУ.
+TGT_MODES = ["цели в % (как сейчас)", "цели кратно риску"]
 TRAIL_MODES = {
     "без подтяжки": (False, False),
     "безубыток после TP1": (True, False),
@@ -177,21 +183,32 @@ def run():
             if room < DIST:
                 continue
             seg = fine[k:k + hold]
-            setups.append((seg, c["side"], px, bnd))
+            atr_pct = c["atr"] / px * 100 if px > 0 else 0     # ATR монеты в % от цены
+            setups.append((seg, c["side"], px, bnd, atr_pct))
             last_end = seg[-1].get("t", 0)
         if i % 20 == 0:
             print(f"[STOP] {i}/{len(pairs)} | сделок {len(setups)} | {time.time()-t0:.0f}с")
 
-    def collect(stop_pct, be, double, coin=False):
+    def collect(stop_val, be, double, coin=False, atr=False, tgt="цели в % (как сейчас)"):
+        """stop_val — процент, либо множитель ATR, если atr=True."""
         out = []
-        for seg, side, px, bnd in setups:
+        for seg, side, px, bnd, atr_pct in setups:
             sd = rng.choice(("long", "short")) if coin else side
             is_l = sd == "long"
             b = bnd if sd == side else (px * (1 + DIST / 100) if is_l else px * (1 - DIST / 100))
+            sp = (stop_val * atr_pct) if atr else stop_val
+            if sp <= 0.05 or sp > 15:
+                continue
             ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
-            stp = px * (1 - stop_pct / 100) if is_l else px * (1 + stop_pct / 100)
-            y1 = px * (1 + TP1 / 100) if is_l else px * (1 - TP1 / 100)
-            y3 = px * (1 + TP3 / 100) if is_l else px * (1 - TP3 / 100)
+            stp = px * (1 - sp / 100) if is_l else px * (1 + sp / 100)
+            if tgt == "цели кратно риску":
+                # риск считаем от ФАКТИЧЕСКОГО входа, цели — кратно ему
+                rr = abs(ent - stp) / ent * 100
+                y1 = ent * (1 + rr / 100) if is_l else ent * (1 - rr / 100)
+                y3 = ent * (1 + 2 * rr / 100) if is_l else ent * (1 - 2 * rr / 100)
+            else:
+                y1 = px * (1 + TP1 / 100) if is_l else px * (1 - TP1 / 100)
+                y3 = px * (1 + TP3 / 100) if is_l else px * (1 - TP3 / 100)
             r = _sim(seg, sd, ent, stp, y1, b, y3, be=be, double=double)
             if r is not None:
                 out.append(r)
@@ -204,25 +221,40 @@ def run():
          f"Зарядов: {n_ch} | сделок в выборке: {len(setups)}", ""]
 
     best = None
-    for name, (be, dbl) in TRAIL_MODES.items():
-        L.append(f"<b>{name}:</b>")
-        for sp in STOP_GRID:
-            rs = collect(sp, be, dbl)
-            cl = collect(sp, be, dbl, coin=True)
+
+    def block(title, grid, atr, tgt, be, dbl):
+        nonlocal best
+        L.append(f"<b>{title}</b>")
+        for v in grid:
+            rs = collect(v, be, dbl, atr=atr, tgt=tgt)
+            cl = collect(v, be, dbl, coin=True, atr=atr, tgt=tgt)
             st, sc = _stat(rs), _stat(cl)
             if not st:
                 continue
             edge = st[1] - sc[1] if sc else 0
-            L.append(_line(rs, f"стоп {sp}%") + f"  <i>монетка {sc[1]:+.3f}R, эдж {edge:+.3f}R</i>")
-            if st[0] >= 100 and (best is None or st[1] > best[3]):
-                best = (name, sp, st[0], st[1], edge)
+            lbl = f"стоп {v}×ATR" if atr else f"стоп {v}%"
+            L.append(_line(rs, lbl) + f"  <i>монетка {sc[1]:+.3f}R, эдж {edge:+.3f}R</i>")
+            if st[0] >= 100 and (best is None or st[1] > best[2]):
+                best = (f"{title} | {lbl}", st[0], st[1], edge)
         L.append("")
 
+    # основной режим подтяжки — безубыток после TP1 (разницы с двойной нет)
+    block("СТОП В % | цели в % (как сейчас)", STOP_GRID, False, TGT_MODES[0], True, False)
+    block("СТОП В % | цели кратно риску", STOP_GRID, False, TGT_MODES[1], True, False)
+    block("СТОП ПО ATR | цели в %", ATR_GRID, True, TGT_MODES[0], True, False)
+    block("СТОП ПО ATR | цели кратно риску", ATR_GRID, True, TGT_MODES[1], True, False)
+
+    L.append("<b>Подтяжка — на лучшем стопе по ATR:</b>")
+    for nm, (be, dbl) in TRAIL_MODES.items():
+        rs = collect(1.5, be, dbl, atr=True, tgt=TGT_MODES[1])
+        L.append(_line(rs, nm))
+    L.append("")
+
     if best:
-        L.append(f"→ <b>лучшее: {best[0]}, стоп {best[1]}%</b> — {best[2]} сд, "
-                 f"{best[3]:+.3f}R, эдж над монеткой {best[4]:+.3f}R")
-        L.append("<i>если лучшее всё ещё в минусе — дело не в стопе, "
-                 "переходим к целям</i>")
+        L.append(f"→ <b>лучшее: {best[0]}</b> — {best[1]} сд, {best[2]:+.3f}R, "
+                 f"эдж над монеткой {best[3]:+.3f}R")
+        L.append("<i>смотри не только на матожидание, но и на эдж: если он около нуля, "
+                 "вариант подстроен под рынок, а не под сигнал</i>")
 
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
