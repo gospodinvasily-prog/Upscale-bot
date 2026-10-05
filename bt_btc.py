@@ -32,7 +32,11 @@ INCLUDE_BOTH = os.environ.get("BC_BOTH", "1") == "1"
 # Минута входа после закрытия часа. Живой бот сканирует на :30 (v10.0), поэтому и тест
 # входит на :30, а уклон BTC берёт по 15м свече, закрытой к этому моменту.
 # Раньше тест входил на :00 — результаты прошлых прогонов получены при :00.
-ENTRY_MIN = int(os.environ.get("BC_ENTRY_MIN", "30"))
+# v10.2: бот сканирует на :00 и :30, поэтому и тест даёт каждому заряду ДВА шанса.
+# Для одного заряда берётся первый вход, прошедший все фильтры (на :00, а если не прошёл — на :30).
+ENTRY_MINS = sorted({int(x) for x in os.environ.get("BC_ENTRY_MINS", "0,30").split(",")
+                     if x.strip() != ""}) or [30]
+ENTRY_MIN = ENTRY_MINS[-1]
 PAIRS_N = int(os.environ.get("BC_PAIRS", "0"))
 DIST    = float(os.environ.get("BC_DIST", "1.5"))
 SLIP    = float(os.environ.get("BC_SLIP", "0.15"))
@@ -85,6 +89,55 @@ def _fetch(sym, tf, days):
             seen.add(c.get("t"))
             uniq.append(c)
     return uniq
+
+
+def _vwap_sigma(win):
+    """VWAP и объёмно-взвешенное стандартное отклонение типичной цены вокруг него.
+    σ-полосы — стандартный способ мерить растяжение с поправкой на волатильность."""
+    vol = sum(x["v"] for x in win)
+    if not win or vol <= 0:
+        return None, None
+    tps = [(x["h"] + x["l"] + x["c"]) / 3 for x in win]
+    vw = sum(tp * x["v"] for tp, x in zip(tps, win)) / vol
+    var = sum(x["v"] * (tp - vw) ** 2 for tp, x in zip(tps, win)) / vol
+    return vw, var ** 0.5
+
+
+def _vfeat(fine, k, px):
+    """Признаки пары на момент входа по ЗАКРЫТЫМ 15м свечам k-5..k-1 (k — свеча входа).
+    dev[b] — отклонение закрытия свечи k-b от её VWAP, %; z[b] — то же в σ.
+    b=1 — последняя закрытая (:30), b=3 — на 30 мин раньше, b=5 — на 60 мин раньше."""
+    if k < 110:
+        return None
+    dev, z = {}, {}
+    vw1 = sg1 = None
+    for b in (5, 4, 3, 2, 1):
+        j = k - b
+        vw, sg = _vwap_sigma(fine[max(0, j - 96): j + 1])
+        if not vw or not sg:
+            return None
+        c = fine[j]["c"]
+        dev[b] = (c - vw) / vw * 100
+        z[b] = (c - vw) / sg
+        if b == 1:
+            vw1, sg1 = vw, sg
+    return {"dev": dev, "z": z,
+            "dev_px": (px - vw1) / vw1 * 100, "z_px": (px - vw1) / sg1}
+
+
+# Фильтры «блокировать?»: d = +1 для лонга, −1 для шорта; f — признаки из _vfeat.
+def f_pct(S):
+    return lambda d, f: d * f["dev_px"] > S
+def f_sig(Z):
+    return lambda d, f: d * f["z_px"] > Z
+def f_back(nb, thr):
+    def fn(d, f):
+        now, then = d * f["dev"][1], d * f["dev"][nb]
+        return now > 0 and now < then - thr          # растяжение на стороне сделки сокращается
+    return fn
+def f_confirm(Zo):
+    # как в документации индикаторов: цена выходила за внешнюю полосу и закрылась обратно
+    return lambda d, f: (any(d * f["z"][b] > Zo for b in (4, 3, 2)) and d * f["z"][1] <= Zo)
 
 
 def _sim(bars, side, entry, stop, t1, t2, t3):
@@ -277,8 +330,8 @@ def run():
             if not vb or not ab or vb <= 0 or ab <= 0:
                 continue
             cts = upto[-1].get("t", 0)
-            sig_ts = cts + 3600 + ENTRY_MIN * 60     # момент входа: :30 после закрытия часа
-            if sig_ts <= last_end:
+            first_ts = cts + 3600 + min(ENTRY_MINS) * 60       # первый скан после закрытия часа
+            if first_ts <= last_end:
                 continue
             c = B.detect_charge(sym, upto, upto[-1]["c"], vb, ab,
                                 {"btc_chg_win": 0.0, "do_charge": True},
@@ -292,39 +345,49 @@ def run():
             n_ch += 1
             if is_both:
                 n_both += 1
-            k = idx.get(sig_ts)
-            if k is None or k + hold + 2 >= len(fine):
-                continue
-            px = fine[k]["o"]
-            if not is_both:
-                is_l = c["side"] == "long"
-                bnd = c["hi"] if is_l else c["lo"]
-                room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
-                if room < min(DIST_GRID):
+            gid = (sym, cts)              # один заряд — одна сделка: на первом сканe, где всё прошло
+            end_all = 0
+            for em in ENTRY_MINS:
+                sig_ts = cts + 3600 + em * 60
+                k = idx.get(sig_ts)
+                if k is None or k + hold + 2 >= len(fine):
                     continue
-            elif sig_ts <= last_end_b:
-                continue
-            lo_i = max(0, k - int(86400 / FINE_SEC))
-            sg = fine[lo_i:k]
-            vv = sum(x["v"] for x in sg)
-            vw_pair = (sum((x["h"] + x["l"] + x["c"]) / 3 * x["v"] for x in sg) / vv) if vv > 0 else None
-            atr_pct = c["atr"] / px * 100 if px > 0 else 0
-            vw_atr = (abs(px - vw_pair) / px * 100 / atr_pct) if (vw_pair and atr_pct > 0) else 99
-            side_s = "both" if is_both else c["side"]
-            setups.append((fine[k:k + hold], side_s, px, c["hi"], c["lo"], sig_ts, vw_atr))
-            end_ts = fine[min(k + hold, len(fine) - 1)].get("t", 0)
-            if is_both:
-                last_end_b = end_ts       # отдельно, чтобы не менять базу «только с уклоном»
-            else:
-                last_end = end_ts
+                px = fine[k]["o"]
+                if not is_both:
+                    is_l = c["side"] == "long"
+                    bnd = c["hi"] if is_l else c["lo"]
+                    room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
+                    if room < min(DIST_GRID):
+                        continue
+                elif sig_ts <= last_end_b:
+                    continue
+                lo_i = max(0, k - int(86400 / FINE_SEC))
+                sg = fine[lo_i:k]
+                vv = sum(x["v"] for x in sg)
+                vw_pair = (sum((x["h"] + x["l"] + x["c"]) / 3 * x["v"] for x in sg) / vv) if vv > 0 else None
+                atr_pct = c["atr"] / px * 100 if px > 0 else 0
+                vw_atr = (abs(px - vw_pair) / px * 100 / atr_pct) if (vw_pair and atr_pct > 0) else 99
+                side_s = "both" if is_both else c["side"]
+                setups.append((fine[k:k + hold], side_s, px, c["hi"], c["lo"], sig_ts, vw_atr,
+                               _vfeat(fine, k, px), gid))
+                end_all = max(end_all, fine[min(k + hold, len(fine) - 1)].get("t", 0))
+            if end_all:
+                if is_both:
+                    last_end_b = end_all      # отдельно, чтобы не менять базу «только с уклоном»
+                else:
+                    last_end = end_all
         if i % 20 == 0:
             print(f"[BTC] {i}/{len(pairs)} | сделок {len(setups)} | {time.time()-t0:.0f}с")
 
-    def collect(bias_fn=None, coin=False, dist=DIST, vwmax=99, both="include"):
+    def collect(bias_fn=None, coin=False, dist=DIST, vwmax=99, both="include",
+                vf=None, vsel="all", cnt=None):
         """both: include — и заряды с уклоном пары, и без него (направление от BTC);
         exclude — только с уклоном пары; only — только заряды БЕЗ уклона пары."""
         out = []
-        for seg, side, px, hi, lo, ts, vw_atr in setups:
+        taken = set()
+        for seg, side, px, hi, lo, ts, vw_atr, feats, gid in setups:
+            if gid in taken:
+                continue                      # по этому заряду уже вошли на более раннем скане
             if vw_atr > vwmax:
                 continue
             is_both = side == "both"
@@ -346,6 +409,12 @@ def run():
             room = (bnd - px) / px * 100 if is_l0 else (px - bnd) / px * 100
             if room < dist:
                 continue
+            if vf is not None and vsel != "all":
+                if feats is None:
+                    continue                      # нет истории для признаков — не берём ни туда, ни туда
+                blocked = vf(1 if is_l0 else -1, feats)
+                if (vsel == "kept" and blocked) or (vsel == "blocked" and not blocked):
+                    continue
             sd = rng.choice(("long", "short")) if coin else eff
             is_l = sd == "long"
             b = bnd if sd == eff else (px * (1 + dist / 100) if is_l else px * (1 - dist / 100))
@@ -356,6 +425,10 @@ def run():
             r = _sim(seg, sd, ent, stp, y1, b, y3)
             if r is not None:
                 out.append(r)
+                taken.add(gid)
+                if cnt is not None:
+                    mm = (ts // 60) % 60
+                    cnt[mm] = cnt.get(mm, 0) + 1
         return out
 
     L = [f"₿ <b>ФИЛЬТР ПО УКЛОНУ BITCOIN</b> (~{cov:.0f} дн, {len(pairs)} пар)",
@@ -380,13 +453,15 @@ def run():
     scan_ts = []
     if vw_side:
         t_lo, t_hi = min(vw_side), max(vw_side)
-        t = (t_lo // 3600 + 1) * 3600 + ENTRY_MIN * 60
-        while t <= t_hi:
-            msk_h = ((t // 3600) + 3) % 24
-            if 4 <= msk_h <= 22:
-                scan_ts.append(t)
-            t += 3600
-    L.append("<b>КАК ЧАСТО BTC НЕЙТРАЛЕН</b> (по сканам :30 в окне 04:00–23:00 МСК)")
+        th = (t_lo // 3600 + 1) * 3600
+        while th <= t_hi:
+            for em in ENTRY_MINS:
+                t = th + em * 60
+                msk_h = ((t // 3600) + 3) % 24
+                if t <= t_hi and 4 <= msk_h <= 22:
+                    scan_ts.append(t)
+            th += 3600
+    L.append("<b>КАК ЧАСТО BTC НЕЙТРАЛЕН</b> (по сканам бота в окне 04:00–23:00 МСК)")
     L.append("  <i>нейтраль = BTC в пределах запаса от своего VWAP, в этот скан альты не торгуем</i>")
     if scan_ts:
         n_days = max(1.0, (scan_ts[-1] - scan_ts[0]) / 86400)
@@ -416,7 +491,7 @@ def run():
             lbl = "любое положение" if m == 0 else f"запас {m}%"
             L.append(f"  {lbl:16}: лонг {cnt['long']/tot*100:3.0f}%, шорт {cnt['short']/tot*100:3.0f}%, "
                      f"<b>нейтраль {cnt['neutral']/tot*100:3.0f}%</b> | "
-                     f"самая долгая нейтраль подряд: <b>{longest} ч</b> | "
+                     f"самая долгая нейтраль подряд: <b>{longest / len(ENTRY_MINS):.1f} ч</b> | "
                      f"смен лонг↔шорт: {flips/n_days:.1f} в сутки")
     else:
         L.append("  данных BTC не хватило")
@@ -476,6 +551,66 @@ def run():
                 if st[0] >= 60 and (best is None or st[1] > best[2]):
                     best = (f"ход ≥{dist}%, VWAP ≤{vw}, {name}", st[0], st[1], edge, gain)
             L.append("")
+
+    # ── ФИЛЬТРЫ VWAP: растяжение и возврат к VWAP ──
+    # Идея: не входить в лонг, когда цена слишком далеко ВЫШЕ своего VWAP (и в шорт — слишком
+    # далеко НИЖЕ), и не входить, когда цена возвращается к VWAP. Для каждого фильтра показано,
+    # что он ОСТАВЛЯЕТ и что ОТСЕКАЕТ. Фильтр полезен, только если отсекаемое заметно ХУЖЕ
+    # оставляемого. Знак: ✅ фильтр помогает значимо, ❌ вредит значимо, пусто — разницы нет.
+    cnt_dep = {}
+    collect(bias_fn=lambda ts: vw_bias(ts, 0.2), dist=1.5, vwmax=2.5, cnt=cnt_dep)
+    if cnt_dep:
+        tot_d = sum(cnt_dep.values())
+        L.append("<b>ВХОДЫ ПО ВРЕМЕНИ СКАНА</b> (как задеплоено: BTC дальше 0.2% от VWAP): "
+                 + ", ".join(f":{m:02d} — {n} ({n/tot_d*100:.0f}%)" for m, n in sorted(cnt_dep.items())))
+        L.append("")
+    vwap_filters = [
+        ("РАСТЯЖЕНИЕ в %: цена дальше S от VWAP в сторону сделки", [
+            (f"> 4.0%", f_pct(4.0)), (f"> 3.5%", f_pct(3.5)),
+            (f"> 3.0%", f_pct(3.0)), (f"> 2.0%", f_pct(2.0))]),
+        ("РАСТЯЖЕНИЕ в σ-полосах (с поправкой на волатильность)", [
+            (f"> 3.0σ", f_sig(3.0)), (f"> 2.5σ", f_sig(2.5)), (f"> 2.0σ", f_sig(2.0))]),
+        ("ВОЗВРАТ К VWAP: растяжение за последние 30/60 мин сократилось", [
+            ("за 30 мин, на ≥0.1%", f_back(3, 0.1)), ("за 60 мин, на ≥0.1%", f_back(5, 0.1)),
+            ("за 60 мин, на ≥0.3%", f_back(5, 0.3))]),
+        ("ПОДТВЕРЖДЁННЫЙ ВОЗВРАТ: выходила за внешнюю полосу и закрылась внутри", [
+            ("полоса 2.0σ", f_confirm(2.0)), ("полоса 1.5σ", f_confirm(1.5))]),
+    ]
+    bases = []
+    bases.append(("как задеплоено: BTC дальше 0.2% от VWAP",
+                  dict(bias_fn=lambda ts: vw_bias(ts, 0.2), dist=1.5, vwmax=2.5)))
+    bases.append(("без фильтра BTC (только заряды с уклоном пары)",
+                  dict(bias_fn=None, dist=1.5, vwmax=2.5)))
+    L += ["", "═══ <b>ФИЛЬТРЫ VWAP: растяжение и возврат</b> ═══",
+          "  <i>«оставляем» — что пройдёт фильтр, «отсекаем» — что он запретит. "
+          "Нужно, чтобы отсекаемое было заметно хуже</i>"]
+    for bname, bkw in bases:
+        allr = collect(vf=None, **bkw)
+        st0 = _stat(allr)
+        L += ["", f"<b>База: {bname}</b> — {st0[0] if st0 else 0} сд, "
+              f"{st0[1]:+.3f}R" if st0 else f"<b>База: {bname}</b> — сделок нет"]
+        if not st0:
+            continue
+        for gname, items in vwap_filters:
+            L.append(f"  <i>{gname}</i>")
+            for lbl, fn in items:
+                kept = collect(vf=fn, vsel="kept", **bkw)
+                blk = collect(vf=fn, vsel="blocked", **bkw)
+                sk, sb = _stat(kept), _stat(blk)
+                if not sk and not sb:
+                    continue
+                kt = f"{sk[0]:4} сд {sk[1]:+.3f}R" if sk else "   —"
+                bt = f"{sb[0]:4} сд {sb[1]:+.3f}R" if sb else "   —"
+                mark = "  "
+                if sk and sb and sb[0] >= 15 and sk[0] >= 15:
+                    ci = (sk[2] ** 2 + sb[2] ** 2) ** 0.5
+                    diff = sk[1] - sb[1]
+                    mark = "✅" if diff > ci else "❌" if diff < -ci else "  "
+                    dtxt = f"разница {diff:+.3f}R (±{ci:.3f})"
+                else:
+                    dtxt = "мало сделок для вывода"
+                L.append(f"   {mark} {lbl:26} | оставляем {kt} | отсекаем {bt} | {dtxt}")
+    L.append("")
 
     # эффект добавления зарядов без уклона пары — на основных настройках
     if INCLUDE_BOTH:

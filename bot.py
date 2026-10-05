@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v10.1"
+BOT_VERSION    = "v10.2"
 
 TRADING_START_MSK = 4          # окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -161,10 +161,13 @@ def fmt_minutes(m: float) -> str:
 # OI, фандинга и тейкеров — внутри часа они меняются, и монета может стать зарядом к :30.
 # ВАЖНО: вход даём только в НОВЫЕ заряды. Повторная перепроверка старых проверена
 # бэктестом и вредна (−0.09R против +0.29R), поэтому её не включаем.
-CHARGE_SCAN_MIN      = int(os.environ.get("CHARGE_SCAN_MIN", "60"))
-# v10.0: скан раз в час, но НЕ на закрытии (:00), а на :30. Час закрылся в :00, к :30 есть
-# две закрытые 15м свечи и цена, на которую можно реально входить.
-CHARGE_SCAN_OFFSET_MIN = int(os.environ.get("CHARGE_SCAN_OFFSET_MIN", "30"))
+CHARGE_SCAN_MIN      = int(os.environ.get("CHARGE_SCAN_MIN", "30"))
+# v10.2: скан каждые 30 минут — на :00 и на :30. В v10.1 был только :30, и если сигнал не
+# прошёл или пропущен, следующего шанса приходилось ждать час. Заряды считаются по ЗАКРЫТЫМ
+# часовым свечам, поэтому на :00 (час только что закрылся) и на :30 набор зарядов один и тот же,
+# меняются цена, уклон BTC и расстояние до границы. На каждом скане проверяются ВСЕ заряды;
+# монета, по которой уже вошли, до конца дня заблокирована гейтом «одна монета в день».
+CHARGE_SCAN_OFFSET_MIN = int(os.environ.get("CHARGE_SCAN_OFFSET_MIN", "0"))
 
 # ── ФИЛЬТР ПО BTC ──
 # Альты ходят за биткоином. Входим в лонг только когда BTC выше своего VWAP на запас
@@ -1193,9 +1196,9 @@ def gate_allows(sym: str, side: str) -> tuple:
         return False, f"лимит {DAILY_MAX_SIGNALS} сигналов в день исчерпан"
     if ONE_PER_SYMBOL_DAY and sym in DAY_GATE["syms"]:
         return False, "по этой монете сегодня уже был сигнал"
-    DAY_GATE["recent"] = [r for r in DAY_GATE["recent"] if now_ts - r[0] <= 1800]
+    DAY_GATE["recent"] = [r for r in DAY_GATE["recent"] if now_ts - r[0] <= 2100]   # 35 мин: вход на :00 виден на скане :30
     if MAX_SAME_SIDE_30M and sum(1 for r in DAY_GATE["recent"] if r[1] == side) >= MAX_SAME_SIDE_30M:
-        return False, f"уже {MAX_SAME_SIDE_30M} сигнала в {side} за последние 30 мин"
+        return False, f"уже {MAX_SAME_SIDE_30M} сигнала в {side} за последний скан"
     return True, ""
 
 def gate_save():
@@ -1470,6 +1473,11 @@ def order_trigger(level: float, is_long: bool, atr: float = 0.0) -> float:
     buf = max(level * BREAK_BUFFER, atr * BREAK_BUFFER_ATR_MULT)
     return level + buf if is_long else level - buf
 
+
+def scan_minutes_txt() -> str:
+    """Минуты часа, в которые бот сканирует: «:00 и :30»."""
+    mins = [m for m in range(60) if ((m - CHARGE_SCAN_OFFSET_MIN) % 60) % SCAN_INTERVAL == 0]
+    return " и ".join(f":{m:02d}" for m in mins)
 
 def tilt_windows_txt() -> str:
     return ", ".join(f"{h1:02d}:{m1:02d}–{h2:02d}:{m2:02d}" for h1, m1, h2, m2 in TILT_WINDOWS)
@@ -3125,7 +3133,7 @@ def main():
         + {"dry": " (только сообщения)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""),
         "",
         f"⏳ <b>ЗАРЯД</b> {CHARGE_TF} — сжатие при стоящей цене, коридор {WIN_TXT}, "
-        f"скан раз в час в :{CHARGE_SCAN_OFFSET_MIN:02d} — проверяются ВСЕ заряды заново",
+        f"скан в {scan_minutes_txt()} — на каждом проверяются ВСЕ заряды заново",
         f"   сила ≥{ACC_MIN_SCORE}/{ACC_MAX_SCORE} | объём ≥{ACC_RVOL_MIN}× | "
         f"размах ≤{ACC_RANGE_ATR_K}×ATR×√окно (до {ACC_MAX_RANGE_ABS}%)",
         "",
