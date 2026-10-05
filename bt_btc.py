@@ -41,6 +41,9 @@ BTC_WIN_H = 12                        # окно изменения BTC
 DIST_GRID = [1.0, 1.5]               # ход до границы коридора пары, %
 VWAP_GRID = [2.0, 2.5]               # не дальше N ATR от дневного VWAP пары
 BTC_TFS = ["1h", "4h"]               # на каком ТФ считать КОРИДОР биткоина
+# Насколько далеко BTC должен отойти от своего VWAP, чтобы считать уклон уверенным.
+# 0 = любое положение (как сейчас). Чем больше — тем строже и тем меньше сделок.
+VW_MARGIN = [0.0, 0.1, 0.2, 0.3, 0.5]
 
 
 def _fetch(sym, tf, days):
@@ -152,7 +155,7 @@ def run():
         if vv <= 0:
             continue
         vw = sum((x["h"] + x["l"] + x["c"]) / 3 * x["v"] for x in seg) / vv
-        vw_side[btc15[k].get("t", 0) + FINE_SEC] = "long" if btc15[k]["c"] > vw else "short"
+        vw_side[btc15[k].get("t", 0) + FINE_SEC] = (btc15[k]["c"] - vw) / vw * 100 if vw else 0.0
     # уклон BTC по ЕГО СОБСТВЕННОМУ коридору — на 1ч и на 4ч
     btc_corr = {tf: {} for tf in BTC_TFS}
     for tf in BTC_TFS:
@@ -320,9 +323,28 @@ def run():
     for thr in CHG_GRID:
         methods.append((f"изменение BTC 12ч, нейтраль ±{thr}%",
                         lambda ts, t=thr: btc_bias_chg(ts, t)))
-    methods.append(("BTC vs дневной VWAP", lambda ts: btc_bias_map(ts, vw_side, FINE_SEC)))
+    def vw_bias(ts, margin):
+        """BTC выше своего VWAP на margin% → лонги, ниже на столько же → шорты."""
+        v = btc_bias_map(ts, vw_side, FINE_SEC)
+        if v is None:
+            return None
+        return "long" if v > margin else "short" if v < -margin else "neutral"
+
+    for m in VW_MARGIN:
+        lbl = "BTC vs VWAP (любое положение)" if m == 0 else f"BTC дальше {m}% от VWAP"
+        methods.append((lbl, lambda ts, mm=m: vw_bias(ts, mm)))
     if ema_side:
         methods.append(("BTC vs EMA20 4ч", lambda ts: btc_bias_map(ts, ema_side, 14400)))
+
+    # согласие двух признаков: VWAP и коридор BTC смотрят в одну сторону
+    if btc_corr.get("1h"):
+        def both_agree(ts):
+            a = vw_bias(ts, 0.0)
+            b = btc_bias_map(ts, btc_corr["1h"], 3600)
+            if not a or not b or a == "neutral" or b == "neutral":
+                return "neutral"
+            return a if a == b else "neutral"
+        methods.append(("VWAP + коридор BTC 1ч согласны", both_agree))
 
     best = None
     for dist in DIST_GRID:
@@ -336,7 +358,7 @@ def run():
             for name, fn in methods:
                 rs = collect(fn, dist=dist, vwmax=vw)
                 st = _stat(rs)
-                if not st or st[0] < 25:
+                if not st or st[0] < 30:
                     continue
                 cl = collect(fn, coin=True, dist=dist, vwmax=vw)
                 L.append(_line(rs, name, cl, bn))
