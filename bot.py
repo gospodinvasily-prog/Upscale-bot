@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v9.14"
+BOT_VERSION    = "v10.1"
 
 TRADING_START_MSK = 4          # окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -101,11 +101,13 @@ TILT_LAST_STOP = {}   # {"SYM:long": stop_price, "SYM:short": stop_price}
 # ── v8.3: правила отбора сделок (проверены на 90 днях и 103 парах) ──
 # Без них: 62 сделки в день, винрейт 68%, просадка −146%.
 # С ними:  4.6 сделки в день, винрейт 78%, просадка −4%, худший день −2.8%.
-VWAP_MAX_ATR       = 2.5   # v9.13: вернули 2.5 (в v9.9 ставили 2.0 по шуму одного периода).
-                           # Проверка на ЧУЖИХ данных (90-60 дней назад) показала обратное:
-                           # 2.0 → +0.566R (210 сд), 2.5 → +0.575R (238), 3.0 → +0.578R (255).
-                           # Разница везде в пределах сотых — фильтр почти не разбирает,
-                           # но при 2.5 сделок на 15% больше. Берём 2.5.
+VWAP_MAX_ATR       = 2.5   # фильтр VWAP пары — КАК В РАБОЧЕЙ ВЕРСИИ: VWAP от 00:00 МСК, ATR 15-минуток.
+# Переключатель PAIR_VWAP_MODE=aligned включает способ, как считает бэктест bt_btc: скользящий
+# VWAP по 97 закрытым 15м свечам и ATR часового заряда, предел VWAP_ALIGNED_MAX_ATR (2.0).
+# По умолчанию legacy — поведение не меняется. Единицы у двух способов разные: 2.5 в legacy
+# примерно соответствует 5 в aligned, поэтому числа между режимами не переносить.
+PAIR_VWAP_MODE       = os.environ.get("PAIR_VWAP_MODE", "legacy")        # legacy | aligned
+VWAP_ALIGNED_MAX_ATR = float(os.environ.get("VWAP_ALIGNED_MAX_ATR", "2.0"))
 DAILY_MAX_SIGNALS  = 0     # v9.5: ВЫКЛЮЧЕНО (было 15). В бэктесте (+0.32R на 818 сделках)
                            # лимита не было, а ориентир теперь — денежный риск, а не счётчик.
                            # Защита по просадке в исполнителе остаётся: стоп входов при −$300,
@@ -160,6 +162,19 @@ def fmt_minutes(m: float) -> str:
 # ВАЖНО: вход даём только в НОВЫЕ заряды. Повторная перепроверка старых проверена
 # бэктестом и вредна (−0.09R против +0.29R), поэтому её не включаем.
 CHARGE_SCAN_MIN      = int(os.environ.get("CHARGE_SCAN_MIN", "60"))
+# v10.0: скан раз в час, но НЕ на закрытии (:00), а на :30. Час закрылся в :00, к :30 есть
+# две закрытые 15м свечи и цена, на которую можно реально входить.
+CHARGE_SCAN_OFFSET_MIN = int(os.environ.get("CHARGE_SCAN_OFFSET_MIN", "30"))
+
+# ── ФИЛЬТР ПО BTC ──
+# Альты ходят за биткоином. Входим в лонг только когда BTC выше своего VWAP на запас
+# BTC_VWAP_MARGIN_PCT, в шорт — когда ниже на столько же. Между ними — нейтраль, пропускаем.
+# Заряд, у которого уклон пары не определён («both»), берёт направление от BTC.
+# Бэктест (60 дн, 103 пары): без фильтра −0.16R, с запасом 0.2% около +0.07R, винрейт 55→67%.
+# Но доверительный интервал ±0.20R, то есть плюс НЕ доказан; на чужом периоде не проверен.
+BTC_FILTER_ENABLED  = os.environ.get("BTC_FILTER", "1") == "1"
+BTC_VWAP_MARGIN_PCT = float(os.environ.get("BTC_VWAP_MARGIN_PCT", "0.2"))
+VWAP_WINDOW_BARS    = 97      # ≈ сутки 15м свечей, как в бэктесте
 # v9.11: вернули 60 (было 30). Бэктест проверяет заряды на ЗАКРЫТЫХ часовых свечах,
 # то есть раз в час. При скане раз в полчаса бот брал входы в середине часа по
 # неполной свече — таких сделок в бэктесте нет вообще, и их качество непроверено.
@@ -246,7 +261,7 @@ HORIZON_HOURS     = 12         # горизонт оценки исхода си
 COOLDOWN_HOURS    = 3          # пауза по монете после пробоя
 
 # ── Профили таймфрейма: у каждого ЗАРЯДа свой (альты — CHARGE_TF, BTC — BTC_CHARGE_TF) ──
-BTC_CHARGE_ENABLED = True
+BTC_CHARGE_ENABLED = False   # v10.0: BTC не торгуем, он служит только фильтром направления
 BTC_CHARGE_TF      = "1h"      # BTC движется медленнее альтов — на 1h диапазоны 1–3%, пробои крупнее
 
 def tf_profile(tf: str) -> dict:
@@ -2291,6 +2306,172 @@ def scan_btc_charge(ctx: dict):
         return stats[s]
     return detect_charge("BTC", closed, price, baseline, atr_norm, ctx, ctx["tickers"].get("BTC", {}), stats_cache, P)
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  ₿ ФИЛЬТР ПО BTC И РЕШЕНИЕ О ВХОДЕ (v10.0)
+# ═════════════════════════════════════════════════════════════════════════════
+
+RU_SIDE = {"long": "лонг", "short": "шорт"}
+
+def vwap_rolling(candles: list):
+    """VWAP по последним VWAP_WINDOW_BARS закрытым 15м свечам (≈ сутки). Как в бэктесте."""
+    seg = candles[-VWAP_WINDOW_BARS:]
+    vol = sum(c["v"] for c in seg)
+    if not seg or vol <= 0:
+        return None
+    return sum((c["h"] + c["l"] + c["c"]) / 3 * c["v"] for c in seg) / vol
+
+def btc_bias(now_ts=None) -> dict:
+    """Уклон BTC: цена последней ЗАКРЫТОЙ 15м свечи относительно своего VWAP.
+    bias: long / short / neutral, либо None, если данных нет (тогда входы блокируются)."""
+    now_ts = now_ts or time.time()
+    raw = get_candles("BTC", "15m", VWAP_WINDOW_BARS + 8)
+    closed, _, price = split_closed(raw, 900, now_ts)
+    if len(closed) < 40:
+        return {"bias": None, "dev": 0.0, "price": price, "vwap": None}
+    vw = vwap_rolling(closed)
+    if not vw:
+        return {"bias": None, "dev": 0.0, "price": price, "vwap": None}
+    dev = (closed[-1]["c"] - vw) / vw * 100
+    m = BTC_VWAP_MARGIN_PCT
+    bias = "long" if dev > m else "short" if dev < -m else "neutral"
+    return {"bias": bias, "dev": dev, "price": price, "vwap": vw}
+
+def btc_line(b: dict) -> str:
+    if not b or b.get("bias") is None:
+        return "₿ BTC: данных нет — входы заблокированы"
+    ico = {"long": "🟢 лонг", "short": "🔴 шорт", "neutral": "⚪ нейтраль"}[b["bias"]]
+    side = "выше" if b["dev"] >= 0 else "ниже"
+    return (f"₿ BTC: {ico} ({abs(b['dev']):.2f}% {side} своего VWAP, "
+            f"запас {BTC_VWAP_MARGIN_PCT}%)")
+
+def _pair_vwap_aligned(sym: str, price: float, atr: float):
+    """Способ как в бэктесте: скользящий VWAP по 97 закрытым 15м свечам, ATR ЧАСОВОГО заряда."""
+    raw = get_candles(sym, "15m", VWAP_WINDOW_BARS + 8)
+    closed, _, _ = split_closed(raw, 900, time.time())
+    vw = vwap_rolling(closed) if len(closed) >= 40 else None
+    if not vw or not atr or atr <= 0:
+        return True, "н/д", None
+    d = abs(price - vw) / atr
+    return d <= VWAP_ALIGNED_MAX_ATR, f"{d:.1f}", d
+
+def pair_vwap_dist(sym: str, price: float, atr: float):
+    """Фильтр «не догонять»: цена пары не дальше предела от VWAP.
+    legacy — прежний фильтр рабочей версии (vwap_filter); aligned — как в бэктесте."""
+    if PAIR_VWAP_MODE == "aligned":
+        return _pair_vwap_aligned(sym, price, atr)
+    ok, _txt, d = vwap_filter(sym, price)
+    return ok, (f"{d:.1f}" if d is not None else "н/д"), d
+
+def tilt_decision(c: dict, btc: dict) -> dict:
+    """Решение по ОДНОМУ заряду. status: enter / skip. Порядок проверок: окно → BTC →
+    расстояние до границы и защита после стопа → VWAP пары. Лимиты и «одна монета в день»
+    проверяются отдельно, уже по отсортированному списку (от них зависит порядок)."""
+    sym = c["symbol"]
+    if sym == "BTC":
+        return {"status": "skip", "group": "BTC не торгуем", "detail": ""}
+    if not in_tilt_window():
+        return {"status": "skip", "group": f"вне окна ({tilt_windows_txt()} МСК)", "detail": ""}
+    side, from_btc = c["side"], False
+    if BTC_FILTER_ENABLED:
+        b = btc.get("bias") if btc else None
+        if b is None:
+            return {"status": "skip", "group": "нет данных BTC", "detail": ""}
+        if b == "neutral":
+            return {"status": "skip", "group": "BTC нейтрален", "detail": ""}
+        if side in ("long", "short"):
+            if side != b:
+                return {"status": "skip", "group": f"против BTC (у BTC {RU_SIDE[b]})",
+                        "detail": RU_SIDE[side]}
+        else:
+            side, from_btc = b, True          # уклон пары неясен — направление от BTC
+    elif side == "both":
+        return {"status": "skip", "group": "уклон неясен", "detail": ""}
+
+    tilt = build_tilt(dict(c, side=side))
+    if tilt is None:
+        is_l = side == "long"
+        bnd = c["hi"] if is_l else c["lo"]
+        d = (bnd - c["price"]) / c["price"] * 100 if is_l else (c["price"] - bnd) / c["price"] * 100
+        if f"{sym}:{side}" in TILT_LAST_STOP:
+            return {"status": "skip", "group": "после стопа цена не ушла дальше", "detail": ""}
+        if d < TILT_MIN_DIST_PCT:
+            return {"status": "skip", "group": f"до границы меньше {TILT_MIN_DIST_PCT}%",
+                    "detail": f"{d:.2f}%"}
+        return {"status": "skip", "group": "условия не выполнены", "detail": ""}
+    ok, txt, dv = pair_vwap_dist(sym, c["price"], c.get("atr"))
+    if not ok:
+        lim = VWAP_ALIGNED_MAX_ATR if PAIR_VWAP_MODE == "aligned" else VWAP_MAX_ATR
+        return {"status": "skip", "group": f"VWAP пары дальше {lim} ATR", "detail": txt}
+    tilt["from_btc"] = from_btc
+    tilt["charge_side"] = c["side"]            # в журнале видно, что уклон пары был неясен
+    return {"status": "enter", "tilt": tilt, "side": side}
+
+def process_entries(charges: list):
+    """v10.0: ВСЕ заряды текущего скана проходят проверку входа заново. Раньше в УКЛОН
+    попадали только НОВЫЕ или усилившиеся заряды (так работал register_charges), а уже
+    известные заряды повторно не проверялись — поэтому часть пар «с уклоном» никогда не
+    рассматривалась. Теперь заряд, не прошедший час назад, проверяется снова."""
+    btc = btc_bias() if BTC_FILTER_ENABLED else None
+    cands, skips = [], {}
+
+    def add_skip(group, sym, detail=""):
+        skips.setdefault(group, []).append(f"{sym}" + (f" ({detail})" if detail else ""))
+
+    for c in charges:
+        try:
+            d = tilt_decision(c, btc)
+        except Exception as e:
+            print(f"[TILT] {c.get('symbol')}: ошибка решения — {e}")
+            add_skip("ошибка проверки", c.get("symbol", "?"))
+            continue
+        if d["status"] == "skip":
+            print(f"[TILT] {c['symbol']}: {d['group']} {d['detail']}")
+            add_skip(d["group"], c["symbol"], d["detail"])
+        else:
+            cands.append(d["tilt"])
+
+    # при BTC-фильтре все входы идут в ОДНУ сторону — это структурная концентрация.
+    # Лимит «≤5 в сторону» срабатывает по порядку, поэтому сильнее запас хода — раньше.
+    cands.sort(key=lambda t: -t["dist_pct"])
+    entered = []
+    for t in cands:
+        sym, side = t["symbol"], t["side"]
+        ok, why = gate_allows(sym, side)
+        if not ok:
+            add_skip(why, sym)
+            continue
+        print(f"[TILT] {sym} {side} dist={t['dist_pct']:.2f}% from_btc={t['from_btc']}")
+        extra = ["", btc_line(btc)] if btc else []
+        if t["from_btc"]:
+            extra.append("↳ уклон пары был неясен — направление взято от BTC")
+        send_blocks((format_tilt(t) + "\n" + "\n".join(extra)).split("\n"))
+        log_tilt(t)
+        gate_register(sym, side)
+        TILT_LAST_STOP[f"{sym}:{side}"] = t["stop"]
+        EXECUTOR.on_signal({
+            "symbol": sym, "side": side, "price": t["price"], "stop": t["stop"],
+            "stop_pct": t["stop_pct"], "tp1_price": t["tp1"], "tp2_price": t["tp2"],
+            "tp3_price": t["tp3"],   # три цели по трети — без этого исполнитель делил бы пополам
+            "atr": t["atr"], "ext_atr": 0.0,
+        }, t["score"])
+        entered.append(t)
+
+    # одно сообщение-сводка на весь скан: что взяли и почему не взяли остальное
+    L = [f"🔎 <b>Скан {msk_time_str()}</b> | зарядов {len(charges)} | "
+         f"вход {len(entered)} | пропуск {len(charges) - len(entered)}"]
+    if btc is not None:
+        L.append(btc_line(btc))
+    if entered:
+        L.append("✅ <b>Вход:</b> " + ", ".join(
+            f"{t['symbol']} {RU_SIDE[t['side']]}" + ("*" if t["from_btc"] else "") for t in entered))
+        if any(t["from_btc"] for t in entered):
+            L.append("   <i>* уклон пары неясен, направление от BTC</i>")
+    for group, syms in sorted(skips.items(), key=lambda kv: -len(kv[1])):
+        L.append(f"⏭ {group}: {', '.join(syms)}")
+    send_blocks(L)
+    return entered
+
+
 def run_scan(do_charge: bool = True, do_btc: bool = False):
     now_ts = time.time()
     do_momentum = MOMENTUM_ENABLED
@@ -2340,74 +2521,11 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
             print(f"  [ERROR] BTC {BTC_CHARGE_TF}: {e}")
     # v8.3: заряды снова приходят отдельными сообщениями — в них готовые ордера,
     # которые надо успеть поставить ДО движения. Часовой дайджест остаётся сводкой.
-    alerts = register_charges(charges) if (do_charge or do_btc) else []
-    for c in alerts:
-        print(f"[CHARGE] {c['symbol']} {c['side']} score={c['score']}")
-        if in_signal_window():
-            send_blocks(format_charge(c).split("\n"))
-            WATCHLIST[c["symbol"]]["alerted"] = True
-        else:
-            WATCHLIST[c["symbol"]]["alerted"] = False
-            print(f"[CHARGE] {c['symbol']}: вне окна — дошлю при открытии окна")
-
-        # ── 🎯 УКЛОН: сразу при заряде ─────────────────────────────────────────
-        # Повторный вход в ту же монету закрыт дневным гейтом (ONE_PER_SYMBOL_DAY),
-        # который отмечает монету ТОЛЬКО после реально отправленного сигнала,
-        # и защитой TILT_LAST_STOP: после стопа не входим, пока цена не ушла дальше него.
-        # v9.4: причины отказа уходили только в лог Render — со стороны выглядело,
-        # будто бот молча игнорирует заряд. Теперь говорит, почему не зашёл.
-        skip = None
-        if not in_tilt_window():
-            skip = f"вне окна УКЛОНА ({tilt_windows_txt()} МСК)"
-        tilt = build_tilt(c) if not skip else None
-        if not skip and tilt is None:
-            if c["side"] == "both":
-                skip = "уклон неясен (both) — направление не определено"
-            else:
-                is_l = c["side"] == "long"
-                bnd = c["hi"] if is_l else c["lo"]
-                d = (bnd - c["price"]) / c["price"] * 100 if is_l else (c["price"] - bnd) / c["price"] * 100
-                key = f"{c['symbol']}:{c['side']}"
-                if key in TILT_LAST_STOP:
-                    skip = (f"после стопа на {TILT_LAST_STOP[key]:.6g} цена не ушла дальше "
-                            f"(сейчас {c['price']:.6g})")
-                elif d < TILT_MIN_DIST_PCT:
-                    skip = f"до границы {d:.2f}% — меньше {TILT_MIN_DIST_PCT}%"
-                else:
-                    skip = f"условия не выполнены (сила {c['score']}, уклон {c['side']})"
-        if not skip:
-            ok, why = gate_allows(c["symbol"], c["side"])
-            if not ok:
-                skip = why
-        if not skip:
-            vw_ok, vw_txt, _ = vwap_filter(c["symbol"], c["price"])
-            if not vw_ok:
-                skip = vw_txt
-        if skip:
-            print(f"[TILT] {c['symbol']}: {skip}")
-            send_telegram(f"⏭ <b>{c['symbol']}</b>: заряд есть, но в сделку не иду — {skip}")
-            continue
-        print(f"[TILT] {c['symbol']} {c['side']} score={c['score']} dist={tilt['dist_pct']:.2f}%")
-        send_blocks(format_tilt(tilt).split("\n"))
-        log_tilt(tilt)
-        gate_register(c["symbol"], c["side"])
-        TILT_LAST_STOP[f"{c['symbol']}:{c['side']}"] = tilt["stop"]
-        EXECUTOR.on_signal({
-            "symbol":    tilt["symbol"],
-            "side":      tilt["side"],
-            "price":     tilt["price"],
-            "stop":      tilt["stop"],
-            "stop_pct":  tilt["stop_pct"],
-            "tp1_price": tilt["tp1"],
-            "tp2_price": tilt["tp2"],
-            "tp3_price": tilt["tp3"],   # v9.3: БЫЛО ПОТЕРЯНО. Без неё исполнитель
-                                        # видел две цели, делил позицию пополам вместо
-                                        # трети и подтягивал стоп один раз вместо двух —
-                                        # то есть работала старая схема, а не та, что
-                                        # дала +0.32R в бэктесте.
-            "atr":       tilt["atr"],
-            "ext_atr":   0.0,          # вход по заряду: не гонимся за ценой пробоя
-        }, tilt["score"])
+    # register_charges по-прежнему ведёт список наблюдения и журнал зарядов, но РЕШЕНИЕ о входе
+    # теперь принимается по ВСЕМ зарядам скана, а не только по новым (см. process_entries).
+    register_charges(charges) if (do_charge or do_btc) else []
+    if do_charge:
+        process_entries(charges)
 
     # ── 🚀 ИМПУЛЬС ── (только в окно отправки: вне окна сигнал не создаётся и не логируется)
     if not in_signal_window():
@@ -2462,7 +2580,7 @@ def run_scan(do_charge: bool = True, do_btc: bool = False):
         send_blocks(blocks)
 
     print(f"[SCAN] Лонгов: {len(longs)} | Шортов: {len(shorts)} | Зарядов: {len(charges)} | Watchlist: {len(WATCHLIST)}")
-    return sent + len(alerts), btc_chg_15
+    return sent + len(charges), btc_chg_15
 
 # ─── КОМАНДЫ В ЧАТЕ ───────────────────────────────────────────────────────────
 # Бот читает сообщения в том же чате, чтобы сравнить «что обещал сигнал»
@@ -2648,6 +2766,7 @@ HELP_TEXT = (
     "/up — версия, режим, эквити, открытые позиции\n"
     "/risk — баланс, просадка, до лимитов\n"
     "/riskraw — то же сырым ответом API (для разбора проблем)\n"
+    "/btc — уклон биткоина сейчас: от него зависит, лонги или шорты берём\n"
     "\n<b>⚙️ УПРАВЛЕНИЕ</b>\n"
     "/halt — пауза: новых входов не будет, открытые позиции и их ордера остаются\n"
     "/resume — снять паузу\n"
@@ -2693,6 +2812,9 @@ def handle_command(text: str) -> str:
         return close_my_trade(arg, num, "out") if arg else "Формат: /out SEI 0.2901"
     if cmd == "/up":
         return EXECUTOR.status()
+    if cmd == "/btc":
+        b = btc_bias()
+        return btc_line(b) + (f"\nVWAP {b['vwap']:.2f}, цена {b['price']:.2f}" if b.get("vwap") else "")
     if cmd in ("/hist", "/history", "/trades"):
         days = int(arg) if arg.isdigit() else 7      # /hist 30 — за 30 дней
         return EXECUTOR.history(max(1, min(60, days)))
@@ -3002,12 +3124,17 @@ def main():
         f"🚀 <b>Upscale Bot {BOT_VERSION}</b> | режим: <b>{EXECUTOR.mode}</b>"
         + {"dry": " (только сообщения)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""),
         "",
-        f"⏳ <b>ЗАРЯД</b> {CHARGE_TF} — сжатие при стоящей цене, коридор {WIN_TXT}, скан раз в {CHARGE_SCAN_MIN} мин",
+        f"⏳ <b>ЗАРЯД</b> {CHARGE_TF} — сжатие при стоящей цене, коридор {WIN_TXT}, "
+        f"скан раз в час в :{CHARGE_SCAN_OFFSET_MIN:02d} — проверяются ВСЕ заряды заново",
         f"   сила ≥{ACC_MIN_SCORE}/{ACC_MAX_SCORE} | объём ≥{ACC_RVOL_MIN}× | "
         f"размах ≤{ACC_RANGE_ATR_K}×ATR×√окно (до {ACC_MAX_RANGE_ABS}%)",
         "",
-        f"🎯 <b>УКЛОН</b> — вход по рынку сразу при заряде (ПРОБОЙ отключён)",
-        f"   ход до границы ≥{TILT_MIN_DIST_PCT}% | VWAP ≤{VWAP_MAX_ATR} ATR",
+        f"🎯 <b>УКЛОН</b> — вход по рынку на скане (ПРОБОЙ отключён)",
+        (f"₿ <b>Фильтр BTC:</b> выше своего VWAP на ≥{BTC_VWAP_MARGIN_PCT}% → только лонги, "
+         f"ниже → только шорты, между → пропуск. Уклон пары неясен — берём направление BTC")
+        if BTC_FILTER_ENABLED else "₿ Фильтр BTC выключен",
+        f"   ход до границы ≥{TILT_MIN_DIST_PCT}% | VWAP пары ≤"
+        f"{VWAP_ALIGNED_MAX_ATR if PAIR_VWAP_MODE == 'aligned' else VWAP_MAX_ATR} ATR",
         f"   стоп {TILT_STOP_PCT}% | цели по трети: {TILT_TP1_PCT}% → граница → {TILT_TP3_PCT}%",
         f"   стоп подтягивается после первой и второй цели",
         "",
@@ -3040,9 +3167,9 @@ def main():
             now_msk = datetime.now(MSK)
 
             # часовой дайджест: пары в зарядке + BTC 12ч (заменил алерты по каждому ЗАРЯДу)
-            if now_msk.hour != status_sent_hour and is_trading_hours():
-                send_status(last_signal_count, last_btc)
-                status_sent_hour = now_msk.hour
+            # v10.0: часовой дайджест «В зарядке (N)» убран — он путал (накопительный список за
+            # 16 часов) и дублировал сводку скана, которая теперь приходит после каждого :30.
+            # Список наблюдения по-прежнему доступен командой /watch.
 
             today = now_msk.strftime("%Y-%m-%d")
             if (now_msk.hour, now_msk.minute) >= SUMMARY_HHMM and summary_sent_date != today:
@@ -3050,13 +3177,15 @@ def main():
                 summary_sent_date = today
 
             if is_trading_hours():
-                aligned = (now_msk.hour, (now_msk.minute // SCAN_INTERVAL) * SCAN_INTERVAL)
-                # весь первый минутный отрезок после границы свечи, а не только первые 15 сек:
+                # v10.0: сетка сканов сдвинута на CHARGE_SCAN_OFFSET_MIN (по умолчанию :30)
+                shifted = (now_msk.minute - CHARGE_SCAN_OFFSET_MIN) % 60
+                aligned = (now_msk.hour, now_msk.minute)
+                # весь первый минутный отрезок после границы, а не только первые 15 сек:
                 # если fast_check затянулся из-за таймаута API, скан не пропадёт на 5 минут
-                if now_msk.minute % SCAN_INTERVAL == 0 and aligned != last_scan_key:
+                if shifted % SCAN_INTERVAL == 0 and aligned != last_scan_key:
                     last_scan_key = aligned
-                    result = run_scan(do_charge=(now_msk.minute % CHARGE_SCAN_MIN == 0),
-                                      do_btc=(now_msk.minute % BTC_P["tf_min"] == 0))
+                    result = run_scan(do_charge=(shifted % CHARGE_SCAN_MIN == 0),
+                                      do_btc=False)
                     if result:
                         last_signal_count, last_btc = result
                     last_fast = time.time()
