@@ -25,6 +25,14 @@ import statistics
 import bot as B
 
 DAYS    = int(os.environ.get("BC_DAYS", "60"))
+OFFSET  = int(os.environ.get("BC_OFFSET", "0"))     # на сколько дней сдвинуть период назад
+# Заряды, у которых уклон ПАРЫ не определён («both»): направление берём от BTC.
+# 1 = включить, 0 = только заряды с чётким уклоном (как было раньше)
+INCLUDE_BOTH = os.environ.get("BC_BOTH", "1") == "1"
+# Минута входа после закрытия часа. Живой бот сканирует на :30 (v10.0), поэтому и тест
+# входит на :30, а уклон BTC берёт по 15м свече, закрытой к этому моменту.
+# Раньше тест входил на :00 — результаты прошлых прогонов получены при :00.
+ENTRY_MIN = int(os.environ.get("BC_ENTRY_MIN", "30"))
 PAIRS_N = int(os.environ.get("BC_PAIRS", "0"))
 DIST    = float(os.environ.get("BC_DIST", "1.5"))
 SLIP    = float(os.environ.get("BC_SLIP", "0.15"))
@@ -48,7 +56,7 @@ VW_MARGIN = [0.0, 0.1, 0.2, 0.3, 0.5]
 
 def _fetch(sym, tf, days):
     sec = {"15m": 900, "1h": 3600, "4h": 14400}[tf]
-    now = int(time.time())
+    now = int(time.time()) - OFFSET * 86400
     out, cur = [], now - days * 86400
     while cur < now:
         to = min(now, cur + 1900 * sec)
@@ -230,6 +238,7 @@ def run():
     hold = max(6, int(HOLD_H * 3600 / FINE_SEC))
     setups = []
     n_ch = 0
+    n_both = 0
     t0 = time.time()
     cov = 0.0
 
@@ -248,6 +257,7 @@ def run():
             cov = (fine[-1].get("t", 0) - fine[0].get("t", 0)) / 86400
         idx = {c.get("t"): k for k, c in enumerate(fine)}
         last_end = 0
+        last_end_b = 0
         for e in range(B.BASE_FROM + B.ACC_WINDOW, len(base)):
             upto = base[:e]
             sl = upto[-B.BASE_FROM:-B.BASE_TO]
@@ -258,24 +268,32 @@ def run():
             if not vb or not ab or vb <= 0 or ab <= 0:
                 continue
             cts = upto[-1].get("t", 0)
-            sig_ts = cts + 3600
+            sig_ts = cts + 3600 + ENTRY_MIN * 60     # момент входа: :30 после закрытия часа
             if sig_ts <= last_end:
                 continue
             c = B.detect_charge(sym, upto, upto[-1]["c"], vb, ab,
                                 {"btc_chg_win": 0.0, "do_charge": True},
                                 {"funding": 0.0, "change_24h": 0.0},
                                 lambda s: None, P=B.ALT_P)
-            if not c or c["side"] not in ("long", "short"):
+            if not c:
+                continue
+            is_both = c["side"] not in ("long", "short")
+            if is_both and not INCLUDE_BOTH:
                 continue
             n_ch += 1
+            if is_both:
+                n_both += 1
             k = idx.get(sig_ts)
             if k is None or k + hold + 2 >= len(fine):
                 continue
             px = fine[k]["o"]
-            is_l = c["side"] == "long"
-            bnd = c["hi"] if is_l else c["lo"]
-            room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
-            if room < min(DIST_GRID):
+            if not is_both:
+                is_l = c["side"] == "long"
+                bnd = c["hi"] if is_l else c["lo"]
+                room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
+                if room < min(DIST_GRID):
+                    continue
+            elif sig_ts <= last_end_b:
                 continue
             lo_i = max(0, k - int(86400 / FINE_SEC))
             sg = fine[lo_i:k]
@@ -283,23 +301,45 @@ def run():
             vw_pair = (sum((x["h"] + x["l"] + x["c"]) / 3 * x["v"] for x in sg) / vv) if vv > 0 else None
             atr_pct = c["atr"] / px * 100 if px > 0 else 0
             vw_atr = (abs(px - vw_pair) / px * 100 / atr_pct) if (vw_pair and atr_pct > 0) else 99
-            setups.append((fine[k:k + hold], c["side"], px, bnd, sig_ts, room, vw_atr))
-            last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
+            side_s = "both" if is_both else c["side"]
+            setups.append((fine[k:k + hold], side_s, px, c["hi"], c["lo"], sig_ts, vw_atr))
+            end_ts = fine[min(k + hold, len(fine) - 1)].get("t", 0)
+            if is_both:
+                last_end_b = end_ts       # отдельно, чтобы не менять базу «только с уклоном»
+            else:
+                last_end = end_ts
         if i % 20 == 0:
             print(f"[BTC] {i}/{len(pairs)} | сделок {len(setups)} | {time.time()-t0:.0f}с")
 
-    def collect(bias_fn=None, coin=False, dist=DIST, vwmax=99):
+    def collect(bias_fn=None, coin=False, dist=DIST, vwmax=99, both="include"):
+        """both: include — и заряды с уклоном пары, и без него (направление от BTC);
+        exclude — только с уклоном пары; only — только заряды БЕЗ уклона пары."""
         out = []
-        for seg, side, px, bnd, ts, room, vw_atr in setups:
-            if room < dist or vw_atr > vwmax:
+        for seg, side, px, hi, lo, ts, vw_atr in setups:
+            if vw_atr > vwmax:
                 continue
+            is_both = side == "both"
+            if (both == "exclude" and is_both) or (both == "only" and not is_both):
+                continue
+            if is_both and bias_fn is None:
+                continue                  # без фильтра BTC направления у такого заряда нет
             if bias_fn is not None:
                 bb = bias_fn(ts)
-                if bb is None or bb == "neutral" or bb != side:
+                if bb is None or bb == "neutral":
                     continue
-            sd = rng.choice(("long", "short")) if coin else side
+                if not is_both and bb != side:
+                    continue
+                eff = bb if is_both else side
+            else:
+                eff = side
+            is_l0 = eff == "long"
+            bnd = hi if is_l0 else lo
+            room = (bnd - px) / px * 100 if is_l0 else (px - bnd) / px * 100
+            if room < dist:
+                continue
+            sd = rng.choice(("long", "short")) if coin else eff
             is_l = sd == "long"
-            b = bnd if sd == side else (px * (1 + dist / 100) if is_l else px * (1 - dist / 100))
+            b = bnd if sd == eff else (px * (1 + dist / 100) if is_l else px * (1 - dist / 100))
             ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
             stp = px * (1 - STOP / 100) if is_l else px * (1 + STOP / 100)
             y1 = px * (1 + TP1 / 100) if is_l else px * (1 - TP1 / 100)
@@ -311,8 +351,60 @@ def run():
 
     L = [f"₿ <b>ФИЛЬТР ПО УКЛОНУ BITCOIN</b> (~{cov:.0f} дн, {len(pairs)} пар)",
          "<i>входим только когда уклон монеты совпадает с уклоном BTC. "
-         "Нейтраль пропускаем</i>",
+         "Нейтраль пропускаем</i>"
+         + (f"\n⏪ <b>ПЕРИОД СДВИНУТ НАЗАД НА {OFFSET} ДНЕЙ</b> — проверка на чужих данных"
+            if OFFSET else ""),
+         (f"Заряды БЕЗ уклона пары включены: направление берём от BTC "
+          f"({n_both} из {n_ch} зарядов)" if INCLUDE_BOTH else
+          "Заряды без уклона пары не берём"),
          f"Зарядов: {n_ch} | сделок в выборке: {len(setups)}", ""]
+
+    # ── Как часто BTC нейтрален и как долго ждать уклона ──
+    # Считаем по тем же :30, на которых сканирует бот, только в окне работы (04:00-23:00 МСК).
+    scan_ts = []
+    if vw_side:
+        t_lo, t_hi = min(vw_side), max(vw_side)
+        t = (t_lo // 3600 + 1) * 3600 + ENTRY_MIN * 60
+        while t <= t_hi:
+            msk_h = ((t // 3600) + 3) % 24
+            if 4 <= msk_h <= 22:
+                scan_ts.append(t)
+            t += 3600
+    L.append("<b>КАК ЧАСТО BTC НЕЙТРАЛЕН</b> (по сканам :30 в окне 04:00–23:00 МСК)")
+    L.append("  <i>нейтраль = BTC в пределах запаса от своего VWAP, в этот скан альты не торгуем</i>")
+    if scan_ts:
+        n_days = max(1.0, (scan_ts[-1] - scan_ts[0]) / 86400)
+        for m in VW_MARGIN:
+            cnt = {"long": 0, "short": 0, "neutral": 0}
+            run_n = longest = 0
+            prev_t = None
+            last_dir, flips = None, 0
+            for t in scan_ts:
+                v = btc_bias_map(t, vw_side, FINE_SEC)
+                if v is None:
+                    continue
+                bb = "long" if v > m else "short" if v < -m else "neutral"
+                cnt[bb] += 1
+                if prev_t is not None and t - prev_t > 3700:
+                    run_n = 0                      # ночной разрыв — серия обрывается
+                if bb == "neutral":
+                    run_n += 1
+                    longest = max(longest, run_n)
+                else:
+                    run_n = 0
+                    if last_dir and bb != last_dir:
+                        flips += 1
+                    last_dir = bb
+                prev_t = t
+            tot = sum(cnt.values()) or 1
+            lbl = "любое положение" if m == 0 else f"запас {m}%"
+            L.append(f"  {lbl:16}: лонг {cnt['long']/tot*100:3.0f}%, шорт {cnt['short']/tot*100:3.0f}%, "
+                     f"<b>нейтраль {cnt['neutral']/tot*100:3.0f}%</b> | "
+                     f"самая долгая нейтраль подряд: <b>{longest} ч</b> | "
+                     f"смен лонг↔шорт: {flips/n_days:.1f} в сутки")
+    else:
+        L.append("  данных BTC не хватило")
+    L.append("")
 
     methods = []
     for tf in BTC_TFS:
@@ -368,6 +460,23 @@ def run():
                 if st[0] >= 60 and (best is None or st[1] > best[2]):
                     best = (f"ход ≥{dist}%, VWAP ≤{vw}, {name}", st[0], st[1], edge, gain)
             L.append("")
+
+    # эффект добавления зарядов без уклона пары — на основных настройках
+    if INCLUDE_BOTH:
+        L += ["<b>ЧТО ДАЮТ ЗАРЯДЫ БЕЗ УКЛОНА ПАРЫ</b> (ход ≥1.5%, VWAP пары ≤2.0)",
+              "  <i>для каждого фильтра BTC: только с уклоном пары / вместе / "
+              "только без уклона</i>"]
+        cmp_methods = [m for m in methods if any(k in m[0] for k in
+                       ("любое положение", "0.2%", "0.3%", "согласны", "коридор BTC 1h"))]
+        for name, fn in cmp_methods:
+            a = collect(fn, dist=1.5, vwmax=2.0, both="exclude")
+            b_ = collect(fn, dist=1.5, vwmax=2.0, both="include")
+            c_ = collect(fn, dist=1.5, vwmax=2.0, both="only")
+            L.append(f"  <b>{name}</b>")
+            L.append(_line(a, "   только с уклоном пары"))
+            L.append(_line(b_, "   ВМЕСТЕ с зарядами без уклона"))
+            L.append(_line(c_, "   только заряды без уклона (направление от BTC)"))
+        L.append("")
 
     if best:
         L.append(f"→ <b>лучшее: {best[0]}</b>")
