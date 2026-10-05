@@ -2904,6 +2904,7 @@ def main():
         print(f"[PENDING] поднял с диска записей: {_restored}")
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "ФИЛЬТР ПО BTC (bt_btc.py)" if bt_mode in ("btc", "16")
            else "ПРОБОЙ VWAP (bt_vbreak.py)" if bt_mode in ("vbreak", "15")
            else "VWAP КАК МАГНИТ (bt_vwap.py)" if bt_mode in ("vwap", "14")
            else "СТОП И ПОДТЯЖКА (bt_stop.py)" if bt_mode in ("stop", "13")
@@ -2919,7 +2920,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -2941,7 +2942,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("vbreak", "15"):
+                if bt_mode in ("btc", "16"):
+                    import bt_btc
+                    bt_btc.main()          # фильтр по уклону BTC
+                elif bt_mode in ("vbreak", "15"):
                     import bt_vbreak
                     bt_vbreak.main()       # сигнал по пробою VWAP
                 elif bt_mode in ("vwap", "14"):
