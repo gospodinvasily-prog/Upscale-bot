@@ -2904,6 +2904,7 @@ def main():
         print(f"[PENDING] поднял с диска записей: {_restored}")
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "ТАЙМФРЕЙМЫ ЗАРЯДА (bt_tf.py)" if bt_mode in ("tf", "12")
            else "АУДИТ ДОПУЩЕНИЙ (bt_audit.py)" if bt_mode in ("audit", "11")
            else "СХЕМА ВХОДА (bt_entry.py)" if bt_mode in ("entry", "10")
            else "ОСЛАБЛЕНИЯ (bt_loose.py)" if bt_mode in ("loose", "9")
@@ -2915,7 +2916,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -2937,7 +2938,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("audit", "11"):
+                if bt_mode in ("tf", "12"):
+                    import bt_tf
+                    bt_tf.main()           # на каком ТФ искать заряд
+                elif bt_mode in ("audit", "11"):
                     import bt_audit
                     bt_audit.main()        # аудит допущений бэктеста
                 elif bt_mode in ("entry", "10"):
