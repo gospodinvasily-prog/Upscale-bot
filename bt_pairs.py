@@ -36,7 +36,7 @@ import statistics
 
 import bot as B
 
-DAYS      = int(os.environ.get("PB_DAYS", "45"))
+DAYS      = int(os.environ.get("PB_DAYS", "60"))
 OFFSET    = int(os.environ.get("PB_OFFSET", "0"))
 PAIRS_N   = int(os.environ.get("PB_PAIRS", "0"))
 DIST      = float(os.environ.get("PB_DIST", "1.5"))
@@ -47,6 +47,9 @@ SLIP      = float(os.environ.get("PB_SLIP", "0.10"))
 COST      = float(os.environ.get("PB_COST", "0.065"))
 STOP_SLIP = float(os.environ.get("PB_STOP_SLIP", "0.05"))
 HOLD_H    = int(os.environ.get("PB_HOLD_H", "12"))
+# Прошлый прогон: сила 4-5 дала -0.086R, 6-7 -0.065R, 8-9 +0.082R — монотонно.
+# Порог отбирает сделки по силе ПОЛНОГО детектора (с очками за OI и тейкеров).
+MIN_SCORE = int(os.environ.get("PB_MIN_SCORE", "0"))   # 0 = без отбора
 
 FINE_SEC = 900
 STOP, TP1, TP3 = 1.0, 1.0, 2.0
@@ -284,6 +287,8 @@ def run():
                 n_ch_slim += 1
             if not c_full:
                 continue
+            if MIN_SCORE and c_full["score"] < MIN_SCORE:
+                continue
 
             for em in ENTRY_MINS:
                 ts = sig_ts + em * 60
@@ -324,7 +329,7 @@ def run():
                     continue
                 oi_w = (snap or {}).get("oi_win")
                 slim_sc = c_slim["score"] if c_slim else None
-                trades.append({"R": r, "score": c_full["score"], "oi": oi_w,
+                trades.append({"R": r, "ts": ts, "score": c_full["score"], "oi": oi_w,
                                "slim": slim_sc, "side": side, "px": px, "bnd": bnd,
                                "seg": seg, "taker": (snap or {}).get("taker_win"),
                                "fund": tick["funding"]})
@@ -339,7 +344,8 @@ def run():
          "<i>впервые заряд считается с настоящими OI, тейкерами и фандингом — "
          "раньше в бэктестах их не было, и проверялся урезанный детектор</i>",
          f"Фильтры: ход ≥{DIST}%" + ("" if NO_BTC else f", BTC ≥{BTC_MARG}% от VWAP")
-         + ("" if NO_PVWAP else ", сторона VWAP пары"),
+         + ("" if NO_PVWAP else ", сторона VWAP пары")
+         + (f", сила ≥{MIN_SCORE}" if MIN_SCORE else ""),
          f"Зарядов с полными данными: {n_ch_full} | тем же детектором без них: {n_ch_slim}",
          f"Сделок: {len(trades)} | издержки {COST}%, проскальзывание {SLIP}%", ""]
 
@@ -366,17 +372,42 @@ def run():
                 out.append(r)
         return out
 
+    trades.sort(key=lambda t: t.get("ts", 0))
+    mid = len(trades) // 2
+    half1 = trades[:mid]
+    half2 = trades[mid:]
     allR = [t["R"] for t in trades]
+
     L.append("<b>1. ВСЕ СДЕЛКИ</b>")
     L.append(_line(allR, "полный детектор", coin(trades)))
+    if half1 and half2:
+        h1 = _stat([t["R"] for t in half1])
+        h2 = _stat([t["R"] for t in half2])
+        if h1 and h2:
+            L.append(f"     <i>первая половина периода: {h1[1]:+.3f}R ({h1[0]} сд) | "
+                     f"вторая: {h2[1]:+.3f}R ({h2[0]} сд)</i>")
     L.append("")
 
-    L.append("<b>2. ПО СИЛЕ ЗАРЯДА</b> (теперь сила настоящая, с очками за OI)")
+    L.append("<b>2. ПО СИЛЕ ЗАРЯДА</b> (сила настоящая, с очками за OI и тейкеров)")
+    L.append("  <i>группами — видно, растёт ли качество со силой</i>")
     for lo, hi in ((4, 5), (6, 7), (8, 9), (10, 99)):
         sel = [t for t in trades if lo <= t["score"] <= hi]
-        if len(sel) >= 25:
+        if len(sel) >= 20:
             lbl = f"сила {lo}-{hi}" if hi < 99 else f"сила ≥{lo}"
             L.append(_line([t["R"] for t in sel], lbl, coin(sel)))
+    L.append("  <i>накопительно — и с разбивкой по половинам периода</i>")
+    for mn in (5, 6, 7, 8, 9):
+        sel = [t for t in trades if t["score"] >= mn]
+        if len(sel) < 20:
+            continue
+        s1 = [t for t in half1 if t["score"] >= mn]
+        s2 = [t for t in half2 if t["score"] >= mn]
+        st1 = _stat([t["R"] for t in s1])
+        st2 = _stat([t["R"] for t in s2])
+        halves = ""
+        if st1 and st2:
+            halves = f" <i>[1-я: {st1[1]:+.2f}R/{st1[0]}сд | 2-я: {st2[1]:+.2f}R/{st2[0]}сд]</i>"
+        L.append(_line([t["R"] for t in sel], f"сила ≥{mn}", coin(sel)) + halves)
     L.append("")
 
     L.append("<b>3. ЧТО ДАЁТ ОТКРЫТЫЙ ИНТЕРЕС</b>")
@@ -421,6 +452,28 @@ def run():
         mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
         L.append(f"  {mark} через {hh:2}ч: {avg:+.3f}% (±{1.96 * se:.3f}), "
                  f"в плюс {sum(1 for x in mv if x > 0) / n * 100:.0f}%")
+
+    L.append("  <i>то же, но только сильные заряды</i>")
+    for mn in (7, 8):
+        sel = [t for t in trades if t["score"] >= mn]
+        if len(sel) < 40:
+            continue
+        for hh, nb in ((4, 16), (12, 48)):
+            mv = []
+            for t in sel:
+                seg = t["seg"]
+                if len(seg) <= nb or t["px"] <= 0:
+                    continue
+                m = (seg[nb]["c"] - t["px"]) / t["px"] * 100
+                mv.append(m if t["side"] == "long" else -m)
+            if len(mv) < 40:
+                continue
+            n = len(mv)
+            avg = sum(mv) / n
+            se = statistics.pstdev(mv) / (n ** 0.5) if n > 1 else 0
+            mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
+            L.append(f"  {mark} сила ≥{mn}, через {hh:2}ч: {avg:+.3f}% (±{1.96 * se:.3f}), "
+                     f"{n} набл.")
 
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
