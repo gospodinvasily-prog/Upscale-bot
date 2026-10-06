@@ -1,7 +1,7 @@
 """
-bt_pairs.py — PULSE-D (дневной импульс) + IGNITION и SWEEP (интрадей) на BTC/ETH.
+bt_pairs.py — FLUSH-60 (альты, каскады ликвидаций) + PULSE-D (дневной импульс) + IGNITION и SWEEP (интрадей).
 
-ПО УМОЛЧАНИЮ запускается PULSE-D (PAIRS_RUN=pulsed). Интрадей-части: PAIRS_RUN=ignition|sweep|both|all.
+ПО УМОЛЧАНИЮ запускается FLUSH-60 (PAIRS_RUN=flush). Остальное: PAIRS_RUN=pulsed|ignition|sweep|both|all.
 
 IGNITION + SWEEP: две интрадей-проверки на BTC/ETH.
 
@@ -1090,9 +1090,408 @@ def run_pulsed():
     _send(L)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  FLUSH-60 — откат после каскада ликвидаций на 60 днях истории (все альты Upscale)
+# ═════════════════════════════════════════════════════════════════════════════
+FL_DAYS       = int(os.environ.get("FL_DAYS", "60"))
+FL_PAIRS_N    = int(os.environ.get("FL_PAIRS_N", "0"))
+FL_ALIGN      = os.environ.get("FL_ALIGN", "auto").lower()      # auto | 0 | -1
+FL_LIQ_MULT   = float(os.environ.get("FL_LIQ_MULT", "5"))
+FL_LIQ_MIN    = float(os.environ.get("FL_LIQ_MIN", "3000"))
+FL_OI_DROP    = float(os.environ.get("FL_OI_DROP", "0.8"))
+FL_MOVE       = float(os.environ.get("FL_MOVE", "2.5"))
+FL_MAX_STOP   = float(os.environ.get("FL_MAX_STOP", "3.0"))
+FL_BUF        = float(os.environ.get("FL_BUF", "0.1"))
+FL_HOLD_H     = int(os.environ.get("FL_HOLD_H", "12"))
+FL_FEE        = float(os.environ.get("FL_FEE", "0.05"))
+FL_SLIP       = float(os.environ.get("FL_SLIP", "0.10"))
+FL_STOP_SLIP  = float(os.environ.get("FL_STOP_SLIP", "0.15"))
+FL_COOLDOWN_H = int(os.environ.get("FL_COOLDOWN_H", "6"))
+FL_N_MIN      = int(os.environ.get("FL_N_MIN", "100"))
+FL_TP_K       = (0.4, 0.7, 1.0)
+HOUR          = 3600
+
+
+def fl_sim(bars, is_long, ent, stop, tps, scale=1.0, optimistic=False):
+    """Три цели по трети; после TP1 стоп в безубыток, после TP2 — на TP1.
+    В спорной свече первым считается СТОП; optimistic=True — тейки первыми (верхняя граница)."""
+    fee_pct, stop_slip = FL_FEE * scale, FL_STOP_SLIP * scale
+    risk = abs(ent - stop)
+    if risk <= 0 or not bars:
+        return None
+    fee, acc, done, cs = fee_pct / 100 * ent / risk, 0.0, 0, stop
+    parts = (1 / 3, 1 / 3, 1 / 3)
+
+    def stop_out(left_parts):
+        px = cs * (1 - stop_slip / 100) if is_long else cs * (1 + stop_slip / 100)
+        r = (px - ent) / risk if is_long else (ent - px) / risk
+        left = sum(left_parts)
+        return acc + r * left - fee - fee_pct / 100 * px * left / risk
+
+    for c in bars:
+        if optimistic:
+            hit = False
+            while done < 3:
+                t = tps[done]
+                if (c["h"] >= t) if is_long else (c["l"] <= t):
+                    acc += parts[done] * (abs(t - ent) / risk)
+                    fee += fee_pct / 100 * t * parts[done] / risk
+                    done += 1
+                    hit = True
+                    cs = ent if done == 1 else (tps[0] if done == 2 else cs)
+                else:
+                    break
+            if done >= 3:
+                return acc - fee
+            if not hit and ((c["l"] <= cs) if is_long else (c["h"] >= cs)):
+                return stop_out(parts[done:])
+        else:
+            if (c["l"] <= cs) if is_long else (c["h"] >= cs):
+                return stop_out(parts[done:])
+            while done < 3:
+                t = tps[done]
+                if (c["h"] >= t) if is_long else (c["l"] <= t):
+                    acc += parts[done] * (abs(t - ent) / risk)
+                    fee += fee_pct / 100 * t * parts[done] / risk
+                    done += 1
+                    cs = ent if done == 1 else (tps[0] if done == 2 else cs)
+                else:
+                    break
+            if done >= 3:
+                return acc - fee
+    last = bars[-1]["c"]
+    left = sum(parts[done:])
+    r = (last - ent) / risk if is_long else (ent - last) / risk
+    return acc + r * left - fee - fee_pct / 100 * last * left / risk
+
+
+def fl_trade(bars, is_long, entry, stop, tps, scale=1.0, optimistic=False):
+    """Вход по рынку со ПРОСКАЛЬЗЫВАНИЕМ (в присланной версии FL_SLIP нигде не применялся).
+    Уровни стопа и целей — рыночные, поэтому от проскальзывания не меняются."""
+    ent = entry * (1 + FL_SLIP * scale / 100) if is_long else entry * (1 - FL_SLIP * scale / 100)
+    if (is_long and stop >= ent) or ((not is_long) and stop <= ent):
+        return None                                      # цена открылась за стопом
+    return fl_sim(bars, is_long, ent, stop, tps, scale, optimistic)
+
+
+def fl_fetch_stats(sym, days):
+    """contract_stats по часам: {начало_часа: {ll, ls, oi, oiu}}."""
+    now = int(time.time())
+    cur, out, probes = now - days * 86400, [], 0
+    while cur < now:
+        raw = B.api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": "1h",
+                                           "from": cur, "to": min(now, cur + 100 * HOUR),
+                                           "limit": 100})
+        rows = raw if isinstance(raw, list) else []
+        if not rows:
+            probes += 1
+            if probes > 20:
+                break
+            cur += 5 * 86400
+            continue
+        out.extend(rows)
+        nxt = max(int(B.fnum(r.get("time", 0))) for r in rows) + HOUR
+        if nxt <= cur:
+            break
+        cur = nxt
+    res = {}
+    for r in out:
+        t = int(B.fnum(r.get("time", 0)))
+        if t > 0:
+            res[t - t % HOUR] = {"ll": B.fnum(r.get("long_liq_usd", 0)),
+                                 "ls": B.fnum(r.get("short_liq_usd", 0)),
+                                 "oi": B.fnum(r.get("open_interest", 0)),
+                                 "oiu": B.fnum(r.get("open_interest_usd", 0))}
+    return res
+
+
+def fl_load(sym, days):
+    rows = fl_fetch_stats(sym, days)
+    c = fetch_gate(sym, days, 0)
+    if len(rows) < 240 or len(c) < 1000:
+        return None
+    c = c[:-1]
+    use_c = all(r["oi"] > 0 for r in rows.values())          # единица OI одна на весь ряд
+    for r in rows.values():
+        r["o"] = r["oi"] if use_c else r["oiu"]
+    return {"rows": rows, "c": c, "idx": {x["t"]: k for k, x in enumerate(c)}}
+
+
+def fl_pick_align(data):
+    """К какому часу относится строка статистики с временем t: [t, t+1ч) или [t−1ч, t)?
+    От этого зависит всё: если ошибиться, ликвидации сопоставятся с чужим ходом цены.
+    Определяем по данным: часы с самыми крупными ликвидациями лонгов должны совпадать с
+    падением цены, шортов — с ростом. Берём окно, где этот контраст сильнее."""
+    acc = {0: {"L": [], "S": []}, -HOUR: {"L": [], "S": []}}
+    for d in data.values():
+        rows, c, idx = d["rows"], d["c"], d["idx"]
+        for key, tag in (("ll", "L"), ("ls", "S")):
+            vals = sorted(r[key] for r in rows.values() if r[key] > 0)
+            if len(vals) < 30:
+                continue
+            thr = vals[int(0.97 * (len(vals) - 1))]
+            for t, r in rows.items():
+                if r[key] < thr:
+                    continue
+                for sh in acc:
+                    a, b = idx.get(t + sh), idx.get(t + sh + 3 * SEC)
+                    if a is None or b is None or c[a]["o"] <= 0:
+                        continue
+                    acc[sh][tag].append((c[b]["c"] / c[a]["o"] - 1) * 100)
+    score = {}
+    for sh, v in acc.items():
+        if len(v["L"]) >= 20 and len(v["S"]) >= 20:
+            score[sh] = (sum(v["S"]) / len(v["S"]) - sum(v["L"]) / len(v["L"]), len(v["L"]), len(v["S"]))
+    if FL_ALIGN in ("0", "-1"):
+        sh = 0 if FL_ALIGN == "0" else -HOUR
+        return sh, [f"выравнивание задано вручную: FL_ALIGN={FL_ALIGN}"]
+    if not score:
+        return 0, ["⚠️ выравнивание определить не удалось (мало крупных ликвидаций) — принято [t, t+1ч)"]
+    best = max(score, key=lambda k: score[k][0])
+    txt = []
+    for sh in (0, -HOUR):
+        if sh in score:
+            txt.append(f"{'[t, t+1ч)' if sh == 0 else '[t−1ч, t)'}: контраст шорт-лонг "
+                       f"{score[sh][0]:+.2f}% ({score[sh][1]}+{score[sh][2]} часов)")
+    note = ""
+    if score[best][0] < 0.3:
+        note = " ⚠️ контраст слабый — выравнивание ненадёжно"
+    lbl = "строка t описывает час [t, t+1ч)" if best == 0 else "строка t описывает час [t−1ч, t)"
+    return best, [f"выравнивание статистики: {'; '.join(txt)} → <b>{lbl}</b>{note}"]
+
+
+def fl_scan_pair(sym, d, shift, rng):
+    """События двух видов: flush (цена + ликвидации + падение OI) и price (та же ценовая картина
+    БЕЗ ликвидационных условий — контроль: нужны ли вообще данные о ликвидациях)."""
+    rows, c, idx = d["rows"], d["c"], d["idx"]
+    out, last_ev = [], {"flush": -10 ** 12, "price": -10 ** 12}
+    for t in sorted(t for t, r in rows.items() if r["o"] > 0):
+        hs = t + shift                                    # начало каскадного часа
+        a = idx.get(hs)
+        if a is None or a + 3 >= len(c):
+            continue
+        hb = c[a:a + 4]
+        if hb[3]["t"] != hs + 3 * SEC or hb[0]["o"] <= 0:
+            continue
+        move = (hb[3]["c"] / hb[0]["o"] - 1) * 100
+        last = hb[3]
+        # ПОСЛЕДНЯЯ свеча часа — встречная (в присланной версии сравнивались закрытие и открытие
+        # всего часа, из-за чего отсекался любой настоящий каскад)
+        if move <= -FL_MOVE and last["c"] > last["o"]:
+            is_long = True
+        elif move >= FL_MOVE and last["c"] < last["o"]:
+            is_long = False
+        else:
+            continue
+        r, prev = rows[t], rows.get(t - HOUR)
+        hist = [rows[t - k * HOUR] for k in range(1, 25) if (t - k * HOUR) in rows]
+        if not prev or prev["o"] <= 0 or len(hist) < 12:
+            continue
+        key = "ll" if is_long else "ls"
+        other = "ls" if is_long else "ll"
+        med = statistics.median([x[key] for x in hist])
+        oi_chg = (r["o"] / prev["o"] - 1) * 100
+        liq = r[key]
+        is_flush = (liq >= max(FL_LIQ_MULT * med, FL_LIQ_MIN) and liq >= 2 * r[other]
+                    and oi_chg <= -FL_OI_DROP)
+        kind = "flush" if is_flush else "price"
+        if t <= last_ev[kind] + FL_COOLDOWN_H * HOUR:
+            continue
+        k0 = None
+        for off in range(5):                              # вход строго ПОСЛЕ закрытия часа
+            k0 = idx.get(hs + HOUR + off * SEC)
+            if k0 is not None:
+                break
+        if k0 is None or k0 + FL_HOLD_H * 4 > len(c):
+            continue                                      # нужен полный горизонт удержания
+        bars = c[k0:k0 + FL_HOLD_H * 4]
+        entry = bars[0]["o"]
+        ext = min(x["l"] for x in hb) if is_long else max(x["h"] for x in hb)
+        stop = ext * (1 - FL_BUF / 100) if is_long else ext * (1 + FL_BUF / 100)
+        if entry <= 0 or abs(entry - stop) / entry * 100 > FL_MAX_STOP:
+            continue
+        mv = abs(move)
+        tps = [entry * (1 + mv * k / 100) if is_long else entry * (1 - mv * k / 100) for k in FL_TP_K]
+        r_main = fl_trade(bars, is_long, entry, stop, tps)
+        if r_main is None:
+            continue
+        r_opt = fl_trade(bars, is_long, entry, stop, tps, optimistic=True)
+        # зеркальная сделка: тот же риск, развёрнутая геометрия, СВОЁ проскальзывание
+        r_anti = fl_trade(bars, not is_long, entry, 2 * entry - stop, [2 * entry - x for x in tps])
+        if r_anti is None:
+            continue
+        drift = {}
+        for hh in (1, 2, 4, 8, 12, 24):
+            kk = None
+            for off in range(5):
+                kk = idx.get(hs + HOUR + hh * HOUR + off * SEC)
+                if kk is not None:
+                    break
+            if kk is not None:
+                drift[hh] = (c[kk]["o"] / entry - 1) * 100 * (1 if is_long else -1)
+        oiu = prev["oiu"] if prev["oiu"] > 0 else None
+        dt = datetime.fromtimestamp(hs, timezone.utc)
+        out.append({"kind": kind, "sym": sym, "t": hs, "is_long": is_long, "r": r_main,
+                    "r_opt": r_opt, "r_anti": r_anti,
+                    "r_coin": r_main if rng.random() < 0.5 else r_anti,
+                    "drift": drift, "move": mv, "mult": (liq / med) if med > 0 else None,
+                    "med0": med <= 0, "liq_oi": (liq / oiu * 100) if oiu else None,
+                    "day": dt.strftime("%Y-%m-%d"), "month": dt.strftime("%Y-%m"),
+                    "bars": bars, "entry": entry, "stop": stop, "tps": tps})
+        last_ev[kind] = t
+    return out
+
+
+def _fl_line(evs, label, key="r"):
+    vals = [(e[key], e["day"]) for e in evs if e.get(key) is not None]
+    if not vals:
+        return f"  {label}: сделок нет"
+    n, m, ci = cluster_ci([v for v, _ in vals], [d for _, d in vals])
+    wr = sum(1 for v, _ in vals if v > 0) / n * 100
+    mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
+    return f"  {mark} {label}: {n:4} сд, ВР {wr:3.0f}%, <b>{m:+.3f}R</b> (±{ci:.3f})"
+
+
+def _fl_drift(evs, hh):
+    vals = [(e["drift"][hh], e["day"]) for e in evs if hh in e["drift"]]
+    if len(vals) < 5:
+        return None
+    return cluster_ci([v for v, _ in vals], [d for _, d in vals])
+
+
+def run_flush():
+    rnd = random.Random(60)
+    pairs = B.UPSCALE_PAIRS[:FL_PAIRS_N] if FL_PAIRS_N else B.UPSCALE_PAIRS
+    t0 = time.time()
+    data = {}
+    for i, sym in enumerate(pairs, 1):
+        try:
+            d = fl_load(sym, FL_DAYS)
+        except Exception as e:
+            print(f"[FL60] {sym}: {e}")
+            d = None
+        if d:
+            data[sym] = d
+        if i % 20 == 0:
+            print(f"[FL60] {i}/{len(pairs)} | с данными {len(data)} | {time.time() - t0:.0f}с")
+    if not data:
+        _send(["⚠️ FLUSH-60: данных нет ни по одной паре"])
+        return
+    shift, align_txt = fl_pick_align(data)
+    ev = []
+    for sym, d in data.items():
+        ev += fl_scan_pair(sym, d, shift, rnd)
+    flush = [e for e in ev if e["kind"] == "flush"]
+    ponly = [e for e in ev if e["kind"] == "price"]
+
+    L = [f"💥 <b>FLUSH-60 v1.2: откат после каскада ликвидаций</b> — {len(data)} пар, {FL_DAYS} дн",
+         f"<i>каскад: ликвидации одной стороны ≥ max({FL_LIQ_MULT}×медианы 24ч, ${FL_LIQ_MIN:.0f}) и ≥2× "
+         f"другой, OI за час ≤ −{FL_OI_DROP}%, ход часа ≥{FL_MOVE}% и ПОСЛЕДНЯЯ 15м свеча встречная | "
+         f"вход по открытию следующей свечи после часа | стоп за экстремум часа +{FL_BUF}% (≤{FL_MAX_STOP}%) | "
+         f"цели {', '.join(f'{int(k * 100)}%' for k in FL_TP_K)} каскадного хода по трети, "
+         f"безубыток после TP1, держим {FL_HOLD_H}ч</i>",
+         f"<i>издержки: комиссия {FL_FEE}% за сторону, проскальзывание входа {FL_SLIP}%, "
+         f"стопа {FL_STOP_SLIP}% (проскальзывание входа теперь реально применяется)</i>"]
+    L += align_txt
+    L += [f"Событий: <b>{len(flush)}</b> с ликвидациями | {len(ponly)} с той же ценовой картиной "
+          f"БЕЗ ликвидационных условий (контроль)", ""]
+    if not flush:
+        L.append("⚠️ Каскадов с ликвидациями не найдено — вывод невозможен")
+        _send(L)
+        return
+
+    L.append("<b>1. ДРЕЙФ ПОСЛЕ КАСКАДА</b> (без стопов и целей, в сторону отката, %)")
+    L.append("  <i>главное измерение. Рядом тот же ход цены БЕЗ данных о ликвидациях: если они "
+             "равны, ликвидации ничего не добавляют</i>")
+    for hh in (1, 2, 4, 8, 12, 24):
+        a, b = _fl_drift(flush, hh), _fl_drift(ponly, hh)
+        if not a:
+            continue
+        ma = "✅" if a[1] - a[2] > 0 else "❌" if a[1] + a[2] < 0 else "  "
+        row = f"  {ma} +{hh:2}ч: каскад {a[1]:+.3f}% (±{a[2]:.3f}, n={a[0]})"
+        if b:
+            row += f" | только цена {b[1]:+.3f}% (±{b[2]:.3f}, n={b[0]})"
+        L.append(row)
+    L.append("")
+
+    L.append("<b>2. СИЛА КАСКАДА</b>")
+    z = sum(1 for e in flush if e["med0"])
+    L.append(f"  у {z} из {len(flush)} событий ({z / len(flush) * 100:.0f}%) медиана часовых ликвидаций "
+             f"за сутки равна НУЛЮ — порог «{FL_LIQ_MULT}× медианы» там не работает и остаётся "
+             f"только ${FL_LIQ_MIN:.0f}")
+    lo = sorted(e["liq_oi"] for e in flush if e["liq_oi"] is not None)
+    if len(lo) >= 30:
+        q = lambda p: lo[int(p * (len(lo) - 1))]
+        L.append(f"  ликвидации как доля OI за час: p25 {q(.25):.2f}% | медиана {q(.5):.2f}% | "
+                 f"p75 {q(.75):.2f}% | p90 {q(.9):.2f}%")
+        t1, t2 = q(1 / 3), q(2 / 3)
+        for name, sel in ((f"слабые (≤{t1:.2f}% OI)", [e for e in flush if e["liq_oi"] is not None and e["liq_oi"] <= t1]),
+                          ("средние", [e for e in flush if e["liq_oi"] is not None and t1 < e["liq_oi"] <= t2]),
+                          (f"сильные (>{t2:.2f}% OI)", [e for e in flush if e["liq_oi"] is not None and e["liq_oi"] > t2])):
+            d4 = _fl_drift(sel, 4)
+            L.append(_fl_line(sel, name) + (f" | дрейф +4ч {d4[1]:+.3f}%" if d4 else ""))
+        L.append("  <i>настоящий эффект растёт с долей OI. Если слабые и сильные одинаковы — дело не "
+                 "в ликвидациях</i>")
+    L.append("")
+
+    L.append("<b>3. СДЕЛКИ</b> (три цели по трети)")
+    L.append(_fl_line(flush, "MAIN (стоп первым — нижняя граница)"))
+    L.append(_fl_line(flush, "BOX: тейки первыми (верхняя граница)", "r_opt"))
+    L.append(_fl_line(flush, "ANTI (зеркальная сделка против)", "r_anti"))
+    L.append(_fl_line(flush, "COIN (случайное направление)", "r_coin"))
+    L.append(_fl_line(ponly, "ТОЛЬКО ЦЕНА (те же правила, без ликвидаций)"))
+    pairs_ = [((e["r"] - e["r_anti"]) / 2, e["day"]) for e in flush]
+    if len(pairs_) >= 30:
+        n_, m_, ci_ = cluster_ci([v for v, _ in pairs_], [d for _, d in pairs_])
+        cost = -sum((e["r"] + e["r_anti"]) / 2 for e in flush) / len(flush)
+        mk = "✅" if m_ - ci_ > 0 else "❌" if m_ + ci_ < 0 else "  "
+        L.append(f"  {mk} валовый эдж направления (MAIN−ANTI)/2: <b>{m_:+.3f}R</b> (±{ci_:.3f}) при "
+                 f"издержках {cost:.3f}R → чистый {m_ - cost:+.3f}R")
+    cells = []
+    for sc in (1.0, 0.7, 0.4):
+        rs = [(fl_trade(e["bars"], e["is_long"], e["entry"], e["stop"], e["tps"], scale=sc), e["day"])
+              for e in flush]
+        rs = [(r, d) for r, d in rs if r is not None]
+        st = cluster_ci([r for r, _ in rs], [d for _, d in rs]) if rs else None
+        if st:
+            cells.append(f"издержки ×{sc:g} → <b>{st[1]:+.3f}R</b> (±{st[2]:.3f})")
+    if cells:
+        L.append("  MAIN при сниженных издержках: " + " | ".join(cells))
+    L.append("")
+
+    months = {}
+    for e in flush:
+        months.setdefault(e["month"], []).append(e["r"])
+    L.append("<b>4. РАЗБРОС</b>")
+    L.append("  по месяцам: " + " | ".join(f"{m}: {len(v)} соб., {sum(v):+.1f}R" for m, v in sorted(months.items())))
+    by_sym, by_day = {}, {}
+    for e in flush:
+        by_sym[e["sym"]] = by_sym.get(e["sym"], 0) + 1
+        by_day[e["day"]] = by_day.get(e["day"], 0) + 1
+    t5 = sorted(by_sym.items(), key=lambda kv: -kv[1])[:5]
+    d5 = sorted(by_day.items(), key=lambda kv: -kv[1])[:3]
+    L.append("  монеты-лидеры: " + ", ".join(f"{s} ({n})" for s, n in t5)
+             + f" — {sum(n for _, n in t5) / len(flush) * 100:.0f}% событий")
+    L.append("  дни-лидеры (каскады идут по всему рынку сразу): " + ", ".join(f"{d} ({n})" for d, n in d5)
+             + f" — {sum(n for _, n in d5) / len(flush) * 100:.0f}% событий")
+    L.append("")
+
+    st = cluster_ci([e["r"] for e in flush], [e["day"] for e in flush])
+    if not st or st[0] < FL_N_MIN:
+        verdict = f"⚠️ ВЫВОД НЕВОЗМОЖЕН: событий {st[0] if st else 0} < {FL_N_MIN}"
+    elif st[1] - st[2] > 0.15:
+        verdict = "✅ ПРОЙДЕН — нижняя граница выше +0.15R, можно на demo"
+    else:
+        verdict = "❌ ПРОВАЛЕН — нижняя граница не выше +0.15R"
+    L.append(f"<b>КРИТЕРИЙ</b> (нижняя граница MAIN > +0.15R, n ≥ {FL_N_MIN}, интервал по дням): {verdict}")
+    L.append("<i>интервалы по дням: каскады происходят на всём рынке сразу, поэтому события одного "
+             "дня зависимы, и обычный интервал был бы слишком узким</i>")
+    _send(L)
+
+
 # ═════════════ запуск ═════════════
 
-PAIRS_RUN = os.environ.get("PAIRS_RUN", "pulsed").lower()    # pulsed | ignition | sweep | both | all
+PAIRS_RUN = os.environ.get("PAIRS_RUN", "flush").lower()   # flush | pulsed | ignition | sweep | both | all
 
 
 def run():
@@ -1102,6 +1501,8 @@ def run():
         run_sweep()
     if PAIRS_RUN in ("all", "pulsed"):
         run_pulsed()
+    if PAIRS_RUN in ("all", "flush"):
+        run_flush()
 
 
 def main():
