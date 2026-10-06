@@ -35,16 +35,16 @@ import bot as B
 
 DAYS      = int(os.environ.get("XM_DAYS", "90"))
 OFFSET    = int(os.environ.get("XM_OFFSET", "0"))
-MOM_H     = int(os.environ.get("XM_MOM_H", "72"))
+MOM_H     = int(os.environ.get("XM_MOM_H", "168"))
 TOP_N     = int(os.environ.get("XM_TOP", "5"))
-HOLD_D    = int(os.environ.get("XM_HOLD_D", "3"))
+HOLD_D    = int(os.environ.get("XM_HOLD_D", "5"))
 POS_USD   = float(os.environ.get("XM_POSITION", "500"))
 FEE_PCT   = float(os.environ.get("XM_FEE", "0.05"))
 SLIP_PCT  = float(os.environ.get("XM_SLIP", "0.05"))
 
 # Дополнительные окна доходности и длины цикла — заодно смотрим, не лучше ли другое.
-MOM_GRID  = [int(x) for x in os.environ.get("XM_MOM_GRID", "24,48,72,120,168").split(",")]
-HOLD_GRID = [int(x) for x in os.environ.get("XM_HOLD_GRID", "1,2,3,5").split(",")]
+MOM_GRID  = [int(x) for x in os.environ.get("XM_MOM_GRID", "120,168,240,336").split(",")]
+HOLD_GRID = [int(x) for x in os.environ.get("XM_HOLD_GRID", "3,5,7,10").split(",")]
 
 
 def _fetch_1h(sym, days):
