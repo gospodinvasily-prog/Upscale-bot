@@ -1,5 +1,9 @@
 """
-bt_pairs.py — IGNITION + SWEEP: две интрадей-проверки на BTC/ETH в одном файле.
+bt_pairs.py — PULSE-D (дневной импульс) + IGNITION и SWEEP (интрадей) на BTC/ETH.
+
+ПО УМОЛЧАНИЮ запускается PULSE-D (PAIRS_RUN=pulsed). Интрадей-части: PAIRS_RUN=ignition|sweep|both|all.
+
+IGNITION + SWEEP: две интрадей-проверки на BTC/ETH.
 
 Запуск: RUN_BACKTEST=pairs    (бот менять не нужно; прогоняются ОБЕ стратегии подряд)
   PAIRS_RUN=both|ignition|sweep   — что именно гонять (по умолчанию both)
@@ -129,16 +133,17 @@ def fetch_gate(sym, days, offset):
     return _dedupe(out)
 
 
-def fetch_binance(sym, days, offset, get=None):
+def fetch_binance(sym, days, offset, get=None, interval="15m"):
     """Публичные свечи Binance (спот): пагинация по startTime, до 1000 свечей за запрос.
     Объём берётся как есть: нужны только ОТНОШЕНИЯ внутри одного ряда, единицы не важны."""
     get = get or requests.get
+    step = {"15m": SEC, "1d": 86400}[interval]
     now_ms = (int(time.time()) - offset * 86400) * 1000
     start = now_ms - days * 86400 * 1000
     out, note = [], ""
     while start < now_ms:
         try:
-            r = get(BINANCE, params={"symbol": f"{sym}USDT", "interval": "15m",
+            r = get(BINANCE, params={"symbol": f"{sym}USDT", "interval": interval,
                                      "startTime": start, "endTime": now_ms, "limit": 1000},
                     timeout=15)
         except Exception as e:
@@ -156,7 +161,7 @@ def fetch_binance(sym, days, offset, get=None):
                             "l": float(k[3]), "c": float(k[4]), "v": float(k[5])})
             except (TypeError, ValueError, IndexError):
                 continue
-        nxt = int(rows[-1][0]) + SEC * 1000
+        nxt = int(rows[-1][0]) + step * 1000
         if nxt <= start:
             break
         start = nxt
@@ -421,6 +426,61 @@ def evaluate_criteria(ev):
     return rows, st1, ok2
 
 
+# ═════════════ разложение результата: валовый эдж и издержки ═════════════
+
+def edge_block(evs, label):
+    """MAIN и ANTI торгуют ОДНИ И ТЕ ЖЕ события в противоположные стороны с одинаковым
+    риском, поэтому издержки у них общие, а эдж направления входит с разным знаком:
+        MAIN = +e − c,  ANTI = −e − c   →   e = (MAIN − ANTI)/2,  c = −(MAIN + ANTI)/2.
+    Это сравнение без случайности контроля «монетка» и без предположения об издержках."""
+    pairs = [(e["r"], e["r_anti"], e["day"]) for e in evs if e.get("r_anti") is not None]
+    if len(pairs) < 30:
+        return []
+    edge = [(r - a) / 2 for r, a, _ in pairs]
+    n, m, ci = cluster_ci(edge, [d for *_, d in pairs])
+    cost = -sum((r + a) / 2 for r, a, _ in pairs) / len(pairs)
+    mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
+    return [f"  {mark} {label}: валовый эдж направления <b>{m:+.3f}R</b> (±{ci:.3f}) при "
+            f"издержках {cost:.3f}R → чистый {m - cost:+.3f}R"]
+
+
+COST_SCALES = (1.0, 0.7, 0.4)
+
+
+def cost_table(evs, label, risk_key):
+    """Чистый результат при сниженных издержках: пересчёт тех же сделок. Показывает, при каких
+    издержках система вообще могла бы работать. Реальные комиссии и проскальзывание Upscale
+    нужно взять из истории сделок — это решающий параметр."""
+    global FEE, SLIP, STOP_SLIP
+    if len(evs) < 30:
+        return []
+    save = (FEE, SLIP, STOP_SLIP)
+    cells = []
+    try:
+        for k in COST_SCALES:
+            FEE, SLIP, STOP_SLIP = save[0] * k, save[1] * k, save[2] * k
+            rs, ds = [], []
+            for e in evs:
+                r = trade(e["fut"], e["px"], e["up"], e[risk_key])
+                if r is not None:
+                    rs.append(r)
+                    ds.append(e["day"])
+            st = cluster_ci(rs, ds)
+            if st:
+                cells.append(f"издержки круга {2 * (save[0] + save[1]) * k:.3f}% → "
+                             f"<b>{st[1]:+.3f}R</b> (±{st[2]:.3f})")
+    finally:
+        FEE, SLIP, STOP_SLIP = save
+    return [f"  {label} при разных издержках: " + " | ".join(cells)] if cells else []
+
+
+def overlap_note(offset, days):
+    if offset and offset < days:
+        return [f"⚠️ <i>период пересекается с основным на {days - offset} дн — для независимой "
+                f"проверки нужен сдвиг не меньше {days} дн</i>"]
+    return []
+
+
 # ═════════════ отчёт ═════════════
 
 def run_ignition():
@@ -434,7 +494,9 @@ def run_ignition():
          f"{WIN[0] // 60:02d}:{WIN[0] % 60:02d}–{WIN[1] // 60:02d}:{WIN[1] % 60:02d} МСК</i>",
          f"<i>вход по открытию следующей свечи | стоп max({STOP_MIN}%, {STOP_ATR}×ATR15) | "
          f"TP {TP1R}R/{TP2R}R 50/50, безубыток после TP1 | выход не позже 22:00 МСК и +{MAX_HOLD_H:.0f}ч | "
-         f"издержки {(FEE + SLIP) * 2:.2f}% на круг + проскальзывание стопа {STOP_SLIP}%</i>", ""]
+         f"издержки {(FEE + SLIP) * 2:.2f}% на круг + проскальзывание стопа {STOP_SLIP}%</i>"]
+    L += overlap_note(OFFSET, DAYS)
+    L.append("")
     all_ev = []
     for sym in PAIRS:
         c, src, note = fetch(sym)
@@ -475,6 +537,8 @@ def run_ignition():
             L.append(_line([e for e in all_ev if e["cat"] == cat], lbl))
         L.append(_line(mains, "COIN", "r_coin"))
         L.append(_line(mains, "ANTI", "r_anti"))
+        L += edge_block(mains, "MAIN")
+        L += cost_table(mains, "MAIN", "stp_pct")
         if len(mains) >= 20:
             ms = sorted(mains, key=lambda e: e["t"])
             h = len(ms) // 2
@@ -704,7 +768,9 @@ def run_sweep():
          f"<i>вход по открытию следующей свечи | стоп за свечу ±0.05×ATR, пол {SW_STOP_F}% | "
          f"TP {TP1R}R/{TP2R}R 50/50, безубыток после TP1 | выход не позже 22:00 МСК и "
          f"+{SW_MAX_HOLD_H:.0f}ч | окно {SW_WIN[0] // 60:02d}:00–{SW_WIN[1] // 60:02d}:00 МСК | "
-         f"издержки {(FEE + SLIP) * 2:.2f}% на круг</i>", ""]
+         f"издержки {(FEE + SLIP) * 2:.2f}% на круг</i>"]
+    L += overlap_note(SW_OFFSET, SW_DAYS)
+    L.append("")
     all_ev = []
     for sym in PAIRS:
         c, src, note = fetch_for(sym, SW_DAYS, SW_OFFSET)
@@ -745,6 +811,8 @@ def run_sweep():
             L.append(_line(m, name))
             L.append(_line(m, f"  {name} COIN", "r_coin"))
             L.append(_line(m, f"  {name} ANTI", "r_anti"))
+            L += edge_block(m, name)
+            L += cost_table(m, name, "risk_pct")
             by_m = {}
             for e in m:
                 by_m.setdefault(e["month"], []).append(e["r"])
@@ -773,16 +841,267 @@ def _send(L):
         print(f"[PAIRS] отправка: {e}")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  PULSE-D — дневной импульс: сильный день → лонг на следующие 24ч (BTC/ETH + расширенный набор)
+# ═════════════════════════════════════════════════════════════════════════════
+PD_DAYS   = int(os.environ.get("PD_DAYS", "1825"))
+PD_OFFSET = int(os.environ.get("PD_OFFSET", "0"))
+PD_PAIRS  = [x.strip().upper() for x in os.environ.get("PD_PAIRS", "BTC,ETH").split(",") if x.strip()]
+PD_EXT    = [x.strip().upper() for x in os.environ.get(
+    "PD_EXT", "SOL,XRP,BNB,ADA,DOGE,LINK,LTC,AVAX").split(",") if x.strip()]
+PD_RET_K  = float(os.environ.get("PD_RET_K", "1.5"))
+PD_CLV_K  = float(os.environ.get("PD_CLV_K", "0.6"))
+PD_VOL_K  = float(os.environ.get("PD_VOL_K", "1.2"))
+PD_WEAK_K = float(os.environ.get("PD_WEAK_K", "0.5"))
+PD_RIDE_MAX = int(os.environ.get("PD_RIDE_MAX", "10"))
+PD_FUND   = float(os.environ.get("PD_FUND", "0.03"))        # %/день: лонг платит, шорт получает
+PD_N_MIN  = int(os.environ.get("PD_N_MIN", "150"))
+PD_COST   = (FEE + SLIP) * 2                                # % на круг, как в интрадей-частях
+_DCACHE = {}
+
+
+def fetch_gate_daily(sym, days, offset):
+    now = int(time.time()) - offset * 86400
+    out, cur, probes = [], now - days * 86400, 0
+    while cur < now:
+        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1d",
+                                         "from": cur, "to": min(now, cur + 900 * 86400)})
+        part = B.parse_candles(raw) if raw else []
+        if not part:
+            probes += 1
+            if probes > 6:
+                break
+            cur += 200 * 86400
+            continue
+        out.extend(part)
+        nxt = part[-1].get("t", 0) + 86400
+        if nxt <= cur:
+            break
+        cur = nxt
+    return _dedupe(out)
+
+
+def fetch_daily_for(sym, days, offset):
+    """(свечи, источник, примечание). Gate, если дал почти весь период, иначе Binance."""
+    key = (sym, days, offset, SOURCE)
+    if key in _DCACHE:
+        return _DCACHE[key]
+    need = days + 30
+    gate = fetch_gate_daily(sym, need, offset) if SOURCE in ("auto", "gate") else []
+    notes = []
+    if SOURCE == "gate" or (SOURCE == "auto" and len(gate) >= 0.95 * need):
+        res = (gate[:-1], "Gate", "")
+    else:
+        if SOURCE == "auto":
+            notes.append(f"у Gate {len(gate)} дн из {need}")
+        bn, note = fetch_binance(sym, need, offset, interval="1d")
+        if note:
+            notes.append(note)
+        if len(bn) > len(gate):
+            res = (bn[:-1], "Binance (спот)", "; ".join(notes))
+        else:
+            res = (gate[:-1], "Gate", "; ".join(notes + ["Binance не дал больше данных"]))
+    _DCACHE[key] = res
+    return res
+
+
+def pd_events(c):
+    """Категории дневных сделок. Решение по ЗАКРЫТОМУ дню D, вход по ОТКРЫТИЮ дня D+1, выход
+    по закрытию D+1 (1-day) либо по закрытию первого «красного» дня, максимум PD_RIDE_MAX.
+    Возвращает {категория: [(нетто %, дата, месяц, год)]}. Все цифры уже за вычетом издержек
+    и фандинга."""
+    cat = {k: [] for k in ("long", "short", "ride", "ride_s", "weak", "ret_only", "clv_only",
+                           "vol_only", "base", "rest")}
+    for i in range(21, len(c) - 1):
+        d, prev, nx = c[i], c[i - 1], c[i + 1]
+        rng = d["h"] - d["l"]
+        if rng <= 0 or prev["c"] <= 0 or nx["o"] <= 0:
+            continue
+        clv = (d["c"] - d["l"]) / rng
+        ret = (d["c"] / prev["c"] - 1) * 100
+        vmed = statistics.median([x.get("v", 0) or 0 for x in c[i - 20:i]]) or 0
+        volok = vmed > 0 and (d.get("v", 0) or 0) >= PD_VOL_K * vmed
+        nd = (nx["c"] / nx["o"] - 1) * 100                  # следующие 24ч: открытие → закрытие
+        dt = datetime.fromtimestamp(d["t"], timezone.utc)
+        tag = (dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m"), dt.year)
+        net_l = nd - PD_COST - PD_FUND
+        cat["base"].append((net_l,) + tag)
+        up_strong = ret >= PD_RET_K and clv >= PD_CLV_K and volok
+        dn_strong = ret <= -PD_RET_K and clv <= 1 - PD_CLV_K and volok
+        if up_strong:
+            cat["long"].append((net_l,) + tag)
+        else:
+            cat["rest"].append((net_l,) + tag)                # честная база: дни БЕЗ сигнала
+        if dn_strong:
+            cat["short"].append((-nd - PD_COST + PD_FUND,) + tag)
+        if ret >= PD_RET_K:
+            cat["ret_only"].append((net_l,) + tag)
+        if clv >= PD_CLV_K and ret > 0:
+            cat["clv_only"].append((net_l,) + tag)
+        if volok and ret > 0:
+            cat["vol_only"].append((net_l,) + tag)
+        if PD_WEAK_K <= ret < PD_RET_K and clv >= PD_CLV_K and volok:
+            cat["weak"].append((net_l,) + tag)
+        # RIDE (описательно): держим до первого дня, закрывшегося ниже/выше предыдущего
+        for kind, sign in (("ride", 1), ("ride_s", -1)):
+            if (kind == "ride" and not up_strong) or (kind == "ride_s" and not dn_strong):
+                continue
+            exit_px, held = None, 0
+            for k in range(i + 1, min(i + 1 + PD_RIDE_MAX, len(c))):
+                held += 1
+                if (c[k]["c"] < c[k - 1]["c"]) if sign == 1 else (c[k]["c"] > c[k - 1]["c"]):
+                    exit_px = c[k]["c"]
+                    break
+            if exit_px is None:
+                exit_px = c[min(i + PD_RIDE_MAX, len(c) - 1)]["c"]
+                held = min(PD_RIDE_MAX, len(c) - 1 - i)
+            r = (exit_px / nx["o"] - 1) * 100 * sign - PD_COST - sign * PD_FUND * held
+            cat[kind].append((r,) + tag)
+    return cat
+
+
+def pd_merge(cats):
+    out = {}
+    for cat in cats:
+        for k, v in cat.items():
+            out.setdefault(k, []).extend(v)
+    return out
+
+
+def pd_stat(items):
+    """(n, среднее %, полуширина 95%). Кластеры — МЕСЯЦЫ: сильные дни собираются в одних
+    режимах рынка, а BTC и ETH ходят вместе, так что обычный интервал был бы слишком узким."""
+    if not items:
+        return None
+    return cluster_ci([x[0] for x in items], [x[2] for x in items])
+
+
+def pd_line(items, label):
+    st = pd_stat(items)
+    if not st:
+        return f"  {label}: сделок нет"
+    n, m, ci = st
+    wr = sum(1 for x in items if x[0] > 0) / n * 100
+    mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
+    return f"  {mark} {label}: {n:5} сд, ВР {wr:3.0f}%, <b>{m:+.3f}%</b> (±{ci:.3f})"
+
+
+def pd_criteria(pool):
+    """Критерии по объединённой выборке. ② — против дней БЕЗ сигнала, а не против шорта:
+    у шорта на растущем рынке разница равна удвоенному дрейфу и проходит сама по себе."""
+    main, rest, weak = pool.get("long", []), pool.get("rest", []), pool.get("weak", [])
+    sm, sr, sw = pd_stat(main), pd_stat(rest), pd_stat(weak)
+    if not sm or sm[0] < PD_N_MIN:
+        st1 = "few"
+    else:
+        st1 = "ok" if (sm[1] >= 0.15 and sm[1] - sm[2] > 0) else "no"
+    d = ci_d = None
+    ok2 = False
+    if sm and sr:
+        d = sm[1] - sr[1]
+        ci_d = (sm[2] ** 2 + sr[2] ** 2) ** 0.5
+        ok2 = d >= 0.10 and d - ci_d > 0
+    ok3 = bool(sm and sw and sm[1] > sw[1])
+    ok4, halves = False, ""
+    if len(main) >= 20:
+        ms = sorted(main, key=lambda x: x[1])
+        h = len(ms) // 2
+        a, b = pd_stat(ms[:h]), pd_stat(ms[h:])
+        if a and b:
+            ok4 = a[1] > 0 and b[1] > 0
+            halves = f" ({a[1]:+.3f}% | {b[1]:+.3f}%)"
+    mark1 = {"ok": "✅", "no": "❌", "few": "⚠️"}[st1]
+    rows = [f"  {mark1} ① LONG нетто ≥ +0.15% значимо при n ≥ {PD_N_MIN}"
+            + (f" (n={sm[0]}, {sm[1]:+.3f}%, ±{sm[2]:.3f})" if sm else "")
+            + (" — сделок мало" if st1 == "few" and sm else ""),
+            f"  {'✅' if ok2 else '❌'} ② LONG − дни без сигнала ≥ +0.10% значимо"
+            + (f" ({d:+.3f}%, ±{ci_d:.3f})" if d is not None else ""),
+            f"  {'✅' if ok3 else '❌'} ③ доза: сильные дни лучше слабых"
+            + (f" ({sm[1]:+.3f}% против {sw[1]:+.3f}%)" if sm and sw else ""),
+            f"  {'✅' if ok4 else '❌'} ④ обе половины периода в плюсе{halves}"]
+    if st1 == "ok" and ok2:
+        verdict = "①+② ВЫПОЛНЕНЫ — смотреть ③, ④ и чужой период"
+    elif st1 == "few":
+        verdict = "ВЫВОД НЕВОЗМОЖЕН: сделок мало"
+    else:
+        verdict = "КРИТЕРИИ НЕ ВЫПОЛНЕНЫ"
+    return rows, verdict, sm
+
+
+def pd_pool_block(title, pool):
+    L = [f"── <b>{title}</b> ──",
+         pd_line(pool.get("long", []), "LONG 24ч после сильного дня (основная)"),
+         pd_line(pool.get("rest", []), "ДНИ БЕЗ СИГНАЛА (честная база: дрейф рынка)"),
+         pd_line(pool.get("base", []), "все дни (для справки)"),
+         pd_line(pool.get("weak", []), "WEAK: ret 0.5–1.5% (доза)"),
+         pd_line(pool.get("ret_only", []), "ret-only (без CLV/объёма)"),
+         pd_line(pool.get("clv_only", []), "clv-only (без ret/объёма)"),
+         pd_line(pool.get("vol_only", []), "vol-only (без ret/CLV)"),
+         pd_line(pool.get("ride", []), "RIDE: до первого красного дня (перекрываются, описательно)"),
+         pd_line(pool.get("short", []), "SHORT после сильного падения (справочно)")]
+    by_year = {}
+    for x in pool.get("long", []):
+        by_year.setdefault(x[3], []).append(x[0])
+    if len(by_year) >= 3:
+        L.append("  по годам LONG: " + " | ".join(
+            f"{y}: {sum(v) / len(v):+.2f}% ({len(v)})" for y, v in sorted(by_year.items())))
+    rows, verdict, sm = pd_criteria(pool)
+    L.append("  <b>критерии</b>")
+    L += rows
+    if sm:
+        L.append(f"  <i>минимально различимый эффект при этой выборке ≈ ±{sm[2]:.2f}% на сделку: "
+                 f"всё меньше неотличимо от шума</i>")
+    L.append(f"  → <b>{verdict}</b>")
+    return L
+
+
+def run_pulsed():
+    L = [f"🌀 <b>PULSE-D v1.1: дневной импульс</b> — запрошено {PD_DAYS} дн"
+         + (f"\n⏪ <b>СДВИНУТ НА {PD_OFFSET} ДН</b>" if PD_OFFSET else ""),
+         f"<i>сигнал по закрытию дня: ret ≥{PD_RET_K}% + CLV ≥{PD_CLV_K} + объём ≥{PD_VOL_K}× "
+         f"медианы 20д → вход по ОТКРЫТИЮ следующего дня, выход по его закрытию | издержки "
+         f"{PD_COST:.2f}% + фандинг {PD_FUND}%/день (лонг платит)</i>"]
+    L += overlap_note(PD_OFFSET, PD_DAYS)
+    L.append("")
+    per, ext = {}, {}
+    for sym in PD_PAIRS + [x for x in PD_EXT if x not in PD_PAIRS]:
+        c, src, note = fetch_daily_for(sym, PD_DAYS, PD_OFFSET)
+        yrs = (c[-1]["t"] - c[0]["t"]) / 86400 / 365 if len(c) > 1 else 0.0
+        ok = len(c) >= 400
+        L.append(f"  {sym}: источник {src}, {len(c)} дн ({yrs:.1f} л)"
+                 + (f" <i>({note})</i>" if note else "") + ("" if ok else " ⚠️ истории мало"))
+        if not ok:
+            continue
+        ev = pd_events(c)
+        (per if sym in PD_PAIRS else ext)[sym] = ev
+    L.append("")
+    if per:
+        pool = pd_merge(per.values())
+        L += pd_pool_block(f"{'+'.join(per)} (основная проверка по пре-регу)", pool)
+        L.append("")
+    if ext and per:
+        big = pd_merge(list(per.values()) + list(ext.values()))
+        L += pd_pool_block(f"РАСШИРЕННЫЙ НАБОР: {'+'.join(list(per) + list(ext))}", big)
+        L.append("  <i>на альтах издержки обычно выше заложенных 0.16%, поэтому набор нужен "
+                 "для мощности, а не как готовая цена торговли</i>")
+        L.append("")
+    L.append("<i>проверка на чужом периоде: PD_OFFSET = PD_DAYS (данные Binance с 2017 г., "
+             "период будет короче). Сдвиг на 365 дн пересекается с основным на 4 года из 5</i>")
+    _send(L)
+
+
 # ═════════════ запуск ═════════════
 
-PAIRS_RUN = os.environ.get("PAIRS_RUN", "both").lower()
+PAIRS_RUN = os.environ.get("PAIRS_RUN", "pulsed").lower()    # pulsed | ignition | sweep | both | all
 
 
 def run():
-    if PAIRS_RUN in ("both", "ignition"):
+    if PAIRS_RUN in ("both", "all", "ignition"):
         run_ignition()
-    if PAIRS_RUN in ("both", "sweep"):
+    if PAIRS_RUN in ("both", "all", "sweep"):
         run_sweep()
+    if PAIRS_RUN in ("all", "pulsed"):
+        run_pulsed()
 
 
 def main():
