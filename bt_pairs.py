@@ -1,7 +1,7 @@
 """
-bt_pairs.py — FLUSH-60 (альты, каскады ликвидаций) + PULSE-D (дневной импульс) + IGNITION и SWEEP (интрадей).
+bt_pairs.py — POSITIONING SCAN (lsr/топ-трейдеры/киты) + FLUSH-60 + PULSE-D + IGNITION и SWEEP.
 
-ПО УМОЛЧАНИЮ запускается FLUSH-60 (PAIRS_RUN=flush). Остальное: PAIRS_RUN=pulsed|ignition|sweep|both|all.
+ПО УМОЛЧАНИЮ запускается POSITIONING SCAN, оба универсума сразу (PAIRS_RUN=pos). Остальное: PAIRS_RUN=flush|pulsed|ignition|sweep|both|all.
 
 IGNITION + SWEEP: две интрадей-проверки на BTC/ETH.
 
@@ -1489,9 +1489,289 @@ def run_flush():
     _send(L)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  POSITIONING SCAN — три семейства позиционирования из contract_stats (дневной горизонт)
+# ═════════════════════════════════════════════════════════════════════════════
+POS_DAYS      = int(os.environ.get("POS_DAYS", "60"))
+POS_OFFSET    = int(os.environ.get("POS_OFFSET", "0"))
+POS_UNI       = os.environ.get("POS_UNI", "both").lower()         # both | liq | alts
+POS_PCT_HI    = float(os.environ.get("POS_PCT_HI", "80"))
+POS_PCT_LO    = float(os.environ.get("POS_PCT_LO", "20"))
+POS_TRAIL     = int(os.environ.get("POS_TRAIL", "30"))
+POS_COST_LIQ  = (0.05 + 0.03) * 2                                 # 0.16% на круг
+POS_COST_ALT  = float(os.environ.get("POS_COST_ALT", "0.60"))     # 0.60% на круг для остальных альтов
+POS_FUND      = float(os.environ.get("POS_FUND", "0.03"))         # %/день: лонг платит, шорт получает
+POS_EDGE_MIN  = float(os.environ.get("POS_EDGE_MIN", "0.10"))
+POS_Z         = float(os.environ.get("POS_Z", "2.64"))            # 6 ног: порог 0.05/6 на ногу
+POS_LIQ10     = ["BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "LTC", "AVAX"]
+POS_DAY       = 86400
+
+
+def pos_fetch_stats(sym, days, offset):
+    now = int(time.time()) - offset * POS_DAY
+    out, cur, probes = [], now - (days + 2) * POS_DAY, 0
+    while cur < now:
+        raw = B.api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": "1h",
+                                           "from": cur, "to": min(now, cur + 100 * HOUR), "limit": 100})
+        rows = raw if isinstance(raw, list) else []
+        if not rows:
+            probes += 1
+            if probes > 20:
+                break
+            cur += 5 * POS_DAY
+            continue
+        out.extend(rows)
+        nxt = max(int(B.fnum(r.get("time", 0))) for r in rows) + HOUR
+        if nxt <= cur:
+            break
+        cur = nxt
+    seen, res = set(), []
+    for r in sorted(out, key=lambda r: int(B.fnum(r.get("time", 0)))):
+        t = int(B.fnum(r.get("time", 0)))
+        if t and t not in seen:
+            seen.add(t)
+            res.append({"t": t, "lsr": B.fnum(r.get("lsr_account", 0)),
+                        "top": B.fnum(r.get("top_lsr_size", 0)),
+                        "lu": B.fnum(r.get("long_users", 0)), "su": B.fnum(r.get("short_users", 0)),
+                        "tl": B.fnum(r.get("top_long_size", 0)), "ts": B.fnum(r.get("top_short_size", 0))})
+    return res
+
+
+def pos_fetch_1h(sym, days, offset):
+    now = int(time.time()) - offset * POS_DAY
+    out, cur, probes = [], now - (days + 3) * POS_DAY, 0
+    while cur < now:
+        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1h",
+                                         "from": cur, "to": min(now, cur + 1900 * HOUR)})
+        part = B.parse_candles(raw) if raw else []
+        if not part:
+            probes += 1
+            if probes > 6:
+                break
+            cur += 20 * POS_DAY
+            continue
+        out.extend(part)
+        nxt = part[-1].get("t", 0) + HOUR
+        if nxt <= cur:
+            break
+        cur = nxt
+    return _dedupe(out)
+
+
+def pos_daily_bars(c1h):
+    """Дневные бары по UTC из ЧАСОВЫХ свечей: открытие первого и закрытие последнего часа.
+    Не зависит от того, где Gate проводит границу своих дневных свечей. Неполные дни выбрасываются."""
+    by = {}
+    for c in c1h:
+        by.setdefault(c["t"] // POS_DAY, []).append(c)
+    bars = {}
+    for d, v in by.items():
+        v.sort(key=lambda x: x["t"])
+        if len(v) == 24 and all(b["t"] - a["t"] == HOUR for a, b in zip(v, v[1:])) and v[0]["o"] > 0:
+            bars[d] = (v[0]["o"], v[-1]["c"])
+    return bars
+
+
+def pos_snapshots(rows):
+    """Позиционирование на конец UTC-дня: последняя строка дня."""
+    last = {}
+    for r in rows:
+        last[r["t"] // POS_DAY] = r
+    snap = {}
+    for d, r in last.items():
+        crowd = r["lu"] / (r["lu"] + r["su"]) if r["lu"] + r["su"] > 0 else None
+        whale = r["tl"] / (r["tl"] + r["ts"]) if r["tl"] + r["ts"] > 0 else None
+        snap[d] = {"lsr": r["lsr"] if r["lsr"] > 0 else None,
+                   "top": r["top"] if r["top"] > 0 else None,
+                   "crowd": crowd,
+                   "div": (whale - crowd) if (whale is not None and crowd is not None) else None}
+    return snap
+
+
+def pos_pctl(snap, d, key):
+    """Перцентиль значения дня d среди предыдущих POS_TRAIL дней той же пары (день d не входит)."""
+    cur = snap.get(d, {}).get(key)
+    vals = [snap[x][key] for x in range(d - POS_TRAIL, d) if x in snap and snap[x].get(key) is not None]
+    if cur is None or len(vals) < 15:
+        return None
+    return sum(1 for v in vals if v <= cur) / len(vals) * 100
+
+
+def pos_records(sym, days, offset):
+    """Записи «пара-день»: позиционирование на конец дня D и ход дня D+1 (открытие → закрытие)."""
+    rows = pos_fetch_stats(sym, days, offset)
+    c1h = pos_fetch_1h(sym, days, offset)
+    if len(rows) < 200 or len(c1h) < 24 * 30:
+        return None
+    snap, bars = pos_snapshots(rows), pos_daily_bars(c1h)
+    recs = []
+    for d in sorted(snap):
+        if d not in bars or (d + 1) not in bars:        # следующий день должен быть СЛЕДУЮЩИМ, без дыр
+            continue
+        o, c = bars[d + 1]
+        recs.append({"d": d, "sym": sym, "nd": (c / o - 1) * 100,
+                     "pA": pos_pctl(snap, d, "lsr"), "pB": pos_pctl(snap, d, "top"),
+                     "pC": pos_pctl(snap, d, "crowd"), "pD": pos_pctl(snap, d, "div")})
+    return recs
+
+
+def pos_edge(recs, elig, sel, sign):
+    """Эдж ноги относительно ОСТАЛЬНЫХ пар ТОГО ЖЕ ДНЯ. Общий ход рынка за день вычитается, поэтому
+    тренд выборки (рынок падал/рос) не может ни создать эдж, ни скрыть его.
+    Возвращает dict или None: n, дни, эдж (%), SE, эдж по половинам."""
+    by = {}
+    for r in recs:
+        if not elig(r):
+            continue
+        by.setdefault(r["d"], {"leg": [], "rest": []})["leg" if sel(r) else "rest"].append(sign * r["nd"])
+    days = sorted(d for d, v in by.items() if v["leg"] and v["rest"])
+    if len(days) < 8:
+        return None
+
+    def agg(ds):
+        diffs = [sum(by[d]["leg"]) / len(by[d]["leg"]) - sum(by[d]["rest"]) / len(by[d]["rest"]) for d in ds]
+        ws = [len(by[d]["leg"]) for d in ds]
+        W = sum(ws)
+        e = sum(w * x for w, x in zip(ws, diffs)) / W
+        se = (sum(w * w * (x - e) ** 2 for w, x in zip(ws, diffs))) ** 0.5 / W
+        return e, se, W
+
+    e, se, n = agg(days)
+    h = len(days) // 2
+    e1, e2 = agg(days[:h])[0], agg(days[h:])[0]
+    return {"n": n, "days": len(days), "e": e, "se": se, "e1": e1, "e2": e2}
+
+
+POS_FAMILIES = (
+    ("A", "A РОЗНИЦА-CONTRA (фэйд lsr_account)",
+     lambda r: r["pA"] is not None, lambda r: r["pA"] <= POS_PCT_LO, lambda r: r["pA"] >= POS_PCT_HI),
+    ("B", "B ТОП-ТРЕЙДЕРЫ (следуем top_lsr_size)",
+     lambda r: r["pB"] is not None, lambda r: r["pB"] >= POS_PCT_HI, lambda r: r["pB"] <= POS_PCT_LO),
+    ("C", "C КИТЫ-vs-ТОЛПА (встаём с китами)",
+     lambda r: r["pC"] is not None and r["pD"] is not None,
+     lambda r: r["pC"] <= POS_PCT_LO and r["pD"] >= POS_PCT_HI,
+     lambda r: r["pC"] >= POS_PCT_HI and r["pD"] <= POS_PCT_LO),
+)
+
+
+def pos_eval(recs, cost):
+    """Результаты по семействам и ногам. Возвращает список строк отчёта и список прошедших ног."""
+    L, passed, ses = [], [], []
+    for fam, name, elig, lg, sh in POS_FAMILIES:
+        n_el = sum(1 for r in recs if elig(r))
+        L.append(f"── <b>{name}</b> ── доступно пар-дней: {n_el}")
+        if n_el < 100:
+            L.append("  данных почти нет — семейство пропущено")
+            L.append("")
+            continue
+        for leg, sel, sign, lbl in (("long", lg, 1, "лонг-нога"), ("short", sh, -1, "шорт-нога")):
+            res = pos_edge(recs, elig, sel, sign)
+            net_vals = [(sign * r["nd"] - cost - sign * POS_FUND, r["d"]) for r in recs if elig(r) and sel(r)]
+            if not res or res["n"] < 30 or len(net_vals) < 30:
+                L.append(f"  {lbl}: мало сделок ({len(net_vals)})")
+                continue
+            ses.append(res["se"] * POS_Z)
+            _, mnet, cinet = cluster_ci([v for v, _ in net_vals], [d for _, d in net_vals])
+            strict = POS_Z * res["se"]
+            ok = (res["e"] >= POS_EDGE_MIN and res["e"] - strict > 0 and res["e1"] > 0 and res["e2"] > 0)
+            mark = "✅" if res["e"] - strict > 0 else "❌" if res["e"] + strict < 0 else "  "
+            row = (f"  {mark} {lbl}: {res['n']} сд / {res['days']} дн | эдж над днём "
+                   f"<b>{res['e']:+.3f}%</b> (±{strict:.3f}) | половины {res['e1']:+.3f} | {res['e2']:+.3f} | "
+                   f"чистый {mnet:+.3f}%")
+            if ok:
+                row += "  ← ПЛАНКА ✅" + ("" if mnet > 0 else " (но чистый ≤0 при этих издержках)")
+                passed.append(f"{fam}-{leg}")
+            L.append(row)
+        L.append("")
+    return L, passed, ses
+
+
+def pos_dose(recs):
+    """Дневной избыточный ход по квинтилям lsr_account (A): монотонность — признак настоящего эффекта."""
+    el = [r for r in recs if r["pA"] is not None]
+    by_day = {}
+    for r in el:
+        by_day.setdefault(r["d"], []).append(r["nd"])
+    mean_day = {d: sum(v) / len(v) for d, v in by_day.items()}
+    q = {k: [] for k in range(1, 6)}
+    for r in el:
+        k = min(5, max(1, int(r["pA"] // 20) + 1))
+        q[k].append((r["nd"] - mean_day[r["d"]], r["d"]))
+    out = []
+    for k in range(1, 6):
+        if len(q[k]) >= 20:
+            n, m, ci = cluster_ci([v for v, _ in q[k]], [d for _, d in q[k]])
+            out.append(f"Q{k}: {m:+.3f}% (±{ci:.3f}, n={n})")
+    return out
+
+
+def run_pos():
+    pairs_all = B.UPSCALE_PAIRS
+    universes = []
+    if POS_UNI in ("both", "liq"):
+        universes.append(("10 ЛИКВИДНЫХ (главный скрин)", POS_LIQ10, POS_COST_LIQ))
+    if POS_UNI in ("both", "alts"):
+        universes.append(("ОСТАЛЬНЫЕ АЛЬТЫ (проверка вторым универсумом)",
+                          [s for s in pairs_all if s not in POS_LIQ10], POS_COST_ALT))
+    L = [f"👥 <b>POSITIONING SCAN v1.2</b> — {POS_DAYS} дн, позиционирование на конец дня D → ход дня D+1 "
+         f"(открытие → закрытие)",
+         f"<i>перцентили внутри пары за {POS_TRAIL} дн | эдж считается ОТНОСИТЕЛЬНО остальных пар того же дня "
+         f"(общий ход рынка вычитается) | интервалы строгие: {POS_Z}σ, поправка на 6 ног | издержки "
+         f"информационно | планка: эдж ≥{POS_EDGE_MIN}% значимо, обе половины в плюсе</i>", ""]
+    results = []
+    for uname, syms, cost in universes:
+        t0 = time.time()
+        recs, n_ok = [], 0
+        for i, sym in enumerate(syms, 1):
+            try:
+                rr = pos_records(sym, POS_DAYS, POS_OFFSET)
+            except Exception as e:
+                print(f"[POS] {sym}: {e}")
+                rr = None
+            if rr:
+                recs += rr
+                n_ok += 1
+            if i % 20 == 0:
+                print(f"[POS] {uname[:12]} {i}/{len(syms)} | {time.time() - t0:.0f}с")
+        days = len({r["d"] for r in recs})
+        L.append(f"══ <b>{uname}</b> ══ пар с данными {n_ok}/{len(syms)}, пар-дней {len(recs)}, "
+                 f"дней {days}, издержки {cost:.2f}% на круг")
+        if not recs:
+            L.append("  ⚠️ данных нет")
+            L.append("")
+            results.append((uname, []))
+            continue
+        rows, passed, ses = pos_eval(recs, cost)
+        L += rows
+        dz = pos_dose(recs)
+        if dz:
+            L.append("<b>Доза A</b> — избыточный ход следующего дня по квинтилям lsr_account "
+                     "(Q1 = толпа в шортах, Q5 = в лонгах; фэйд толпы ждёт Q1 > Q5):")
+            L.append("  " + " | ".join(dz))
+        if ses:
+            L.append(f"  <i>минимально различимый эдж на ногу в этом универсуме ≈ ±{statistics.median(ses):.2f}% "
+                     f"в день: всё меньше неотличимо от шума</i>")
+        L.append("")
+        results.append((uname, passed))
+    if len(results) == 2:
+        both = set(results[0][1]) & set(results[1][1])
+        L.append("<b>ИТОГ</b>")
+        for uname, passed in results:
+            L.append(f"  {uname}: " + (", ".join(passed) if passed else "ни одна нога не прошла планку"))
+        if both:
+            L.append(f"  → <b>ПОВТОРИЛОСЬ В ОБОИХ УНИВЕРСУМАХ: {', '.join(sorted(both))}</b> — кандидат на форвард "
+                     f"2–3 недели (≥30 сигналов)")
+        else:
+            L.append("  → <b>ни одна нога не повторилась в обоих универсумах: семейства lsr/top/киты-vs-толпа "
+                     "эджа не дают</b>")
+    elif results:
+        L.append("<b>ИТОГ</b>: " + (", ".join(results[0][1]) if results[0][1] else "ни одна нога не прошла планку"))
+    _send(L)
+
+
 # ═════════════ запуск ═════════════
 
-PAIRS_RUN = os.environ.get("PAIRS_RUN", "flush").lower()   # flush | pulsed | ignition | sweep | both | all
+PAIRS_RUN = os.environ.get("PAIRS_RUN", "pos").lower()   # pos | flush | pulsed | ignition | sweep | both | all
 
 
 def run():
@@ -1503,6 +1783,8 @@ def run():
         run_pulsed()
     if PAIRS_RUN in ("all", "flush"):
         run_flush()
+    if PAIRS_RUN in ("all", "pos"):
+        run_pos()
 
 
 def main():
