@@ -1,71 +1,147 @@
 """
-bt_pairs.py — X-MOM: кросс-секционный моментум.
+bt_pairs.py — FLUSH: разведка истории ликвидаций и бэктест на ней.
 
 Запускается привычным RUN_BACKTEST=pairs — менять bot.py не нужно.
 
-Гипотеза: монеты, обгонявшие рынок за MOM_H часов, продолжают обгонять следующие
-HOLD_D дней. Лонг топ-N по доходности, шорт боттом-N, равные слоты.
+ЧАСТЬ 1 — РАЗВЕДКА. Отдаёт ли Gate историю contract_stats (открытый интерес и
+ликвидации) вглубь по параметру from. Пробуем 1, 3, 7, 14, 30, 60 дней назад и
+печатаем, что реально вернулось, вместе с именами полей.
 
-Почему это может работать там, где не сработало всё прежнее. Горизонт дневной,
-а не часовой: издержки (комиссия + проскальзывание ≈0.2% на круг) размазываются
-по движению в несколько процентов, а не съедают его целиком. Все прошлые системы
-упирались ровно в это — найденное преимущество было меньше стоимости входа.
+ЧАСТЬ 2 — БЭКТЕСТ, запускается автоматически, если история нашлась хотя бы на
+несколько дней. Гипотеза: каскад ликвидаций — это принудительные маркет-ордера,
+которые уводят цену дальше равновесия; когда топливо кончается (OI упал, появилась
+встречная свеча), цена откатывает.
 
-Тайминг честный: ранжирование считается по свече, ЗАКРЫТОЙ до момента входа;
-вход по открытию следующей свечи; выход по открытию свечи через HOLD_D дней.
+Почему это стоит проверять после закрытия ценовых идей: здесь сигнал строится НЕ
+на цене, а на данных о позициях. Все похороненные гипотезы были price-only.
 
-КОНТРОЛЬ встроен: тот же портфель из СЛУЧАЙНЫХ пар. Если наш не лучше случайного —
-ранжирование не работает, и в живой режим это не идёт.
+Тайминг честный: событие определяется по ЗАКРЫТЫМ 5м данным, вход по открытию
+следующей свечи. Рядом считается монетка.
 
-Настройки (переменные Render):
-  XM_DAYS (90)      — сколько дней истории
-  XM_OFFSET (0)     — сдвиг окна назад; 90 даст предыдущие 90 дней — проверка на подгонку
-  XM_MOM_H (72)     — окно доходности для ранжирования, часов
-  XM_TOP (5)        — сколько пар в каждую сторону
-  XM_HOLD_D (3)     — длина цикла, дней
-  XM_POSITION (500) — размер слота, $
-  XM_FEE (0.05), XM_SLIP (0.05) — издержки на сторону, %
+Настройки:
+  FL_PROBE_ONLY (0)   — 1 = только разведка, без бэктеста
+  FL_DAYS (30)        — сколько дней истории брать для бэктеста
+  FL_PAIRS (0)        — сколько пар (0 = все)
+  FL_MULT (5)         — во сколько раз ликвидации выше медианы
+  FL_MIN_USD (3000)   — минимальная сумма ликвидаций за час
+  FL_OI_DROP (0.8)    — на сколько % должен упасть OI за час
+  FL_MOVE (2.5)       — минимальный ход цены за час, %
+  FL_MAX_STOP (3.0)   — максимальный стоп, % (иначе событие пропускаем)
+  FL_HOLD_H (12)      — горизонт удержания
 """
 import os
 import time
-import random
 import statistics
 
 import bot as B
 
-DAYS      = int(os.environ.get("XM_DAYS", "90"))
-OFFSET    = int(os.environ.get("XM_OFFSET", "0"))
-MOM_H     = int(os.environ.get("XM_MOM_H", "168"))
-TOP_N     = int(os.environ.get("XM_TOP", "5"))
-HOLD_D    = int(os.environ.get("XM_HOLD_D", "5"))
-POS_USD   = float(os.environ.get("XM_POSITION", "500"))
-FEE_PCT   = float(os.environ.get("XM_FEE", "0.05"))
-SLIP_PCT  = float(os.environ.get("XM_SLIP", "0.05"))
+PROBE_ONLY = os.environ.get("FL_PROBE_ONLY", "0") == "1"
+DAYS       = int(os.environ.get("FL_DAYS", "30"))
+PAIRS_N    = int(os.environ.get("FL_PAIRS", "0"))
+LIQ_MULT   = float(os.environ.get("FL_MULT", "5"))
+LIQ_MIN    = float(os.environ.get("FL_MIN_USD", "3000"))
+OI_DROP    = float(os.environ.get("FL_OI_DROP", "0.8"))
+MOVE_PCT   = float(os.environ.get("FL_MOVE", "2.5"))
+MAX_STOP   = float(os.environ.get("FL_MAX_STOP", "3.0"))
+HOLD_H     = float(os.environ.get("FL_HOLD_H", "12"))
+STOP_BUF   = float(os.environ.get("FL_STOP_BUF", "0.1"))
+SLIP       = float(os.environ.get("FL_SLIP", "0.10"))
+STOP_SLIP  = float(os.environ.get("FL_STOP_SLIP", "0.10"))
+FEE_PCT    = float(os.environ.get("FL_FEE", "0.065"))
 
-# Дополнительные окна доходности и длины цикла — заодно смотрим, не лучше ли другое.
-MOM_GRID  = [int(x) for x in os.environ.get("XM_MOM_GRID", "120,168,240,336").split(",")]
-HOLD_GRID = [int(x) for x in os.environ.get("XM_HOLD_GRID", "3,5,7,10").split(",")]
+STEP = 300          # 5м
+PARTS = (1 / 3, 1 / 3, 1 / 3)
+TP_K = (0.4, 0.7, 1.0)      # доли каскадного хода
 
 
-def _fetch_1h(sym, days):
-    """Часовые свечи за days дней. Если данных с начала окна нет, не сдаёмся,
-    а щупаем вперёд: Gate хранит историю не для всех пар одинаково."""
-    sec = 3600
-    now = int(time.time()) - OFFSET * 86400
+# ═════════ ЧАСТЬ 1: РАЗВЕДКА ═════════
+
+def probe():
+    """Пробуем contract_stats на разной глубине. Возвращает (глубина в днях, поля)."""
+    L = ["🔍 <b>РАЗВЕДКА: отдаёт ли Gate историю ликвидаций и OI</b>",
+         "<i>если история есть — все гипотезы на позициях становятся проверяемыми "
+         "за один прогон вместо недель ожидания</i>", ""]
+    now = int(time.time())
+    depth_found = 0
+    fields = []
+    for d in (0, 1, 3, 7, 14, 30, 60):
+        params = {"contract": "BTC_USDT", "interval": "5m", "limit": 100}
+        if d:
+            params["from"] = now - d * 86400
+            params["to"] = now - d * 86400 + 100 * STEP
+        raw = B.api_get("contract_stats", params)
+        if not isinstance(raw, list) or not raw:
+            L.append(f"  {d:2} дн назад: пусто")
+            continue
+        ts = [int(r.get("time") or 0) for r in raw if r.get("time")]
+        if not ts:
+            L.append(f"  {d:2} дн назад: {len(raw)} строк, но без времени")
+            continue
+        age = (now - max(ts)) / 86400
+        L.append(f"  {d:2} дн назад: {len(raw)} строк, самая свежая {age:.1f} дн назад")
+        if d and age > d * 0.5:
+            depth_found = max(depth_found, d)
+        if not fields:
+            fields = sorted(raw[0].keys())
+    L.append("")
+    if fields:
+        L.append(f"<b>Поля ответа:</b> {', '.join(fields)}")
+    have_liq = any("liq" in f for f in fields)
+    have_oi = any("open_interest" in f for f in fields)
+    L.append(f"ликвидации в ответе: {'есть' if have_liq else '<b>НЕТ</b>'} | "
+             f"открытый интерес: {'есть' if have_oi else '<b>НЕТ</b>'}")
+    L.append(f"<b>Глубина истории: ~{depth_found} дн</b>" if depth_found else
+             "<b>История вглубь не отдаётся — только форвард</b>")
+    return depth_found, fields, L
+
+
+# ═════════ ЧАСТЬ 2: БЭКТЕСТ ═════════
+
+def _fetch_stats(sym, days):
+    """contract_stats за days дней кусками по 100 строк."""
+    now = int(time.time())
     out, cur, probes = [], now - days * 86400, 0
     while cur < now:
-        to = min(now, cur + 900 * sec)
-        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1h",
+        to = min(now, cur + 100 * STEP)
+        raw = B.api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": "5m",
+                                           "from": cur, "to": to, "limit": 100})
+        rows = raw if isinstance(raw, list) else []
+        if not rows:
+            probes += 1
+            if probes > 20:
+                break
+            cur += 86400
+            continue
+        out.extend(rows)
+        nxt = max(int(r.get("time") or 0) for r in rows) + STEP
+        if nxt <= cur:
+            break
+        cur = nxt
+    seen, uniq = set(), []
+    for r in sorted(out, key=lambda x: int(x.get("time") or 0)):
+        t = int(r.get("time") or 0)
+        if t and t not in seen:
+            seen.add(t)
+            uniq.append(r)
+    return uniq
+
+
+def _fetch_candles(sym, days):
+    now = int(time.time())
+    out, cur, probes = [], now - days * 86400, 0
+    while cur < now:
+        to = min(now, cur + 1900 * STEP)
+        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "5m",
                                          "from": cur, "to": to})
         part = B.parse_candles(raw) if raw else []
         if not part:
             probes += 1
-            if probes > 30:
+            if probes > 20:
                 break
-            cur += 5 * 86400
+            cur += 86400
             continue
         out.extend(part)
-        nxt = part[-1].get("t", 0) + sec
+        nxt = part[-1].get("t", 0) + STEP
         if nxt <= cur:
             break
         cur = nxt
@@ -77,255 +153,235 @@ def _fetch_1h(sym, days):
     return uniq
 
 
-def _stat(vals):
-    if not vals:
+def _sim(bars, is_long, entry, stop, tps):
+    """Три цели по трети, после TP1 стоп в безубыток, после TP2 на TP1.
+    В неоднозначной свече первым считается стоп — консервативно."""
+    risk = abs(entry - stop)
+    if risk <= 0:
         return None
-    n = len(vals)
-    m = sum(vals) / n
-    se = (statistics.pstdev(vals) / (n ** 0.5)) if n > 1 else 0.0
-    return n, m, 1.96 * se
+    tg = list(tps)
+    for i in range(1, 3):
+        if is_long and tg[i] <= tg[i - 1]:
+            tg[i] = tg[i - 1] * 1.001
+        if not is_long and tg[i] >= tg[i - 1]:
+            tg[i] = tg[i - 1] * 0.999
+    done, cur_stop, acc = 0, stop, 0.0
+    cost = FEE_PCT / 100 * entry / risk
+    for c in bars:
+        if (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop):
+            fill = cur_stop * (1 - STOP_SLIP / 100) if is_long else cur_stop * (1 + STOP_SLIP / 100)
+            r = (fill - entry) / risk if is_long else (entry - fill) / risk
+            return acc + r * sum(PARTS[done:]) - cost
+        while done < 3:
+            t = tg[done]
+            if (c["h"] >= t) if is_long else (c["l"] <= t):
+                acc += PARTS[done] * (abs(t - entry) / risk)
+                done += 1
+                if done == 1:
+                    cur_stop = entry
+                elif done == 2:
+                    cur_stop = tg[0]
+            else:
+                break
+        if done >= 3:
+            return acc - cost
+    last = bars[-1]["c"] if bars else entry
+    r = (last - entry) / risk if is_long else (entry - last) / risk
+    return acc + r * sum(PARTS[done:]) - cost
 
 
-def _line(vals, label):
-    st = _stat(vals)
+def _stat(rs):
+    if not rs:
+        return None
+    n = len(rs)
+    m = sum(rs) / n
+    se = (statistics.pstdev(rs) / (n ** 0.5)) if n > 1 else 0.0
+    return n, m, 1.96 * se, sum(1 for r in rs if r > 0) / n * 100
+
+
+def _line(rs, label, ctl=None):
+    st = _stat(rs)
     if not st:
-        return f"  {label}: циклов нет"
-    n, m, ci = st
+        return f"  {label}: событий нет"
+    n, m, ci, wr = st
     mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
-    return f"  {mark} {label}: <b>{m:+.2f}%</b> за цикл (±{ci:.2f}), циклов {n}"
+    s = f"  {mark} {label}: {n:4} соб., в плюс {wr:3.0f}%, <b>{m:+.3f}R</b> (±{ci:.3f})"
+    sc = _stat(ctl) if ctl else None
+    if sc:
+        s += f" | монетка {sc[1]:+.3f}R, эдж {m - sc[1]:+.3f}R"
+    return s
+
+
+def backtest(depth):
+    import random as _rnd
+    rng = _rnd.Random(777)
+    days = min(DAYS, depth)
+    pairs = B.UPSCALE_PAIRS[:PAIRS_N] if PAIRS_N else B.UPSCALE_PAIRS
+    hold = max(6, int(HOLD_H * 3600 / STEP))
+    t0 = time.time()
+
+    events = []
+    n_pairs = 0
+    for i, sym in enumerate(pairs, 1):
+        try:
+            stats = _fetch_stats(sym, days)
+            if len(stats) < 300:
+                continue
+            fine = _fetch_candles(sym, days)
+        except Exception:
+            continue
+        if len(fine) < 300:
+            continue
+        n_pairs += 1
+        idx = {c.get("t"): k for k, c in enumerate(fine)}
+        oi_key = "open_interest"
+        if not any(float(r.get(oi_key) or 0) > 0 for r in stats[:50]):
+            oi_key = "open_interest_usd"
+        ll = [float(r.get("long_liq_usd") or 0) for r in stats]
+        ls = [float(r.get("short_liq_usd") or 0) for r in stats]
+        ts = [int(r.get("time") or 0) for r in stats]
+        oi = [float(r.get(oi_key) or 0) for r in stats]
+        if sum(ll) + sum(ls) <= 0:
+            continue
+        # медиана часовой суммы — база для «спайка»
+        hl = [sum(ll[j - 12:j]) for j in range(12, len(ll) + 1)]
+        hs = [sum(ls[j - 12:j]) for j in range(12, len(ls) + 1)]
+        med_l = statistics.median(hl) if hl else 0.0
+        med_s = statistics.median(hs) if hs else 0.0
+        last_end = 0
+        for j in range(12, len(stats) - 1):
+            t_sig = ts[j] + STEP            # час закончился на этой строке, входим со следующей
+            if t_sig <= last_end:
+                continue
+            liq_l = sum(ll[j - 12:j])
+            liq_s = sum(ls[j - 12:j])
+            if liq_l >= max(LIQ_MULT * med_l, LIQ_MIN) and liq_l >= liq_s * 2:
+                side, liq_usd, med = "long", liq_l, med_l
+            elif liq_s >= max(LIQ_MULT * med_s, LIQ_MIN) and liq_s >= liq_l * 2:
+                side, liq_usd, med = "short", liq_s, med_s
+            else:
+                continue
+            if oi[j - 12] <= 0:
+                continue
+            oi_d = (oi[j] / oi[j - 12] - 1) * 100
+            if oi_d > -OI_DROP:
+                continue
+            k = idx.get(t_sig)
+            if k is None or k < 13 or k + hold + 2 >= len(fine):
+                continue
+            win = fine[k - 12:k]
+            if len(win) < 12:
+                continue
+            is_l = side == "long"
+            o0, c_last = win[0]["o"], win[-1]["c"]
+            if o0 <= 0:
+                continue
+            move = (c_last / o0 - 1) * 100
+            if is_l and (move > -MOVE_PCT or win[-1]["c"] <= win[-1]["o"]):
+                continue
+            if not is_l and (move < MOVE_PCT or win[-1]["c"] >= win[-1]["o"]):
+                continue
+            px = fine[k]["o"]
+            ext = min(c["l"] for c in win) if is_l else max(c["h"] for c in win)
+            stop = ext * (1 - STOP_BUF / 100) if is_l else ext * (1 + STOP_BUF / 100)
+            stop_pct = abs(stop / px - 1) * 100
+            if stop_pct > MAX_STOP or stop_pct < 0.1:
+                continue
+            ma = abs(move)
+            events.append((sym, t_sig, side, px, stop, ma,
+                           fine[k:k + hold], fine[k:k + 49], liq_usd, med, oi_d))
+            last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
+        if i % 20 == 0:
+            print(f"[FLUSH] {i}/{len(pairs)} | пар с данными {n_pairs} | "
+                  f"событий {len(events)} | {time.time() - t0:.0f}с")
+
+    L = ["", "═══ <b>FLUSH: откат после каскада ликвидаций</b> ═══",
+         f"<i>период {days} дн, пар с данными {n_pairs}, событий {len(events)}</i>",
+         f"пороги: ликвидации ≥{LIQ_MULT}× медианы (мин ${LIQ_MIN:,.0f}), "
+         f"OI ≤ -{OI_DROP}%/ч, ход ≥{MOVE_PCT}%, стоп ≤{MAX_STOP}%",
+         f"издержки {FEE_PCT}%, проскальзывание {SLIP}%", ""]
+    if len(events) < 20:
+        L.append("⚠️ Событий слишком мало для вывода. Либо пороги строгие, либо "
+                 "история короткая. Попробуй FL_MULT=3, FL_MOVE=1.5, FL_MIN_USD=1000")
+        return L
+
+    def run(coin=False, mult=None, move_min=None):
+        out = []
+        for sym, t_sig, side, px, stop, ma, seg, tail, liq, med, oi_d in events:
+            if mult is not None and med > 0 and liq < mult * med:
+                continue
+            if move_min is not None and ma < move_min:
+                continue
+            sd = rng.choice(("long", "short")) if coin else side
+            is_l = sd == "long"
+            st = stop if sd == side else (px * (1 - MAX_STOP / 100) if is_l
+                                          else px * (1 + MAX_STOP / 100))
+            ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
+            tps = ([px * (1 + ma * k / 100) for k in TP_K] if is_l
+                   else [px * (1 - ma * k / 100) for k in TP_K])
+            r = _sim(seg, is_l, ent, st, tps)
+            if r is not None:
+                out.append(r)
+        return out
+
+    # чистое движение после каскада — без стопов и целей
+    L.append("<b>1. ЕСТЬ ЛИ ОТКАТ ВООБЩЕ</b> (без стопов и целей)")
+    L.append("  <i>средний ход в сторону отката через N часов, % от входа</i>")
+    for hh, nb in ((1, 12), (2, 24), (4, 48)):
+        mv = []
+        for sym, t_sig, side, px, stop, ma, seg, tail, liq, med, oi_d in events:
+            if len(tail) <= nb or px <= 0:
+                continue
+            m = (tail[nb]["c"] - px) / px * 100
+            mv.append(m if side == "long" else -m)
+        if len(mv) < 20:
+            continue
+        n = len(mv)
+        avg = sum(mv) / n
+        se = statistics.pstdev(mv) / (n ** 0.5) if n > 1 else 0
+        mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
+        L.append(f"  {mark} через {hh}ч: {n:4} соб., <b>{avg:+.3f}%</b> (±{1.96 * se:.3f}), "
+                 f"в плюс {sum(1 for x in mv if x > 0) / n * 100:.0f}%")
+    L.append("")
+
+    L.append("<b>2. СДЕЛКИ</b> (цели — доли каскадного хода, стоп за экстремумом)")
+    L.append(_line(run(), "все события", run(coin=True)))
+    for m in (8, 12, 20):
+        rs = run(mult=m)
+        if len(rs) >= 20:
+            L.append(_line(rs, f"ликвидации ≥{m}× медианы", run(coin=True, mult=m)))
+    for mv_ in (3.5, 5.0):
+        rs = run(move_min=mv_)
+        if len(rs) >= 20:
+            L.append(_line(rs, f"каскадный ход ≥{mv_}%", run(coin=True, move_min=mv_)))
+    L.append("")
+    L.append("<i>критерий: матожидание ≥ +0.15R, значимо, и эдж над монеткой "
+             "заметно больше нуля</i>")
+    return L
 
 
 def run():
-    pairs = B.UPSCALE_PAIRS
-    need = DAYS + max(MOM_GRID) // 24 + 5
-    print(f"[XMOM] качаю 1ч свечи: {len(pairs)} пар × {need} дн (сдвиг назад {OFFSET} дн)")
-    t0 = time.time()
-
-    data = {}
-    for i, sym in enumerate(pairs, 1):
+    depth, fields, L = probe()
+    if PROBE_ONLY or depth < 3:
+        if depth < 3:
+            L.append("")
+            L.append("→ Истории нет, бэктест невозможен. Остаётся форвард: "
+                     "flush_hunter копит сигналы в реальном времени")
+    else:
+        L.append("")
+        L.append(f"→ История есть, запускаю бэктест на {min(DAYS, depth)} днях")
         try:
-            ch = _fetch_1h(sym, need)
-        except Exception:
-            continue
-        if len(ch) > (max(MOM_GRID) // 24 + max(HOLD_GRID) + 2) * 24:
-            data[sym] = {c["t"]: c for c in ch[:-1]}      # последняя свеча незакрыта
-        if i % 20 == 0:
-            print(f"[XMOM] {i}/{len(pairs)} | пар с данными {len(data)} | "
-                  f"{time.time() - t0:.0f}с")
-
-    print(f"[XMOM] пар с данными: {len(data)}")
-    if len(data) < 20:
-        B.send_telegram("⚠️ X-MOM: данных не хватило (менее 20 пар)")
-        return
-
-    ref = max(data.values(), key=len)
-    times = sorted(ref.keys())
-    cost = (FEE_PCT + SLIP_PCT) / 100 * 2        # вход и выход
-    rnd = random.Random(12345)
-
-    def slot(sym, side, t_in, t_out):
-        en, ex = data[sym].get(t_in), data[sym].get(t_out)
-        if not en or not ex or en["o"] <= 0:
-            return None
-        raw = (ex["o"] / en["o"] - 1) * (1 if side == "long" else -1)
-        return raw - cost
-
-    def ranking(t_close, mom_h):
-        """Доходность за mom_h часов по ЗАКРЫТЫМ свечам. Подглядывания нет."""
-        t_old = t_close - mom_h * 3600
-        rets = {}
-        for sym, m in data.items():
-            a, b = m.get(t_old), m.get(t_close)
-            if a and b and a["c"] > 0:
-                rets[sym] = b["c"] / a["c"] - 1
-        if len(rets) < TOP_N * 4:
-            return None
-        srt = sorted(rets.items(), key=lambda kv: kv[1], reverse=True)
-        return [s for s, _ in srt[:TOP_N]], [s for s, _ in srt[-TOP_N:]], rets
-
-    def cycles_for(mom_h, hold_d, with_control=False):
-        """Прогон по циклам. Возвращает (портфель, лонги, шорты, случайный)."""
-        cyc, lon, sho, rc = [], [], [], []
-        cycle_sec = hold_d * 86400
-        t = times[0] + (mom_h + 2) * 3600
-        while t + cycle_sec <= times[-1]:
-            r = ranking(t - 3600, mom_h)
-            t_out = t + cycle_sec
-            if r is None or t_out not in ref:
-                t += cycle_sec
-                continue
-            longs, shorts, _ = r
-            pls = [x for x in (slot(s, "long", t, t_out) for s in longs) if x is not None]
-            pss = [x for x in (slot(s, "short", t, t_out) for s in shorts) if x is not None]
-            ps = pls + pss
-            if len(ps) >= TOP_N * 2 - 2:
-                cyc.append(sum(ps) / len(ps) * 100)
-                if pls:
-                    lon.append(sum(pls) / len(pls) * 100)
-                if pss:
-                    sho.append(sum(pss) / len(pss) * 100)
-                if with_control:
-                    pool = [s for s in data if t in data[s] and t_out in data[s]]
-                    if len(pool) >= TOP_N * 2:
-                        pick = rnd.sample(pool, TOP_N * 2)
-                        rs = [x for x in ([slot(s, "long", t, t_out) for s in pick[:TOP_N]]
-                                          + [slot(s, "short", t, t_out) for s in pick[TOP_N:]])
-                              if x is not None]
-                        if rs:
-                            rc.append(sum(rs) / len(rs) * 100)
-            t += cycle_sec
-        return cyc, lon, sho, rc
-
-    def cycles_long(mom_h, hold_d, rng):
-        """Long-only: топ-N по рангу против СЛУЧАЙНЫХ N лонгов.
-        Зачем отдельно: лонг топ-N несёт в себе общий рост рынка. Сравнение со
-        случайными лонгами вычитает этот общий рост и оставляет вклад самого
-        ранжирования. Общий контроль (лонги+шорты вместе) этого не показывает."""
-        cyc, rc = [], []
-        cycle_sec = hold_d * 86400
-        t = times[0] + (mom_h + 2) * 3600
-        while t + cycle_sec <= times[-1]:
-            r = ranking(t - 3600, mom_h)
-            t_out = t + cycle_sec
-            if r is None or t_out not in ref:
-                t += cycle_sec
-                continue
-            longs, _, _ = r
-            pls = [x for x in (slot(s_, "long", t, t_out) for s_ in longs) if x is not None]
-            pool = [s_ for s_ in data if t in data[s_] and t_out in data[s_]]
-            if len(pls) >= TOP_N - 1 and len(pool) >= TOP_N:
-                pick = rng.sample(pool, TOP_N)
-                rs = [x for x in (slot(s_, "long", t, t_out) for s_ in pick) if x is not None]
-                if rs:                      # пара считается только когда есть ОБЕ половины
-                    cyc.append(sum(pls) / len(pls) * 100)
-                    rc.append(sum(rs) / len(rs) * 100)
-            t += cycle_sec
-        return cyc, rc
-
-    def alpha_of(cyc, rc):
-        """Разница «наши лонги минус случайные» с доверительным интервалом.
-        Считается по ПАРАМ циклов, поэтому общий рост рынка вычитается честно."""
-        if not cyc or len(cyc) != len(rc) or len(cyc) < 5:
-            return None
-        d = [a - b for a, b in zip(cyc, rc)]
-        n = len(d)
-        m = sum(d) / n
-        se = (statistics.pstdev(d) / (n ** 0.5)) if n > 1 else 0.0
-        return n, m, 1.96 * se
-
-    cov = (times[-1] - times[0]) / 86400
-    L = [f"📈 <b>X-MOM: кросс-секционный моментум</b> (~{cov:.0f} дн, {len(data)} пар)"
-         + (f"\n⏪ <b>ПЕРИОД СДВИНУТ НАЗАД НА {OFFSET} ДНЕЙ</b> — проверка на чужих данных"
-            if OFFSET else ""),
-         f"<i>лонг топ-{TOP_N} / шорт боттом-{TOP_N} по доходности за {MOM_H}ч, "
-         f"цикл {HOLD_D} дн, слот ${POS_USD:.0f}</i>",
-         f"Издержки {(FEE_PCT + SLIP_PCT):.2f}% на круг. Решение по закрытой свече, "
-         f"вход по открытию следующей", ""]
-
-    # ── основная настройка ──
-    cyc, lon, sho, rc = cycles_for(MOM_H, HOLD_D, with_control=True)
-    if not cyc:
-        L.append("⚠️ Циклов не набралось")
-        B.send_blocks(L)
-        return
-
-    L.append(f"<b>ОСНОВНАЯ НАСТРОЙКА</b> (ret{MOM_H}ч, цикл {HOLD_D} дн)")
-    L.append(_line(cyc, "портфель лонг+шорт"))
-    eq, peak, dd, usd = 0.0, 0.0, 0.0, 0.0
-    for c in cyc:
-        step = c / 100 * POS_USD * TOP_N * 2
-        usd += step
-        eq += step
-        peak = max(peak, eq)
-        dd = min(dd, eq - peak)
-    wins = sum(1 for c in cyc if c > 0)
-    L.append(f"     итого ${usd:+,.0f} | прибыльных циклов {wins}/{len(cyc)} "
-             f"({wins / len(cyc) * 100:.0f}%) | макс. просадка ${dd:,.0f}")
-    half = len(cyc) // 2
-    if half >= 5:
-        a = statistics.mean(cyc[:half])
-        b = statistics.mean(cyc[half:])
-        L.append(f"     по половинам: первая {a:+.2f}% | вторая {b:+.2f}% — "
-                 + ("держится" if a > 0 and b > 0 else "разваливается"))
-    L.append(_line(lon, "только лонги (топ)"))
-    L.append(_line(sho, "только шорты (боттом)"))
-    L.append("")
-
-    # ── контроль ──
-    L.append("<b>КОНТРОЛЬ: случайные пары вместо ранжированных</b>")
-    L.append("  <i>если наш портфель не лучше случайного — ранжирование не работает</i>")
-    L.append(_line(rc, "случайный портфель"))
-    if rc and cyc:
-        diff = statistics.mean(cyc) - statistics.mean(rc)
-        n = min(len(cyc), len(rc))
-        ci = 1.96 * ((statistics.pstdev(cyc) ** 2 + statistics.pstdev(rc) ** 2) / n) ** 0.5
-        verdict = ("ранжирование работает" if diff - ci > 0 else
-                   "ранжирование ВРЕДИТ" if diff + ci < 0 else
-                   "разница в пределах шума — преимущества не видно")
-        L.append(f"  → <b>наш сигнал против случайного: {diff:+.2f}% за цикл</b> "
-                 f"(±{ci:.2f}) — {verdict}")
-    L.append("")
-
-    # ── сетка: окно доходности × длина цикла ──
-    L.append("<b>ПЕРЕБОР: окно доходности × длина цикла</b>")
-    L.append("  <i>ячейка — средний результат портфеля за цикл, %</i>")
-    L.append("   ret\\цикл | " + " | ".join(f" {h}д  " for h in HOLD_GRID))
-    best = None
-    for mh in MOM_GRID:
-        row = []
-        for hd in HOLD_GRID:
-            c2, _, _, _ = cycles_for(mh, hd)
-            st = _stat(c2)
-            if st and st[0] >= 8:
-                row.append(f"{st[1]:+.2f}")
-                if best is None or st[1] > best[1]:
-                    best = ((mh, hd), st[1], st[0], st[2])
-            else:
-                row.append("  —  ")
-        L.append(f"   {mh:4}ч    | " + " | ".join(row))
-    if best:
-        L.append(f"  → лучшее: ret{best[0][0]}ч, цикл {best[0][1]}д → {best[1]:+.2f}% "
-                 f"за цикл (±{best[3]:.2f}), циклов {best[2]}")
-        L.append("  <i>лучшая ячейка выбрана задним числом из 20 — верить ей можно только "
-                 "если она подтвердится на сдвинутом периоде (XM_OFFSET=90)</i>")
-    L.append("")
-    L.append("<b>LONG-ONLY: альфа над СЛУЧАЙНЫМИ лонгами</b>")
-    L.append("  <i>лонг топ-N несёт общий рост рынка. Сравнение со случайными лонгами "
-             "вычитает его и оставляет вклад ранжирования. Ячейка — альфа, %/цикл</i>")
-    L.append("   ret\\цикл | " + " | ".join(f" {h}д  " for h in HOLD_GRID))
-    rnd2 = random.Random(54321)
-    best_a = None
-    for mh in MOM_GRID:
-        row = []
-        for hd in HOLD_GRID:
-            cl, rl = cycles_long(mh, hd, rnd2)
-            a = alpha_of(cl, rl)
-            if a and a[0] >= 8:
-                row.append(f"{a[1]:+.2f}")
-                if best_a is None or a[1] > best_a[1][1]:
-                    best_a = ((mh, hd), a)
-            else:
-                row.append("  —  ")
-        L.append(f"   {mh:4}ч    | " + " | ".join(row))
-    if best_a:
-        (mh, hd), (n, m, ci) = best_a
-        verdict = ("альфа значима" if m - ci > 0 else
-                   "в пределах шума — ранжирование ничего не добавляет")
-        L.append(f"  → лучшая альфа: ret{mh}ч, цикл {hd}д → <b>{m:+.2f}%/цикл</b> "
-                 f"(±{ci:.2f}, {n} циклов) — {verdict}")
-        L.append("  <i>критерий: альфа ≥ +0.3%/цикл, значима, держится у СОСЕДНИХ ячеек "
-                 "и повторяется при XM_OFFSET=90. Одиночный пик — артефакт перебора: "
-                 "максимум из 20 ячеек при нулевом эдже сам по себе даёт ~1.4–1.9σ</i>")
-    L.append("")
-    L.append("<i>фандинг не учтён: шорты обычно получают платёж, поэтому реальность "
-             "скорее чуть лучше цифр</i>")
-
+            L += backtest(depth)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            L.append(f"⚠️ Бэктест упал: {e}")
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     try:
         B.send_blocks(msg.split("\n"))
     except Exception as e:
-        print(f"[XMOM] отправка не удалась: {e}")
+        print(f"[FLUSH] отправка не удалась: {e}")
 
 
 def main():
@@ -335,7 +391,7 @@ def main():
         import traceback
         traceback.print_exc()
         try:
-            B.send_telegram(f"⚠️ X-MOM упал: {e}")
+            B.send_telegram(f"⚠️ FLUSH упал: {e}")
         except Exception:
             pass
 
