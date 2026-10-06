@@ -42,6 +42,15 @@ STOP, TP1, TP3 = 1.0, 1.0, 2.0
 PARTS = (1 / 3, 1 / 3, 1 / 3)
 VW_BARS = 97
 
+# ── ОТСКОК ОТ ГРАНИЦЫ КОРИДОРА ──
+# Другой вход: не от середины к границе, а ОТ самой границы. Цена подошла к краю
+# коридора, оттолкнулась — идём с отскоком к противоположному краю.
+# Главная развилка: отскок и пробой до факта выглядят одинаково, поэтому проверяем
+# и вход по касанию, и вход с подтверждением (свеча закрылась обратно внутрь).
+BOUNCE_DEPTH  = [0.0, 0.3, 0.6]        # насколько глубоко за границу пускаем (% от цены)
+BOUNCE_STOPS  = [0.5, 1.0, 1.5]        # стоп ЗА границей, % от неё
+BOUNCE_MINROOM = 1.0                   # минимум хода до противоположной границы, %
+
 STOP_GRID = [0.75, 1.0, 1.5, 2.0, 3.0]        # персональный стоп, % от цены
 ATR_GRID  = [1.0, 1.5, 2.0, 3.0]              # персональный стоп, во сколько ATR
 
@@ -150,6 +159,7 @@ def run():
 
     # ── сделки по каждой паре ──
     per = {}            # sym -> список (ts, side, px, bnd, atr_pct, seg)
+    bounces = {}        # sym -> отскоки от границ коридора
     t0 = time.time()
     cov = 0.0
     for i, sym in enumerate(pairs, 1):
@@ -167,6 +177,7 @@ def run():
             cov = (fine[-1].get("t", 0) - fine[0].get("t", 0)) / 86400
         idx = {c.get("t"): k for k, c in enumerate(fine)}
         last_end = 0
+        corr_list = []        # коридоры зарядов этой пары — для поиска отскоков
         for e in range(B.BASE_FROM + B.ACC_WINDOW, len(base)):
             upto = base[:e]
             sl = upto[-B.BASE_FROM:-B.BASE_TO]
@@ -185,6 +196,7 @@ def run():
                                 lambda s: None, P=B.ALT_P)
             if not c:
                 continue
+            corr_list.append((cts, c["hi"], c["lo"]))
             for em in ENTRY_MINS:
                 ts = cts + 3600 + em * 60
                 k = idx.get(ts)
@@ -213,10 +225,44 @@ def run():
                                                 fine[k:k + hold], fine[k:k + 49]))
                 last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
                 break
+        # ── ОТСКОКИ: по тем же зарядам, но вход у границы ──
+        # Берём коридор заряда и ищем на 15м свечах касание его края. Сделка — в сторону
+        # ПРОТИВОПОЛОЖНОЙ границы. Всё по закрытым свечам: касание видим на свече j,
+        # входим по открытию j+1.
+        for cts, hi, lo in corr_list:
+            k0 = idx.get(cts + 3600)
+            if k0 is None:
+                continue
+            h_ = hi - lo
+            if h_ <= 0:
+                continue
+            for j in range(k0, min(k0 + 48, len(fine) - hold - 2)):
+                cj = fine[j]
+                if j + 1 >= len(fine):
+                    break
+                px_ = fine[j + 1]["o"]
+                for side_b, edge, opp in (("long", lo, hi), ("short", hi, lo)):
+                    is_l = side_b == "long"
+                    touched = (cj["l"] <= edge) if is_l else (cj["h"] >= edge)
+                    if not touched:
+                        continue
+                    # как глубоко ушли за границу (0 — только коснулись)
+                    depth = ((edge - cj["l"]) / edge * 100) if is_l else ((cj["h"] - edge) / edge * 100)
+                    # подтверждение: свеча закрылась обратно ВНУТРЬ коридора
+                    confirmed = (cj["c"] > edge) if is_l else (cj["c"] < edge)
+                    room_b = (opp - px_) / px_ * 100 if is_l else (px_ - opp) / px_ * 100
+                    if room_b < BOUNCE_MINROOM:
+                        continue
+                    atrp = (h_ / px_ * 100) / 4 if px_ > 0 else 0
+                    bounces.setdefault(sym, []).append(
+                        (fine[j + 1].get("t", 0), side_b, px_, edge, opp, depth,
+                         confirmed, atrp, fine[j + 1:j + 1 + hold], fine[j + 1:j + 50]))
+                    break
         if i % 20 == 0:
             tot = sum(len(v) for v in per.values())
+            nb_ = sum(len(v) for v in bounces.values())
             print(f"[PAIRS] {i}/{len(pairs)} | пар с сделками {len(per)} | сделок {tot} | "
-                  f"{time.time()-t0:.0f}с")
+                  f"отскоков {nb_} | {time.time()-t0:.0f}с")
 
     def run_trade(rec, stop_pct=None, atr_k=None, coin=False):
         ts, side, px, bnd, atr_pct, seg = rec[:6]
@@ -410,6 +456,89 @@ def run():
              f"если это число близко к {len(confirmed)}, отбор ничего не значит</i>")
     if confirmed:
         L.append("  Подтверждённые: " + ", ".join(sorted(confirmed)))
+
+    # ── 5. ОТСКОК ОТ ГРАНИЦЫ КОРИДОРА ──
+    all_b = [(s_, b) for s_, v in bounces.items() for b in v]
+    L.append("")
+    L.append("═══ <b>5. ОТСКОК ОТ ГРАНИЦЫ КОРИДОРА</b> ═══")
+    L.append("  <i>вход не от середины к границе, а ОТ границы в сторону противоположной. "
+             "Касание видим на закрытой свече, входим по открытию следующей</i>")
+    if not all_b:
+        L.append("  отскоков не найдено")
+    else:
+        L.append(f"  найдено касаний границы: {len(all_b)}")
+
+        def b_move(recs, nb):
+            """Чистый ход после отскока, без стопов и целей."""
+            out = []
+            for _s, r in recs:
+                tail = r[9]
+                if len(tail) <= nb or r[2] <= 0:
+                    continue
+                mv = (tail[nb]["c"] - r[2]) / r[2] * 100
+                out.append(mv if r[1] == "long" else -mv)
+            return out
+
+        def b_trade(r, stop_pct, coin=False):
+            ts, side, px, edge, opp, depth, conf, atrp, seg, tail = r
+            sd = rng.choice(("long", "short")) if coin else side
+            is_l = sd == "long"
+            # стоп ЗА границей, от которой отскочили
+            stp = edge * (1 - stop_pct / 100) if is_l else edge * (1 + stop_pct / 100)
+            if abs(px - stp) / px * 100 > 8 or abs(px - stp) <= 0:
+                return None
+            tgt = opp if sd == side else (px * (1 + 1.5 / 100) if is_l else px * (1 - 1.5 / 100))
+            ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
+            risk_pct = abs(ent - stp) / ent * 100
+            y1 = ent * (1 + risk_pct / 100) if is_l else ent * (1 - risk_pct / 100)
+            y3 = ent * (1 + 2 * risk_pct / 100) if is_l else ent * (1 - 2 * risk_pct / 100)
+            return _sim(seg, sd, ent, stp, y1, tgt, y3)
+
+        # 5.1 чистое движение после касания
+        L.append("  <b>5.1 Движение после касания</b> (без стопов и целей)")
+        for hh, nb in [(1, 4), (2, 8), (4, 16), (12, 48)]:
+            for lbl, sel in (("все касания", all_b),
+                             ("только подтверждённые", [x for x in all_b if x[1][6]])):
+                mv = b_move(sel, nb)
+                if len(mv) < 30:
+                    continue
+                n = len(mv)
+                avg = sum(mv) / n
+                se = (statistics.pstdev(mv) / (n ** 0.5)) if n > 1 else 0.0
+                mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
+                L.append(f"   {mark} через {hh:2}ч, {lbl:22}: {n:4} набл., "
+                         f"<b>{avg:+.3f}%</b> (±{1.96*se:.3f}), в плюс "
+                         f"{sum(1 for x in mv if x > 0)/n*100:.0f}%")
+
+        # 5.2 сделки: глубина захода × стоп, с подтверждением и без
+        L.append("  <b>5.2 Сделки: цель — противоположная граница</b>")
+        best_b = None
+        for conf_only in (False, True):
+            sel0 = [x for x in all_b if (x[1][6] if conf_only else True)]
+            tag = "с подтверждением" if conf_only else "по касанию"
+            for dep in BOUNCE_DEPTH:
+                sel = [x for x in sel0 if x[1][5] <= dep] if dep else \
+                      [x for x in sel0 if x[1][5] <= 0.05]
+                if len(sel) < 30:
+                    continue
+                for sp in BOUNCE_STOPS:
+                    rs = [x for x in (b_trade(r, sp) for _s, r in sel) if x is not None]
+                    cl = [x for x in (b_trade(r, sp, coin=True) for _s, r in sel) if x is not None]
+                    st, sc = _stat(rs), _stat(cl)
+                    if not st or st[0] < 30:
+                        continue
+                    mark = "✅" if st[1] - st[2] > 0 else "❌" if st[1] + st[2] < 0 else "  "
+                    edge_v = st[1] - (sc[1] if sc else 0)
+                    L.append(f"   {mark} {tag}, заход ≤{dep}%, стоп {sp}% за границей: "
+                             f"{st[0]:4} сд, ВР {st[3]:3.0f}%, <b>{st[1]:+.3f}R</b> "
+                             f"(±{st[2]:.3f}) | монетка {sc[1]:+.3f}R, эдж {edge_v:+.3f}R")
+                    if st[0] >= 60 and (best_b is None or st[1] > best_b[1]):
+                        best_b = (f"{tag}, заход ≤{dep}%, стоп {sp}%", st[1], st[0], edge_v)
+        if best_b:
+            L.append(f"   → <b>лучшее: {best_b[0]}</b> — {best_b[2]} сд, {best_b[1]:+.3f}R, "
+                     f"эдж {best_b[3]:+.3f}R")
+        else:
+            L.append("   ни один вариант не набрал 60 сделок")
 
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
