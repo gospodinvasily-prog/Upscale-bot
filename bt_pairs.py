@@ -1,150 +1,77 @@
 """
-bt_pairs.py — FLUSH: разведка истории ликвидаций и бэктест на ней.
+bt_pairs.py — НАША СТРАТЕГИЯ НА ПОЛНЫХ ДАННЫХ.
 
-Запускается привычным RUN_BACKTEST=pairs — менять bot.py не нужно.
+Почему это не повтор пройденного. Все прежние прогоны считали заряд БЕЗ открытого
+интереса, тейкеров и фандинга — я ошибочно считал, что истории contract_stats нет.
+В шапке каждого отчёта так и стояло: «OI за историю не восстановить, сила ниже живой
+на 2-3». То есть мы проверяли УРЕЗАННЫЙ детектор, а не тот, которым торгует бот.
 
-ЧАСТЬ 1 — РАЗВЕДКА. Отдаёт ли Gate историю contract_stats (открытый интерес и
-ликвидации) вглубь по параметру from. Пробуем 1, 3, 7, 14, 30, 60 дней назад и
-печатаем, что реально вернулось, вместе с именами полей.
+Разведка показала: contract_stats отдаёт историю минимум на 60 дней, и в ней есть
+open_interest, lsr_taker, last_funding_rate, ликвидации и позиционирование счетов.
+Значит сигнал можно посчитать точно так же, как вживую.
 
-ЧАСТЬ 2 — БЭКТЕСТ, запускается автоматически, если история нашлась хотя бы на
-несколько дней. Гипотеза: каскад ликвидаций — это принудительные маркет-ордера,
-которые уводят цену дальше равновесия; когда топливо кончается (OI упал, появилась
-встречная свеча), цена откатывает.
+Что считается:
+  1. Заряд с ПОЛНОЙ силой (OI + тейкеры + фандинг) против урезанной — видно, что
+     давали недостающие очки.
+  2. Фильтры как в боте v10.4: уклон BTC по его VWAP, сторона VWAP пары, ход до границы.
+  3. Разбивка по силе заряда и по вкладу OI.
+  4. Монетка рядом с каждой строкой — без неё цифры ничего не значат.
 
-Почему это стоит проверять после закрытия ценовых идей: здесь сигнал строится НЕ
-на цене, а на данных о позициях. Все похороненные гипотезы были price-only.
-
-Тайминг честный: событие определяется по ЗАКРЫТЫМ 5м данным, вход по открытию
-следующей свечи. Рядом считается монетка.
+Тайминг честный: заряд по ЗАКРЫТЫМ часовым свечам, вход по открытию 15м свечи
+после закрытия часа (:00) или через полчаса (:30) — как сканирует бот.
 
 Настройки:
-  FL_PROBE_ONLY (0)   — 1 = только разведка, без бэктеста
-  FL_DAYS (30)        — сколько дней истории брать для бэктеста
-  FL_PAIRS (0)        — сколько пар (0 = все)
-  FL_MULT (5)         — во сколько раз ликвидации выше медианы
-  FL_MIN_USD (3000)   — минимальная сумма ликвидаций за час
-  FL_OI_DROP (0.8)    — на сколько % должен упасть OI за час
-  FL_MOVE (2.5)       — минимальный ход цены за час, %
-  FL_MAX_STOP (3.0)   — максимальный стоп, % (иначе событие пропускаем)
-  FL_HOLD_H (12)      — горизонт удержания
+  PB_DAYS (45)     — дней истории
+  PB_OFFSET (0)    — сдвиг периода назад, для проверки на чужих данных
+  PB_PAIRS (0)     — сколько пар (0 = все)
+  PB_DIST (1.5)    — ход до границы, %
+  PB_BTC (0.2)     — запас BTC от его VWAP, %
+  PB_NO_BTC (0)    — 1 = выключить фильтр BTC
+  PB_NO_PVWAP (0)  — 1 = выключить фильтр стороны VWAP пары
 """
 import os
+import math
 import time
 import statistics
 
 import bot as B
 
-PROBE_ONLY = os.environ.get("FL_PROBE_ONLY", "0") == "1"
-DAYS       = int(os.environ.get("FL_DAYS", "14"))
-# contract_stats отдаёт по 100 строк = 8 часов пятиминуток. На 30 дней это ~90
-# запросов НА ПАРУ, на 103 парах — тысячи запросов и часы ожидания. Поэтому по
-# умолчанию берём 40 пар и 14 дней; расширять через FL_PAIRS=0 и FL_DAYS осознанно.
-PAIRS_N    = int(os.environ.get("FL_PAIRS", "40"))
-LIQ_MULT   = float(os.environ.get("FL_MULT", "5"))
-LIQ_MIN    = float(os.environ.get("FL_MIN_USD", "3000"))
-OI_DROP    = float(os.environ.get("FL_OI_DROP", "0.8"))
-MOVE_PCT   = float(os.environ.get("FL_MOVE", "2.5"))
-MAX_STOP   = float(os.environ.get("FL_MAX_STOP", "3.0"))
-HOLD_H     = float(os.environ.get("FL_HOLD_H", "12"))
-STOP_BUF   = float(os.environ.get("FL_STOP_BUF", "0.1"))
-SLIP       = float(os.environ.get("FL_SLIP", "0.10"))
-STOP_SLIP  = float(os.environ.get("FL_STOP_SLIP", "0.10"))
-FEE_PCT    = float(os.environ.get("FL_FEE", "0.065"))
+DAYS      = int(os.environ.get("PB_DAYS", "45"))
+OFFSET    = int(os.environ.get("PB_OFFSET", "0"))
+PAIRS_N   = int(os.environ.get("PB_PAIRS", "0"))
+DIST      = float(os.environ.get("PB_DIST", "1.5"))
+BTC_MARG  = float(os.environ.get("PB_BTC", "0.2"))
+NO_BTC    = os.environ.get("PB_NO_BTC", "0") == "1"
+NO_PVWAP  = os.environ.get("PB_NO_PVWAP", "0") == "1"
+SLIP      = float(os.environ.get("PB_SLIP", "0.10"))
+COST      = float(os.environ.get("PB_COST", "0.065"))
+STOP_SLIP = float(os.environ.get("PB_STOP_SLIP", "0.05"))
+HOLD_H    = int(os.environ.get("PB_HOLD_H", "12"))
 
-STEP = 300          # 5м
+FINE_SEC = 900
+STOP, TP1, TP3 = 1.0, 1.0, 2.0
 PARTS = (1 / 3, 1 / 3, 1 / 3)
-TP_K = (0.4, 0.7, 1.0)      # доли каскадного хода
+VW_BARS = 97
+ENTRY_MINS = [0, 30]
 
 
-# ═════════ ЧАСТЬ 1: РАЗВЕДКА ═════════
-
-def probe():
-    """Пробуем contract_stats на разной глубине. Возвращает (глубина в днях, поля)."""
-    L = ["🔍 <b>РАЗВЕДКА: отдаёт ли Gate историю ликвидаций и OI</b>",
-         "<i>если история есть — все гипотезы на позициях становятся проверяемыми "
-         "за один прогон вместо недель ожидания</i>", ""]
-    now = int(time.time())
-    depth_found = 0
-    fields = []
-    for d in (0, 1, 3, 7, 14, 30, 60):
-        params = {"contract": "BTC_USDT", "interval": "5m", "limit": 100}
-        if d:
-            params["from"] = now - d * 86400
-            params["to"] = now - d * 86400 + 100 * STEP
-        raw = B.api_get("contract_stats", params)
-        if not isinstance(raw, list) or not raw:
-            L.append(f"  {d:2} дн назад: пусто")
-            continue
-        ts = [int(r.get("time") or 0) for r in raw if r.get("time")]
-        if not ts:
-            L.append(f"  {d:2} дн назад: {len(raw)} строк, но без времени")
-            continue
-        age = (now - max(ts)) / 86400
-        L.append(f"  {d:2} дн назад: {len(raw)} строк, самая свежая {age:.1f} дн назад")
-        if d and age > d * 0.5:
-            depth_found = max(depth_found, d)
-        if not fields:
-            fields = sorted(raw[0].keys())
-    L.append("")
-    if fields:
-        L.append(f"<b>Поля ответа:</b> {', '.join(fields)}")
-    have_liq = any("liq" in f for f in fields)
-    have_oi = any("open_interest" in f for f in fields)
-    L.append(f"ликвидации в ответе: {'есть' if have_liq else '<b>НЕТ</b>'} | "
-             f"открытый интерес: {'есть' if have_oi else '<b>НЕТ</b>'}")
-    L.append(f"<b>Глубина истории: ~{depth_found} дн</b>" if depth_found else
-             "<b>История вглубь не отдаётся — только форвард</b>")
-    return depth_found, fields, L
-
-
-# ═════════ ЧАСТЬ 2: БЭКТЕСТ ═════════
-
-def _fetch_stats(sym, days):
-    """contract_stats за days дней кусками по 100 строк."""
-    now = int(time.time())
+def _fetch_candles(sym, tf, days):
+    sec = {"15m": 900, "1h": 3600}[tf]
+    now = int(time.time()) - OFFSET * 86400
     out, cur, probes = [], now - days * 86400, 0
     while cur < now:
-        to = min(now, cur + 100 * STEP)
-        raw = B.api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": "5m",
-                                           "from": cur, "to": to, "limit": 100})
-        rows = raw if isinstance(raw, list) else []
-        if not rows:
-            probes += 1
-            if probes > 20:
-                break
-            cur += 86400
-            continue
-        out.extend(rows)
-        nxt = max(int(r.get("time") or 0) for r in rows) + STEP
-        if nxt <= cur:
-            break
-        cur = nxt
-    seen, uniq = set(), []
-    for r in sorted(out, key=lambda x: int(x.get("time") or 0)):
-        t = int(r.get("time") or 0)
-        if t and t not in seen:
-            seen.add(t)
-            uniq.append(r)
-    return uniq
-
-
-def _fetch_candles(sym, days):
-    now = int(time.time())
-    out, cur, probes = [], now - days * 86400, 0
-    while cur < now:
-        to = min(now, cur + 1900 * STEP)
-        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "5m",
+        to = min(now, cur + 1900 * sec)
+        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": tf,
                                          "from": cur, "to": to})
         part = B.parse_candles(raw) if raw else []
         if not part:
             probes += 1
-            if probes > 20:
+            if probes > 25:
                 break
-            cur += 86400
+            cur += 5 * 86400
             continue
         out.extend(part)
-        nxt = part[-1].get("t", 0) + STEP
+        nxt = part[-1].get("t", 0) + sec
         if nxt <= cur:
             break
         cur = nxt
@@ -156,28 +83,93 @@ def _fetch_candles(sym, days):
     return uniq
 
 
-def _sim(bars, is_long, entry, stop, tps):
-    """Три цели по трети, после TP1 стоп в безубыток, после TP2 на TP1.
-    В неоднозначной свече первым считается стоп — консервативно."""
+def _fetch_stats(sym, days):
+    """contract_stats часовыми строками: OI, тейкеры, фандинг.
+    Час вместо 5 минут — иначе на 45 дней ушло бы 130 запросов на пару."""
+    now = int(time.time()) - OFFSET * 86400
+    out, cur, probes = [], now - days * 86400, 0
+    while cur < now:
+        to = min(now, cur + 100 * 3600)
+        raw = B.api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": "1h",
+                                           "from": cur, "to": to, "limit": 100})
+        rows = raw if isinstance(raw, list) else []
+        if not rows:
+            probes += 1
+            if probes > 20:
+                break
+            cur += 5 * 86400
+            continue
+        out.extend(rows)
+        nxt = max(int(B.fnum(r.get("time", 0))) for r in rows) + 3600
+        if nxt <= cur:
+            break
+        cur = nxt
+    res = {}
+    for r in out:
+        t = int(B.fnum(r.get("time", 0)))
+        if t <= 0:
+            continue
+        res[t - t % 3600] = {
+            "oi": B.fnum(r.get("open_interest", 0)),
+            "oiu": B.fnum(r.get("open_interest_usd", 0)),
+            "taker": B.fnum(r.get("lsr_taker", 0)),
+            "fund": B.fnum(r.get("last_funding_rate", 0)) * 100,
+        }
+    return res
+
+
+def _stats_at(st, t_end, win_h=12):
+    """Срез статистики на момент t_end по тем же правилам, что в боте:
+    изменение OI за окно и геометрическое среднее lsr_taker."""
+    if not st:
+        return None
+    key_rows = [(t, v) for t, v in st.items() if t_end - win_h * 3600 < t <= t_end]
+    if len(key_rows) < 4:
+        return None
+    key_rows.sort()
+    use_oi = all(v["oi"] > 0 for _, v in key_rows)
+    first = key_rows[0][1]
+    last = key_rows[-1][1]
+    base = first["oi"] if use_oi else first["oiu"]
+    cur = last["oi"] if use_oi else last["oiu"]
+    oi_win = round((cur / base - 1) * 100, 2) if base > 0 else None
+    tk = [v["taker"] for _, v in key_rows if 0.05 < v["taker"] < 20]
+    taker = round(math.exp(sum(math.log(x) for x in tk) / len(tk)), 2) if tk else None
+    return {"oi_win": oi_win, "oi_15m": None, "taker_win": taker,
+            "taker_15m": None, "taker_1h": taker, "oi_1h": oi_win,
+            "liq_long_win": 0, "liq_short_win": 0,
+            "liq_long_1h": 0, "liq_short_1h": 0,
+            "funding": last["fund"]}
+
+
+def _vwap(win):
+    vol = sum(x["v"] for x in win)
+    if not win or vol <= 0:
+        return None
+    return sum((x["h"] + x["l"] + x["c"]) / 3 * x["v"] for x in win) / vol
+
+
+def _sim(bars, side, entry, stop, t1, t2, t3):
     risk = abs(entry - stop)
     if risk <= 0:
         return None
-    tg = list(tps)
+    is_l = side == "long"
+    tg = [t1, t2, t3]
     for i in range(1, 3):
-        if is_long and tg[i] <= tg[i - 1]:
+        if is_l and tg[i] <= tg[i - 1]:
             tg[i] = tg[i - 1] * 1.001
-        if not is_long and tg[i] >= tg[i - 1]:
+        if not is_l and tg[i] >= tg[i - 1]:
             tg[i] = tg[i - 1] * 0.999
     done, cur_stop, acc = 0, stop, 0.0
-    cost = FEE_PCT / 100 * entry / risk
+    cost = COST / 100 * entry / risk
     for c in bars:
-        if (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop):
-            fill = cur_stop * (1 - STOP_SLIP / 100) if is_long else cur_stop * (1 + STOP_SLIP / 100)
-            r = (fill - entry) / risk if is_long else (entry - fill) / risk
+        if (c["l"] <= cur_stop) if is_l else (c["h"] >= cur_stop):
+            fill = cur_stop * (1 - STOP_SLIP / 100) if is_l else cur_stop * (1 + STOP_SLIP / 100)
+            r = (fill - entry) / risk if is_l else (entry - fill) / risk
             return acc + r * sum(PARTS[done:]) - cost
         while done < 3:
             t = tg[done]
-            if (c["h"] >= t) if is_long else (c["l"] <= t):
+            if (c["h"] >= t) if is_l else (c["l"] <= t):
                 acc += PARTS[done] * (abs(t - entry) / risk)
                 done += 1
                 if done == 1:
@@ -189,7 +181,7 @@ def _sim(bars, is_long, entry, stop, tps):
         if done >= 3:
             return acc - cost
     last = bars[-1]["c"] if bars else entry
-    r = (last - entry) / risk if is_long else (entry - last) / risk
+    r = (last - entry) / risk if is_l else (entry - last) / risk
     return acc + r * sum(PARTS[done:]) - cost
 
 
@@ -205,197 +197,237 @@ def _stat(rs):
 def _line(rs, label, ctl=None):
     st = _stat(rs)
     if not st:
-        return f"  {label}: событий нет"
+        return f"  {label}: сделок нет"
     n, m, ci, wr = st
     mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
-    s = f"  {mark} {label}: {n:4} соб., в плюс {wr:3.0f}%, <b>{m:+.3f}R</b> (±{ci:.3f})"
+    s = f"  {mark} {label}: {n:4} сд, ВР {wr:3.0f}%, <b>{m:+.3f}R</b> (±{ci:.3f})"
     sc = _stat(ctl) if ctl else None
     if sc:
         s += f" | монетка {sc[1]:+.3f}R, эдж {m - sc[1]:+.3f}R"
     return s
 
 
-def backtest(depth):
+def run():
     import random as _rnd
-    rng = _rnd.Random(777)
-    days = min(DAYS, depth)
+    rng = _rnd.Random(31337)
     pairs = B.UPSCALE_PAIRS[:PAIRS_N] if PAIRS_N else B.UPSCALE_PAIRS
-    hold = max(6, int(HOLD_H * 3600 / STEP))
+    hold = max(6, int(HOLD_H * 3600 / FINE_SEC))
     t0 = time.time()
 
-    events = []
+    # ── уклон BTC по его VWAP ──
+    btc15 = _fetch_candles("BTC", "15m", DAYS + 2)
+    vw_dev = {}
+    for k in range(VW_BARS, len(btc15)):
+        vw = _vwap(btc15[max(0, k - VW_BARS + 1):k + 1])
+        if vw:
+            vw_dev[btc15[k].get("t", 0) + FINE_SEC] = (btc15[k]["c"] - vw) / vw * 100
+
+    def btc_side(ts):
+        t = ts - ts % FINE_SEC
+        for back in range(8):
+            v = vw_dev.get(t - back * FINE_SEC)
+            if v is not None:
+                return "long" if v > BTC_MARG else "short" if v < -BTC_MARG else "neutral"
+        return None
+
+    trades = []     # (R_полный, score, oi_win, has_oi, side, px, bnd, seg)
+    n_ch_full = n_ch_slim = 0
     n_pairs = 0
+    cov = 0.0
+
     for i, sym in enumerate(pairs, 1):
+        if sym == "BTC":
+            continue
         try:
-            stats = _fetch_stats(sym, days)
-            if len(stats) < 300:
-                continue
-            fine = _fetch_candles(sym, days)
+            fine = _fetch_candles(sym, "15m", DAYS)
+            base = _fetch_candles(sym, "1h", DAYS + 5)
+            st = _fetch_stats(sym, DAYS + 1)
         except Exception:
             continue
-        if len(fine) < 300:
+        if len(fine) < 400 or len(base) < 120:
             continue
+        fine, base = fine[:-1], base[:-1]
+        if not cov:
+            cov = (fine[-1].get("t", 0) - fine[0].get("t", 0)) / 86400
         n_pairs += 1
         idx = {c.get("t"): k for k, c in enumerate(fine)}
-        oi_key = "open_interest"
-        if not any(float(r.get(oi_key) or 0) > 0 for r in stats[:50]):
-            oi_key = "open_interest_usd"
-        ll = [float(r.get("long_liq_usd") or 0) for r in stats]
-        ls = [float(r.get("short_liq_usd") or 0) for r in stats]
-        ts = [int(r.get("time") or 0) for r in stats]
-        oi = [float(r.get(oi_key) or 0) for r in stats]
-        if sum(ll) + sum(ls) <= 0:
-            continue
-        # медиана часовой суммы — база для «спайка»
-        hl = [sum(ll[j - 12:j]) for j in range(12, len(ll) + 1)]
-        hs = [sum(ls[j - 12:j]) for j in range(12, len(ls) + 1)]
-        med_l = statistics.median(hl) if hl else 0.0
-        med_s = statistics.median(hs) if hs else 0.0
         last_end = 0
-        for j in range(12, len(stats) - 1):
-            t_sig = ts[j] + STEP            # час закончился на этой строке, входим со следующей
-            if t_sig <= last_end:
-                continue
-            liq_l = sum(ll[j - 12:j])
-            liq_s = sum(ls[j - 12:j])
-            if liq_l >= max(LIQ_MULT * med_l, LIQ_MIN) and liq_l >= liq_s * 2:
-                side, liq_usd, med = "long", liq_l, med_l
-            elif liq_s >= max(LIQ_MULT * med_s, LIQ_MIN) and liq_s >= liq_l * 2:
-                side, liq_usd, med = "short", liq_s, med_s
-            else:
-                continue
-            if oi[j - 12] <= 0:
-                continue
-            oi_d = (oi[j] / oi[j - 12] - 1) * 100
-            if oi_d > -OI_DROP:
-                continue
-            k = idx.get(t_sig)
-            if k is None or k < 13 or k + hold + 2 >= len(fine):
-                continue
-            win = fine[k - 12:k]
-            if len(win) < 12:
-                continue
-            is_l = side == "long"
-            o0, c_last = win[0]["o"], win[-1]["c"]
-            if o0 <= 0:
-                continue
-            move = (c_last / o0 - 1) * 100
-            if is_l and (move > -MOVE_PCT or win[-1]["c"] <= win[-1]["o"]):
-                continue
-            if not is_l and (move < MOVE_PCT or win[-1]["c"] >= win[-1]["o"]):
-                continue
-            px = fine[k]["o"]
-            ext = min(c["l"] for c in win) if is_l else max(c["h"] for c in win)
-            stop = ext * (1 - STOP_BUF / 100) if is_l else ext * (1 + STOP_BUF / 100)
-            stop_pct = abs(stop / px - 1) * 100
-            if stop_pct > MAX_STOP or stop_pct < 0.1:
-                continue
-            ma = abs(move)
-            events.append((sym, t_sig, side, px, stop, ma,
-                           fine[k:k + hold], fine[k:k + 49], liq_usd, med, oi_d))
-            last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
-        if i % 5 == 0:
-            print(f"[FLUSH] {i}/{len(pairs)} | пар с данными {n_pairs} | "
-                  f"событий {len(events)} | {time.time() - t0:.0f}с")
 
-    L = ["", "═══ <b>FLUSH: откат после каскада ликвидаций</b> ═══",
-         f"<i>период {days} дн, пар с данными {n_pairs}, событий {len(events)}</i>",
-         f"пороги: ликвидации ≥{LIQ_MULT}× медианы (мин ${LIQ_MIN:,.0f}), "
-         f"OI ≤ -{OI_DROP}%/ч, ход ≥{MOVE_PCT}%, стоп ≤{MAX_STOP}%",
-         f"издержки {FEE_PCT}%, проскальзывание {SLIP}%", ""]
-    if len(events) < 20:
-        L.append("⚠️ Событий слишком мало для вывода. Либо пороги строгие, либо "
-                 "история короткая. Попробуй FL_MULT=3, FL_MOVE=1.5, FL_MIN_USD=1000")
-        return L
+        for e in range(B.BASE_FROM + B.ACC_WINDOW, len(base)):
+            upto = base[:e]
+            sl = upto[-B.BASE_FROM:-B.BASE_TO]
+            if len(sl) < 10:
+                continue
+            vb = B.trimmed_mean([c["v"] for c in sl])
+            ab = B.trimmed_mean(B.true_ranges(upto)[-B.BASE_FROM:-B.BASE_TO])
+            if not vb or not ab or vb <= 0 or ab <= 0:
+                continue
+            cts = upto[-1].get("t", 0)
+            sig_ts = cts + 3600
+            if sig_ts <= last_end:
+                continue
 
-    def run(coin=False, mult=None, move_min=None):
+            snap = _stats_at(st, cts, 12)
+            tick = {"funding": (snap or {}).get("funding", 0.0), "change_24h": 0.0}
+            # ПОЛНАЯ сила: детектор получает OI, тейкеров и фандинг — как вживую
+            c_full = B.detect_charge(sym, upto, upto[-1]["c"], vb, ab,
+                                     {"btc_chg_win": 0.0, "do_charge": True}, tick,
+                                     lambda s, _sn=snap: _sn, P=B.ALT_P)
+            # УРЕЗАННАЯ: как во всех прежних прогонах — ничего этого нет
+            c_slim = B.detect_charge(sym, upto, upto[-1]["c"], vb, ab,
+                                     {"btc_chg_win": 0.0, "do_charge": True},
+                                     {"funding": 0.0, "change_24h": 0.0},
+                                     lambda s: None, P=B.ALT_P)
+            if c_full:
+                n_ch_full += 1
+            if c_slim:
+                n_ch_slim += 1
+            if not c_full:
+                continue
+
+            for em in ENTRY_MINS:
+                ts = sig_ts + em * 60
+                k = idx.get(ts)
+                if k is None or k + hold + 2 >= len(fine) or k < VW_BARS + 2:
+                    continue
+                px = fine[k]["o"]
+                bs = btc_side(ts)
+                side = c_full["side"]
+                if not NO_BTC:
+                    if bs is None or bs == "neutral":
+                        continue
+                    if side in ("long", "short"):
+                        if side != bs:
+                            continue
+                    else:
+                        side = bs
+                elif side not in ("long", "short"):
+                    continue
+                if not NO_PVWAP:
+                    vw = _vwap(fine[k - VW_BARS:k])
+                    if not vw:
+                        continue
+                    if ("long" if fine[k - 1]["c"] > vw else "short") != side:
+                        continue
+                is_l = side == "long"
+                bnd = c_full["hi"] if is_l else c_full["lo"]
+                room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
+                if room < DIST:
+                    continue
+                seg = fine[k:k + hold]
+                ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
+                stp = px * (1 - STOP / 100) if is_l else px * (1 + STOP / 100)
+                y1 = px * (1 + TP1 / 100) if is_l else px * (1 - TP1 / 100)
+                y3 = px * (1 + TP3 / 100) if is_l else px * (1 - TP3 / 100)
+                r = _sim(seg, side, ent, stp, y1, bnd, y3)
+                if r is None:
+                    continue
+                oi_w = (snap or {}).get("oi_win")
+                slim_sc = c_slim["score"] if c_slim else None
+                trades.append({"R": r, "score": c_full["score"], "oi": oi_w,
+                               "slim": slim_sc, "side": side, "px": px, "bnd": bnd,
+                               "seg": seg, "taker": (snap or {}).get("taker_win"),
+                               "fund": tick["funding"]})
+                last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
+                break
+        if i % 10 == 0:
+            print(f"[FULL] {i}/{len(pairs)} | пар {n_pairs} | сделок {len(trades)} | "
+                  f"{time.time() - t0:.0f}с")
+
+    L = [f"🔋 <b>СТРАТЕГИЯ НА ПОЛНЫХ ДАННЫХ</b> (~{cov:.0f} дн, {n_pairs} пар)"
+         + (f"\n⏪ <b>ПЕРИОД СДВИНУТ НАЗАД НА {OFFSET} ДНЕЙ</b>" if OFFSET else ""),
+         "<i>впервые заряд считается с настоящими OI, тейкерами и фандингом — "
+         "раньше в бэктестах их не было, и проверялся урезанный детектор</i>",
+         f"Фильтры: ход ≥{DIST}%" + ("" if NO_BTC else f", BTC ≥{BTC_MARG}% от VWAP")
+         + ("" if NO_PVWAP else ", сторона VWAP пары"),
+         f"Зарядов с полными данными: {n_ch_full} | тем же детектором без них: {n_ch_slim}",
+         f"Сделок: {len(trades)} | издержки {COST}%, проскальзывание {SLIP}%", ""]
+
+    if len(trades) < 30:
+        L.append("⚠️ Сделок мало для выводов. Попробуй PB_DAYS=60 или PB_NO_BTC=1")
+        B.send_blocks(L)
+        print("\n".join(L))
+        return
+
+    def coin(sel):
         out = []
-        for sym, t_sig, side, px, stop, ma, seg, tail, liq, med, oi_d in events:
-            if mult is not None and med > 0 and liq < mult * med:
-                continue
-            if move_min is not None and ma < move_min:
-                continue
-            sd = rng.choice(("long", "short")) if coin else side
+        for t in sel:
+            sd = rng.choice(("long", "short"))
             is_l = sd == "long"
-            st = stop if sd == side else (px * (1 - MAX_STOP / 100) if is_l
-                                          else px * (1 + MAX_STOP / 100))
+            px = t["px"]
+            b = t["bnd"] if sd == t["side"] else (px * (1 + DIST / 100) if is_l
+                                                 else px * (1 - DIST / 100))
             ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
-            tps = ([px * (1 + ma * k / 100) for k in TP_K] if is_l
-                   else [px * (1 - ma * k / 100) for k in TP_K])
-            r = _sim(seg, is_l, ent, st, tps)
+            stp = px * (1 - STOP / 100) if is_l else px * (1 + STOP / 100)
+            y1 = px * (1 + TP1 / 100) if is_l else px * (1 - TP1 / 100)
+            y3 = px * (1 + TP3 / 100) if is_l else px * (1 - TP3 / 100)
+            r = _sim(t["seg"], sd, ent, stp, y1, b, y3)
             if r is not None:
                 out.append(r)
         return out
 
-    # чистое движение после каскада — без стопов и целей
-    L.append("<b>1. ЕСТЬ ЛИ ОТКАТ ВООБЩЕ</b> (без стопов и целей)")
-    L.append("  <i>средний ход в сторону отката через N часов, % от входа</i>")
-    for hh, nb in ((1, 12), (2, 24), (4, 48)):
+    allR = [t["R"] for t in trades]
+    L.append("<b>1. ВСЕ СДЕЛКИ</b>")
+    L.append(_line(allR, "полный детектор", coin(trades)))
+    L.append("")
+
+    L.append("<b>2. ПО СИЛЕ ЗАРЯДА</b> (теперь сила настоящая, с очками за OI)")
+    for lo, hi in ((4, 5), (6, 7), (8, 9), (10, 99)):
+        sel = [t for t in trades if lo <= t["score"] <= hi]
+        if len(sel) >= 25:
+            lbl = f"сила {lo}-{hi}" if hi < 99 else f"сила ≥{lo}"
+            L.append(_line([t["R"] for t in sel], lbl, coin(sel)))
+    L.append("")
+
+    L.append("<b>3. ЧТО ДАЁТ ОТКРЫТЫЙ ИНТЕРЕС</b>")
+    L.append("  <i>главный вопрос прогона: очки за OI были слепой зоной прежних тестов</i>")
+    for lbl, cond in (("OI падает (≤-2%)", lambda o: o is not None and o <= -2),
+                      ("OI стоит (-2…+1%)", lambda o: o is not None and -2 < o < 1),
+                      ("OI растёт (+1…+4%)", lambda o: o is not None and 1 <= o < 4),
+                      ("OI сильно растёт (≥+4%)", lambda o: o is not None and o >= 4)):
+        sel = [t for t in trades if cond(t["oi"])]
+        if len(sel) >= 20:
+            L.append(_line([t["R"] for t in sel], lbl, coin(sel)))
+    L.append("")
+
+    L.append("<b>4. ТЕЙКЕРЫ И ФАНДИНГ</b>")
+    for lbl, cond in (("тейкеры продают (L/S ≤0.9)", lambda t: t["taker"] is not None and t["taker"] <= 0.9),
+                      ("тейкеры нейтральны", lambda t: t["taker"] is not None and 0.9 < t["taker"] < 1.1),
+                      ("тейкеры покупают (L/S ≥1.1)", lambda t: t["taker"] is not None and t["taker"] >= 1.1)):
+        sel = [t for t in trades if cond(t)]
+        if len(sel) >= 20:
+            L.append(_line([t["R"] for t in sel], lbl, coin(sel)))
+    for lbl, cond in (("фандинг отрицательный", lambda t: t["fund"] < -0.005),
+                      ("фандинг положительный", lambda t: t["fund"] > 0.01)):
+        sel = [t for t in trades if cond(t)]
+        if len(sel) >= 20:
+            L.append(_line([t["R"] for t in sel], lbl, coin(sel)))
+    L.append("")
+
+    L.append("<b>5. ЧИСТОЕ ДВИЖЕНИЕ</b> (без стопов и целей)")
+    for hh, nb in ((1, 4), (2, 8), (4, 16), (12, 48)):
         mv = []
-        for sym, t_sig, side, px, stop, ma, seg, tail, liq, med, oi_d in events:
-            if len(tail) <= nb or px <= 0:
+        for t in trades:
+            seg = t["seg"]
+            if len(seg) <= nb or t["px"] <= 0:
                 continue
-            m = (tail[nb]["c"] - px) / px * 100
-            mv.append(m if side == "long" else -m)
-        if len(mv) < 20:
+            m = (seg[nb]["c"] - t["px"]) / t["px"] * 100
+            mv.append(m if t["side"] == "long" else -m)
+        if len(mv) < 30:
             continue
         n = len(mv)
         avg = sum(mv) / n
         se = statistics.pstdev(mv) / (n ** 0.5) if n > 1 else 0
         mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
-        L.append(f"  {mark} через {hh}ч: {n:4} соб., <b>{avg:+.3f}%</b> (±{1.96 * se:.3f}), "
+        L.append(f"  {mark} через {hh:2}ч: {avg:+.3f}% (±{1.96 * se:.3f}), "
                  f"в плюс {sum(1 for x in mv if x > 0) / n * 100:.0f}%")
-    L.append("")
 
-    L.append("<b>2. СДЕЛКИ</b> (цели — доли каскадного хода, стоп за экстремумом)")
-    L.append(_line(run(), "все события", run(coin=True)))
-    for m in (8, 12, 20):
-        rs = run(mult=m)
-        if len(rs) >= 20:
-            L.append(_line(rs, f"ликвидации ≥{m}× медианы", run(coin=True, mult=m)))
-    for mv_ in (3.5, 5.0):
-        rs = run(move_min=mv_)
-        if len(rs) >= 20:
-            L.append(_line(rs, f"каскадный ход ≥{mv_}%", run(coin=True, move_min=mv_)))
-    L.append("")
-    L.append("<i>критерий: матожидание ≥ +0.15R, значимо, и эдж над монеткой "
-             "заметно больше нуля</i>")
-    return L
-
-
-def run():
-    depth, fields, L = probe()
-    # Разведку шлём СРАЗУ, не дожидаясь бэктеста: ответ на главный вопрос (есть ли
-    # история) уже получен, а бэктест на многих парах — это тысячи запросов и минуты.
-    _send(L)
-
-    out = []
-    if PROBE_ONLY:
-        out.append("ℹ️ FL_PROBE_ONLY=1 — бэктест пропущен")
-    elif depth < 3:
-        out.append("→ Истории нет, бэктест невозможен. Остаётся форвард: "
-                   "flush_hunter копит сигналы в реальном времени")
-    else:
-        n_pairs = PAIRS_N or len(B.UPSCALE_PAIRS)
-        print(f"[FLUSH] история {depth} дн → бэктест на {min(DAYS, depth)} дн, {n_pairs} пар")
-        try:
-            out = backtest(depth)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            out = [f"⚠️ Бэктест упал: {e}"]
-    _send(out)
-
-
-def _send(lines):
-    if not lines:
-        return
-    msg = "\n".join(lines)
+    msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     try:
         B.send_blocks(msg.split("\n"))
     except Exception as e:
-        print(f"[FLUSH] отправка не удалась: {e}")
+        print(f"[FULL] отправка не удалась: {e}")
 
 
 def main():
@@ -405,7 +437,7 @@ def main():
         import traceback
         traceback.print_exc()
         try:
-            B.send_telegram(f"⚠️ FLUSH упал: {e}")
+            B.send_telegram(f"⚠️ Прогон на полных данных упал: {e}")
         except Exception:
             pass
 
