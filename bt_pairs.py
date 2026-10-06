@@ -36,8 +36,11 @@ import statistics
 import bot as B
 
 PROBE_ONLY = os.environ.get("FL_PROBE_ONLY", "0") == "1"
-DAYS       = int(os.environ.get("FL_DAYS", "30"))
-PAIRS_N    = int(os.environ.get("FL_PAIRS", "0"))
+DAYS       = int(os.environ.get("FL_DAYS", "14"))
+# contract_stats отдаёт по 100 строк = 8 часов пятиминуток. На 30 дней это ~90
+# запросов НА ПАРУ, на 103 парах — тысячи запросов и часы ожидания. Поэтому по
+# умолчанию берём 40 пар и 14 дней; расширять через FL_PAIRS=0 и FL_DAYS осознанно.
+PAIRS_N    = int(os.environ.get("FL_PAIRS", "40"))
 LIQ_MULT   = float(os.environ.get("FL_MULT", "5"))
 LIQ_MIN    = float(os.environ.get("FL_MIN_USD", "3000"))
 OI_DROP    = float(os.environ.get("FL_OI_DROP", "0.8"))
@@ -291,7 +294,7 @@ def backtest(depth):
             events.append((sym, t_sig, side, px, stop, ma,
                            fine[k:k + hold], fine[k:k + 49], liq_usd, med, oi_d))
             last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
-        if i % 20 == 0:
+        if i % 5 == 0:
             print(f"[FLUSH] {i}/{len(pairs)} | пар с данными {n_pairs} | "
                   f"событий {len(events)} | {time.time() - t0:.0f}с")
 
@@ -362,21 +365,32 @@ def backtest(depth):
 
 def run():
     depth, fields, L = probe()
-    if PROBE_ONLY or depth < 3:
-        if depth < 3:
-            L.append("")
-            L.append("→ Истории нет, бэктест невозможен. Остаётся форвард: "
-                     "flush_hunter копит сигналы в реальном времени")
+    # Разведку шлём СРАЗУ, не дожидаясь бэктеста: ответ на главный вопрос (есть ли
+    # история) уже получен, а бэктест на многих парах — это тысячи запросов и минуты.
+    _send(L)
+
+    out = []
+    if PROBE_ONLY:
+        out.append("ℹ️ FL_PROBE_ONLY=1 — бэктест пропущен")
+    elif depth < 3:
+        out.append("→ Истории нет, бэктест невозможен. Остаётся форвард: "
+                   "flush_hunter копит сигналы в реальном времени")
     else:
-        L.append("")
-        L.append(f"→ История есть, запускаю бэктест на {min(DAYS, depth)} днях")
+        n_pairs = PAIRS_N or len(B.UPSCALE_PAIRS)
+        print(f"[FLUSH] история {depth} дн → бэктест на {min(DAYS, depth)} дн, {n_pairs} пар")
         try:
-            L += backtest(depth)
+            out = backtest(depth)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            L.append(f"⚠️ Бэктест упал: {e}")
-    msg = "\n".join(L)
+            out = [f"⚠️ Бэктест упал: {e}"]
+    _send(out)
+
+
+def _send(lines):
+    if not lines:
+        return
+    msg = "\n".join(lines)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     try:
         B.send_blocks(msg.split("\n"))
