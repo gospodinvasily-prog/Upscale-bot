@@ -1,92 +1,88 @@
 """
-bt_magnet.py — КАРТА ЛИКВИДАЦИЙ: работает ли «магнит».
+bt_pairs.py — RANGE IGNITION v1.2 (после аудита): интрадей-расширение волатильности BTC/ETH.
 
-Идея: на графике есть уровни, где стоят чужие ликвидации. Цена тянется к крупному
-скоплению, а у самого уровня идёт быстрый ход. Входим ДО того, как цена туда пришла,
-и забираем тейк чуть раньше уровня — чтобы не опаздывать, как при импульсе.
+Запуск: RUN_BACKTEST=pairs   (бот менять не нужно)
 
-ЧТО ЭТО ЗА КАРТА. Gate не отдаёт карту ликвидаций. Её строят расчётом — так же, как
-Coinglass: из открытого интереса, цены и модели плеч. Здесь модель такая:
-  1. Прирост OI на баре = новые позиции, вошедшие по цене этого бара.
-  2. Позиция делится пополам на лонг и шорт и раскладывается по плечам
-     (5x, 10x, 25x, 50x, 100x с весами). Для каждого плеча считается цена ликвидации.
-  3. Уровень, который цена уже прошла, ВЫЧЁРКИВАЕТСЯ — позиции ликвидированы.
-  4. Падение OI уменьшает все веса пропорционально, плюс постепенное затухание
-     старых позиций (период полураспада PM_HALF_LIFE_D дней).
-  5. Веса складываются по ценовым корзинам — получаются скопления выше и ниже цены.
+ЛОГИКА. Рынок сжался (диапазон последних 6ч узкий) → закрытие 15м свечи за границу
+диапазона + буфер, объём ≥ K × медианы суток → вход по ОТКРЫТИЮ следующей свечи по ходу
+пробоя → TP1 1R (50%), TP2 2R (50%), после TP1 стоп в безубыток → всё закрывается не позже
+ближайших 22:00 МСК и не позже чем через 8ч. Окно сигналов 14:00–21:30 МСК.
 
-ВАЖНО: это МОДЕЛЬ. Распределение плеч, доля лонгов/шортов и момент закрытия позиций
-неизвестны и нигде не проверяются. Поэтому сначала проверяем САМ ЭФФЕКТ на истории
-(она есть на ~60 дней): карта на момент T строится ТОЛЬКО по данным до T.
+ЧТО ИСПРАВЛЕНО ПРИ АУДИТЕ v1.1 (до запуска, до цифр):
+ 1. КОНТРОЛЬ «МОНЕТКА» БЫЛ СЛОМАН. Он разворачивал направление, но оставлял стоп основной
+    сделки. У шорта стоп оказывался НИЖЕ входа и «выбивался» на первой же свече как +0.9R.
+    На стоящем рынке контроль давал +0.74R. Теперь у каждой стороны стоп на своей стороне.
+ 2. СЖАТИЕ «6ч ≤ 2×ATR15» ПОЧТИ НЕ БЫВАЕТ: диапазон 6ч у BTC в норме 4–6 ATR15, условие
+    выполняется в ~0.07% баров, сделок не набралось бы вообще. Теперь по умолчанию сжатие =
+    диапазон 6ч в нижних IG_SQ_PCT % за последние 7 суток. Прежнее определение осталось
+    (IG_SQ_MODE=atr).
+ 3. ГЛУБИНА ИСТОРИИ. 15м свечи Gate доступны ~100 дней, а не 540. Если у Gate меньше
+    IG_MIN_DAYS, берутся публичные свечи Binance (BTC и ETH на разных биржах движутся
+    практически одинаково). Источник и охват печатаются в отчёте.
+ 4. ВХОД по открытию следующей свечи (в v1.1 — по закрытию сигнальной).
+ 5. ДОВЕРИТЕЛЬНЫЕ ИНТЕРВАЛЫ ПО ДНЯМ. Сделки одного дня делят рынок и перекрываются по времени
+    удержания (до 8ч при паузе 2ч), поэтому обычный интервал был бы слишком узким.
+ 6. КРИТЕРИЙ ① ПО ОБЪЕДИНЁННОЙ ВЫБОРКЕ BTC+ETH: по одному инструменту n≥300 недостижимо.
 
-ЧТО МЕРИМ (главное — первое):
-  1. ПЕРВЫЙ КАСАНИЕ. Берём скопление на расстоянии d%. Рядом — зеркальный уровень на
-     том же расстоянии в ДРУГУЮ сторону. Какой уровень цена достигла первым?
-     Если притяжения нет — 50/50. Это контроль на дрейф рынка.
-  2. ДОЗА-ЭФФЕКТ. Сильнее скопление — чаще ли цена идёт к нему? Если нет зависимости
-     от силы, то и эффекта «карты» нет.
-  3. СДЕЛКИ. Вход к скоплению, тейк чуть раньше уровня, стоп фиксированный.
-     Рядом монетка с теми же дистанциями.
+КОНТРОЛИ (каждый отвечает на свой вопрос):
+  NOVOL  — те же сжатие и пробой, но слабый объём: даёт ли объём что-то?
+  NOSQ   — пробой с объёмом, но БЕЗ сжатия: даёт ли что-то сжатие? (в v1.1 контроля не было)
+  OUTWIN — те же пробои вне окна 14:00–21:30: даёт ли что-то сессия?
+  COIN   — случайное направление на тех же входах; ANTI — против пробоя (фейд).
+  Половины периода по порядку сделок + худший месяц.
 
-Тайминг честный: карта по закрытым часовым барам, вход по открытию следующей 15м свечи.
-Строки статистики берутся с лагом в один бар — чтобы не заглянуть вперёд при любой
-трактовке поля time.
-
-Настройки (переменные Render, все необязательные):
-  PM_DAYS (65)  PM_WARM_D (12)  PM_PAIRS (0=все)  PM_SAMPLE_H (12)  PM_HORIZON_H (12)
-  PM_MIN_D (1.0)  PM_MAX_D (6.0)  PM_BUCKET (0.25)  PM_HALF_LIFE_D (3)  PM_MMR (0.5)
-  PM_LEV ("5:0.15,10:0.30,25:0.30,50:0.15,100:0.10")  PM_STOP (1.0)  PM_BUF (0.15)
+КРИТЕРИИ (фиксированы до прогона): ① MAIN ≥ +0.08R значимо при n ≥ IG_N_MIN (300);
+② MAIN ≥ NOVOL + 0.05R; ③ MAIN не хуже OUTWIN; ④ обе половины в плюсе;
+⑤ знак держится при IG_OFFSET=180. ①+② обязательны.
 """
 import os
-import math
 import time
 import random
+import traceback
 import statistics
+from datetime import datetime, timezone, timedelta
+
+import requests
 
 import bot as B
 
-DAYS      = int(os.environ.get("PM_DAYS", "65"))
-WARM_D    = int(os.environ.get("PM_WARM_D", "12"))
-PAIRS_N   = int(os.environ.get("PM_PAIRS", "0"))
-SAMPLE_H  = int(os.environ.get("PM_SAMPLE_H", "12"))   # = горизонт: наблюдения не перекрываются
-HORIZON_H = int(os.environ.get("PM_HORIZON_H", "12"))
-MIN_D     = float(os.environ.get("PM_MIN_D", "1.0"))
-MAX_D     = float(os.environ.get("PM_MAX_D", "6.0"))
-BW        = float(os.environ.get("PM_BUCKET", "0.25")) / 100
-HL_D      = float(os.environ.get("PM_HALF_LIFE_D", "3"))
-MMR       = float(os.environ.get("PM_MMR", "0.5")) / 100
-STOP_PCT  = float(os.environ.get("PM_STOP", "1.0"))
-BUF_PCT   = float(os.environ.get("PM_BUF", "0.15"))
-SLIP      = float(os.environ.get("PM_SLIP", "0.10"))
-COST      = float(os.environ.get("PM_COST", "0.065"))
-STOP_SLIP = float(os.environ.get("PM_STOP_SLIP", "0.05"))
-
-
-def _parse_lev(s):
-    out = []
-    for part in s.split(","):
-        part = part.strip()
-        if ":" in part:
-            a, b = part.split(":")
-            out.append((float(a), float(b)))
-    tot = sum(w for _, w in out) or 1.0
-    return [(l, w / tot) for l, w in out]
-
-
-LEV = _parse_lev(os.environ.get("PM_LEV", "5:0.15,10:0.30,25:0.30,50:0.15,100:0.10"))
-LOGBW = math.log(1 + BW)
+DAYS       = int(os.environ.get("IG_DAYS", "540"))
+OFFSET     = int(os.environ.get("IG_OFFSET", "0"))
+PAIRS      = [s.strip().upper() for s in os.environ.get("IG_PAIRS", "BTC,ETH").split(",") if s.strip()]
+SOURCE     = os.environ.get("IG_SOURCE", "auto").lower()          # auto | gate | binance
+MIN_DAYS   = int(os.environ.get("IG_MIN_DAYS", "150"))            # меньше — пробуем Binance
+SQ_H       = int(os.environ.get("IG_SQ_H", "6"))
+SQ_MODE    = os.environ.get("IG_SQ_MODE", "pct").lower()          # pct | atr
+SQ_PCT     = float(os.environ.get("IG_SQ_PCT", "25"))             # сжатие: нижние N% диапазонов за 7 суток
+SQ_K       = float(os.environ.get("IG_SQ_K", "2.0"))              # для режима atr
+VOL_K      = float(os.environ.get("IG_VOL_K", "2.0"))
+BUF_K      = float(os.environ.get("IG_BUF_K", "0.10"))
+STOP_MIN   = float(os.environ.get("IG_STOP_MIN", "0.5"))
+STOP_ATR   = float(os.environ.get("IG_STOP_ATR", "1.2"))
+TP1R, TP2R = 1.0, 2.0
+FEE        = float(os.environ.get("IG_FEE", "0.05"))
+SLIP       = float(os.environ.get("IG_SLIP", "0.03"))
+STOP_SLIP  = float(os.environ.get("IG_STOP_SLIP", "0.03"))
+MAX_HOLD_H = float(os.environ.get("IG_MAX_HOLD_H", "8"))
+SKIP_BARS  = int(os.environ.get("IG_SKIP_BARS", "8"))
+N_MIN      = int(os.environ.get("IG_N_MIN", "300"))
+MIN_BARS_PATH = 4                                                 # меньше часа до выхода — не считаем
+WIN        = (14 * 60, 21 * 60 + 30)
+EOD_HOUR   = 22
+MSK, SEC   = timezone(timedelta(hours=3)), 900
+SQ_BARS    = SQ_H * 4
+TRAIL      = 7 * 96                                               # окно для процентиля сжатия
+BINANCE    = "https://data-api.binance.vision/api/v3/klines"
 
 
 # ═════════════ данные ═════════════
 
-def _fetch_candles(sym, tf, days):
-    sec = {"15m": 900, "1h": 3600}[tf]
-    now = int(time.time())
+def fetch_gate(sym, days, offset):
+    now = int(time.time()) - offset * 86400
     out, cur, probes = [], now - days * 86400, 0
     while cur < now:
-        to = min(now, cur + 1900 * sec)
-        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": tf,
-                                         "from": cur, "to": to})
+        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "15m",
+                                         "from": cur, "to": min(now, cur + 1900 * SEC)})
         part = B.parse_candles(raw) if raw else []
         if not part:
             probes += 1
@@ -95,413 +91,389 @@ def _fetch_candles(sym, tf, days):
             cur += 5 * 86400
             continue
         out.extend(part)
-        nxt = part[-1].get("t", 0) + sec
+        nxt = part[-1].get("t", 0) + SEC
         if nxt <= cur:
             break
         cur = nxt
-    seen, uniq = set(), []
-    for c in sorted(out, key=lambda x: x.get("t", 0)):
-        if c.get("t") not in seen:
-            seen.add(c.get("t"))
-            uniq.append(c)
-    return uniq
+    return _dedupe(out)
 
 
-def _fetch_oi(sym, days):
-    """Открытый интерес по часам: {начало_часа: OI}. Берём контракты, если они есть,
-    иначе доллары — главное, чтобы ряд был один и тот же."""
-    now = int(time.time())
-    out, cur, probes = [], now - days * 86400, 0
-    while cur < now:
-        to = min(now, cur + 100 * 3600)
-        raw = B.api_get("contract_stats", {"contract": f"{sym}_USDT", "interval": "1h",
-                                           "from": cur, "to": to, "limit": 100})
-        rows = raw if isinstance(raw, list) else []
+def fetch_binance(sym, days, offset, get=None):
+    """Публичные свечи Binance (спот): пагинация по startTime, до 1000 свечей за запрос.
+    Объём берётся как есть: нужны только ОТНОШЕНИЯ внутри одного ряда, единицы не важны."""
+    get = get or requests.get
+    now_ms = (int(time.time()) - offset * 86400) * 1000
+    start = now_ms - days * 86400 * 1000
+    out, note = [], ""
+    while start < now_ms:
+        try:
+            r = get(BINANCE, params={"symbol": f"{sym}USDT", "interval": "15m",
+                                     "startTime": start, "endTime": now_ms, "limit": 1000},
+                    timeout=15)
+        except Exception as e:
+            note = f"Binance недоступен: {e}"
+            break
+        if r.status_code != 200:
+            note = f"Binance ответил {r.status_code}"
+            break
+        rows = r.json()
         if not rows:
-            probes += 1
-            if probes > 20:
-                break
-            cur += 5 * 86400
-            continue
-        out.extend(rows)
-        nxt = max(int(B.fnum(r.get("time", 0))) for r in rows) + 3600
-        if nxt <= cur:
             break
-        cur = nxt
-    use_contracts = out and all(B.fnum(r.get("open_interest", 0)) > 0 for r in out)
-    res = {}
-    for r in out:
-        t = int(B.fnum(r.get("time", 0)))
-        if t <= 0:
+        for k in rows:
+            try:
+                out.append({"t": int(k[0]) // 1000, "o": float(k[1]), "h": float(k[2]),
+                            "l": float(k[3]), "c": float(k[4]), "v": float(k[5])})
+            except (TypeError, ValueError, IndexError):
+                continue
+        nxt = int(rows[-1][0]) + SEC * 1000
+        if nxt <= start:
+            break
+        start = nxt
+        time.sleep(0.05)
+    return _dedupe(out), note
+
+
+def _dedupe(rows):
+    seen, u = set(), []
+    for c in sorted(rows, key=lambda x: x.get("t", 0)):
+        if c.get("t") not in seen:
+            seen.add(c["t"])
+            u.append(c)
+    return u
+
+
+def fetch(sym):
+    """Возвращает (свечи, источник, примечание). Последняя (незакрытая) свеча отбрасывается."""
+    notes = []
+    gate = []
+    if SOURCE in ("auto", "gate"):
+        gate = fetch_gate(sym, DAYS, OFFSET)
+    cov = (gate[-1]["t"] - gate[0]["t"]) / 86400 if len(gate) > 1 else 0.0
+    if SOURCE == "gate" or (SOURCE == "auto" and cov >= MIN_DAYS):
+        return gate[:-1], "Gate", ""
+    if SOURCE == "auto":
+        notes.append(f"у Gate только {cov:.0f} дн 15м-свечей")
+    bn, note = fetch_binance(sym, DAYS, OFFSET)
+    if note:
+        notes.append(note)
+    bcov = (bn[-1]["t"] - bn[0]["t"]) / 86400 if len(bn) > 1 else 0.0
+    if bcov > cov:
+        return bn[:-1], "Binance (спот)", "; ".join(notes)
+    return gate[:-1], "Gate", "; ".join(notes + ["Binance не дал больше данных"])
+
+
+# ═════════════ сделка ═════════════
+
+def sim(fut, is_long, ent, stp):
+    """TP1/TP2 по половине, после TP1 стоп в безубыток. В спорной свече — стоп."""
+    risk = abs(ent - stp)
+    if risk <= 0 or not fut:
+        return None
+    t1 = ent + (risk * TP1R if is_long else -risk * TP1R)
+    t2 = ent + (risk * TP2R if is_long else -risk * TP2R)
+    fee, acc, done, cs = FEE / 100 * ent / risk, 0.0, 0, stp
+    for b in fut:
+        if (b["l"] <= cs) if is_long else (b["h"] >= cs):
+            px = cs * (1 - STOP_SLIP / 100) if is_long else cs * (1 + STOP_SLIP / 100)
+            r = (px - ent) / risk if is_long else (ent - px) / risk
+            left = 1.0 if done == 0 else 0.5
+            return acc + r * left - fee - FEE / 100 * px * left / risk
+        while done < 2:
+            t = t1 if done == 0 else t2
+            if (b["h"] >= t) if is_long else (b["l"] <= t):
+                acc += 0.5 * (abs(t - ent) / risk)
+                fee += FEE / 100 * t * 0.5 / risk
+                done += 1
+                if done == 1:
+                    cs = ent
+            else:
+                break
+        if done >= 2:
+            return acc - fee
+    last = fut[-1]["c"]
+    r = (last - ent) / risk if is_long else (ent - last) / risk
+    left = 1.0 if done == 0 else 0.5
+    return acc + r * left - fee - FEE / 100 * last * left / risk
+
+
+def trade(fut, px, is_long, stp_pct):
+    """Сделка в заданную сторону от цены px: проскальзывание входа и СТОП НА СВОЕЙ СТОРОНЕ.
+    Одна и та же функция для основной сделки и контролей — иначе контроль нечестный."""
+    ent = px * (1 + SLIP / 100) if is_long else px * (1 - SLIP / 100)
+    stp = ent * (1 - stp_pct / 100) if is_long else ent * (1 + stp_pct / 100)
+    return sim(fut, is_long, ent, stp)
+
+
+# ═════════════ сигналы ═════════════
+
+def next_eod_ts(close_ts):
+    dt = datetime.fromtimestamp(close_ts, MSK)
+    eod = dt.replace(hour=EOD_HOUR, minute=0, second=0, microsecond=0)
+    if eod <= dt:
+        eod += timedelta(days=1)
+    return eod.timestamp()
+
+
+def find_events(c):
+    """Все пробои, прошедшие проверки, разложенные по категориям. Только данные ДО сигнала:
+    сигнальная свеча закрыта, вход по открытию следующей."""
+    n = len(c)
+    if n < TRAIL + SQ_BARS + 200:
+        return [], {}
+    # диапазон 6ч «до» каждого бара: считается только по предыдущим барам
+    rng = [None] * n
+    for j in range(SQ_BARS, n):
+        w = c[j - SQ_BARS:j]
+        rng[j] = (max(x["h"] for x in w) - min(x["l"] for x in w)) / c[j - 1]["c"] * 100
+    gaps = [0] * n
+    for j in range(1, n):
+        gaps[j] = gaps[j - 1] + (1 if c[j]["t"] - c[j - 1]["t"] != SEC else 0)
+
+    funnel = {"bars": 0, "breakouts": 0, "squeezed": 0, "squeezed_atr": 0, "vol_ok": 0,
+              "in_window": 0}
+    events = []
+    last_i = {}
+    start = TRAIL + SQ_BARS
+    for i in range(start, n - MIN_BARS_PATH - 2):
+        if gaps[i + 1] - gaps[i - 100] > 0:
+            continue                                  # дыра в данных рядом
+        funnel["bars"] += 1
+        sig = c[i]
+        atr = B.trimmed_mean(B.true_ranges(c[i - 1 - 96:i]))
+        if not atr or atr <= 0:
             continue
-        v = B.fnum(r.get("open_interest", 0)) if use_contracts else \
-            B.fnum(r.get("open_interest_usd", 0))
-        if v > 0:
-            res[t - t % 3600] = v
-    return res
+        atr_pct = atr / sig["c"] * 100
+        win = c[i - SQ_BARS:i]
+        hi, lo = max(x["h"] for x in win), min(x["l"] for x in win)
+        up = sig["c"] > hi * (1 + BUF_K * atr_pct / 100)
+        dn = sig["c"] < lo * (1 - BUF_K * atr_pct / 100)
+        if not (up or dn):
+            continue
+        funnel["breakouts"] += 1
+        r6 = rng[i]
+        sq_atr = r6 <= SQ_K * atr_pct
+        funnel["squeezed_atr"] += 1 if sq_atr else 0
+        if SQ_MODE == "atr":
+            squeezed = sq_atr
+        else:
+            past = sorted(x for x in rng[i - TRAIL:i] if x is not None)
+            squeezed = bool(past) and r6 <= past[int(SQ_PCT / 100 * (len(past) - 1))]
+        funnel["squeezed"] += 1 if squeezed else 0
+        vn = statistics.median([x.get("v", 0) or 0 for x in c[i - 96:i]]) or 0
+        volok = vn > 0 and (sig.get("v", 0) or 0) >= VOL_K * vn
+        funnel["vol_ok"] += 1 if volok else 0
+        close_ts = sig["t"] + SEC
+        dt = datetime.fromtimestamp(close_ts, MSK)
+        mins = dt.hour * 60 + dt.minute
+        inwin = WIN[0] <= mins < WIN[1]
+        funnel["in_window"] += 1 if inwin else 0
+
+        if squeezed and volok and inwin:
+            cat = "main"
+        elif squeezed and not volok and inwin:
+            cat = "novol"
+        elif squeezed and volok and not inwin:
+            cat = "outwin"
+        elif (not squeezed) and volok and inwin:
+            cat = "nosq"
+        else:
+            continue
+        if i - last_i.get(cat, -10 ** 9) < SKIP_BARS:
+            continue                                  # одна волна — один сигнал
+        t_limit = min(next_eod_ts(close_ts), close_ts + MAX_HOLD_H * 3600)
+        j = i + 1
+        while j < n and c[j]["t"] + SEC <= t_limit:
+            j += 1
+        fut = c[i + 1:j]
+        if len(fut) < MIN_BARS_PATH or fut[0]["t"] != sig["t"] + SEC:
+            continue
+        stp_pct = max(STOP_MIN, STOP_ATR * atr_pct)
+        px = fut[0]["o"]                              # вход по ОТКРЫТИЮ следующей свечи
+        r = trade(fut, px, up, stp_pct)
+        if r is None:
+            continue
+        last_i[cat] = i
+        events.append({"cat": cat, "r": r, "up": up, "t": close_ts, "px": px, "fut": fut,
+                       "stp_pct": stp_pct, "day": dt.strftime("%Y-%m-%d"),
+                       "month": dt.strftime("%Y-%m")})
+    return events, funnel
 
 
-# ═════════════ карта ═════════════
-
-def _typical(c):
-    return (c["h"] + c["l"] + c["c"]) / 3
-
-
-def build_clusters(c1h, oi_by_t, first_sample_i):
-    """Идём по часовым барам, ведём карту и в выбранные моменты записываем
-    самое сильное скопление ВЫШЕ и НИЖЕ цены. Карта на бар i использует данные
-    только до бара i включительно, строку OI берём с этим же временем (лаг ≤ 1 бар)."""
-    n = len(c1h)
-    if n < 50:
-        return {}
-    ref = c1h[0]["c"]
-    if ref <= 0:
-        return {}
-
-    def bidx(p):
-        return int(math.floor(math.log(p / ref) / LOGBW))
-
-    def bprice(b):
-        return ref * math.exp((b + 0.5) * LOGBW)
-
-    longs, shorts = {}, {}          # корзина -> вес (ликвидации лонгов / шортов)
-    decay = 0.5 ** (1.0 / (HL_D * 24))
-    prev_oi = None
-    out = {}
-
-    def best(dct, lo_p, hi_p):
-        if not dct:
-            return None
-        b_lo, b_hi = bidx(lo_p), bidx(hi_p)
-        top_w, top_b = 0.0, None
-        for b in range(b_lo, b_hi + 1):
-            w = dct.get(b - 1, 0.0) + dct.get(b, 0.0) + dct.get(b + 1, 0.0)
-            if w > top_w:
-                top_w, top_b = w, b
-        if top_b is None:
-            return None
-        num = den = 0.0
-        for bb in (top_b - 1, top_b, top_b + 1):
-            ww = dct.get(bb, 0.0)
-            num += ww * bprice(bb)
-            den += ww
-        return (num / den, den) if den > 0 else None
-
-    for i in range(n):
-        c = c1h[i]
-        oi = oi_by_t.get(c["t"])
-        d_oi, f_oi = 0.0, 1.0
-        if oi and prev_oi:
-            d_oi = oi - prev_oi
-            if d_oi < 0:
-                f_oi = oi / prev_oi
-        f = decay * f_oi
-        for dct in (longs, shorts):
-            for k in list(dct):
-                w = dct[k] * f
-                if w < 1e-15:
-                    del dct[k]
-                else:
-                    dct[k] = w
-        if d_oi > 0 and i > 0:
-            prev = c1h[i - 1]
-            p = _typical(prev)                # позиции набирались на предыдущем баре
-            # Если этот же бар уже задел уровень — позиция успела ликвидироваться, в карту
-            # её не кладём. Раньше такие позиции попадали в карту и вычёркивались лишь
-            # СЛЕДУЮЩИМ баром, а мёртвые уровни вблизи цены искажали скопления.
-            lo_prev = bidx(prev["l"]) if prev["l"] > 0 else None
-            hi_prev = bidx(prev["h"]) if prev["h"] > 0 else None
-            for lev, wt in LEV:
-                ql = p * (1 - 1 / lev + MMR)
-                qs = p * (1 + 1 / lev - MMR)
-                if ql > 0:
-                    b = bidx(ql)
-                    if lo_prev is None or b < lo_prev:
-                        longs[b] = longs.get(b, 0.0) + d_oi * 0.5 * wt
-                if qs > 0:
-                    b = bidx(qs)
-                    if hi_prev is None or b > hi_prev:
-                        shorts[b] = shorts.get(b, 0.0) + d_oi * 0.5 * wt
-        # уровни, которые цена прошла на этом баре, вычёркиваем: позиции ликвидированы
-        if c["l"] > 0 and c["h"] > 0:
-            lo_b, hi_b = bidx(c["l"]), bidx(c["h"])
-            for k in [k for k in longs if k >= lo_b]:
-                del longs[k]
-            for k in [k for k in shorts if k <= hi_b]:
-                del shorts[k]
-        if oi:
-            prev_oi = oi
-        if i >= first_sample_i and (c["t"] // 3600) % SAMPLE_H == 0 and prev_oi:
-            P = c["c"]
-            up = best(shorts, P * (1 + MIN_D / 100), P * (1 + MAX_D / 100))
-            dn = best(longs, P * (1 - MAX_D / 100), P * (1 - MIN_D / 100))
-            out[i] = {"up": up, "dn": dn, "oi": prev_oi, "P": P}
-    return out
+def add_controls(events, rng):
+    """COIN (случайное направление) и ANTI (против пробоя) на тех же входах MAIN."""
+    for e in events:
+        if e["cat"] != "main":
+            continue
+        e["r_anti"] = trade(e["fut"], e["px"], not e["up"], e["stp_pct"])
+        e["r_coin"] = trade(e["fut"], e["px"], rng.random() < 0.5, e["stp_pct"])
 
 
-# ═════════════ сделка и касания ═════════════
+# ═════════════ статистика ═════════════
 
-def sim_single(path, is_long, entry, stop, tp):
-    risk = abs(entry - stop)
-    if risk <= 0:
+def cluster_ci(rs, days):
+    """(n, среднее, полуширина 95%-интервала). Сделки одного дня — один кластер:
+    они делят рынок и перекрываются по времени."""
+    n = len(rs)
+    if n == 0:
         return None
-    cost = COST / 100 * entry / risk
-    for c in path:
-        if (c["l"] <= stop) if is_long else (c["h"] >= stop):       # в спорной свече — стоп
-            fill = stop * (1 - STOP_SLIP / 100) if is_long else stop * (1 + STOP_SLIP / 100)
-            r = (fill - entry) / risk if is_long else (entry - fill) / risk
-            return r - cost
-        if (c["h"] >= tp) if is_long else (c["l"] <= tp):
-            r = (tp - entry) / risk if is_long else (entry - tp) / risk
-            return r - cost
-    last = path[-1]["c"] if path else entry
-    r = (last - entry) / risk if is_long else (entry - last) / risk
-    return r - cost
-
-
-def touch_result(direction, P, d_pct, path):
-    """Какой уровень цена достигла первым: к скоплению или зеркальный на том же расстоянии.
-    Возвращает (первый, достигнут_к_скоплению, достигнут_зеркальный)."""
-    if direction == "up":
-        lt, lo = P * (1 + d_pct / 100), P * (1 - d_pct / 100)
-    else:
-        lt, lo = P * (1 - d_pct / 100), P * (1 + d_pct / 100)
-    hit_t = hit_o = False
-    first = None
-    for c in path:
-        ht = (c["h"] >= lt) if direction == "up" else (c["l"] <= lt)
-        ho = (c["l"] <= lo) if direction == "up" else (c["h"] >= lo)
-        if first is None and (ht or ho):
-            first = "both" if (ht and ho) else ("toward" if ht else "opp")
-        hit_t = hit_t or ht
-        hit_o = hit_o or ho
-    return first, hit_t, hit_o
-
-
-def _mean_ci(vals):
-    if not vals:
-        return None
-    n = len(vals)
-    m = sum(vals) / n
-    se = (statistics.pstdev(vals) / (n ** 0.5)) if n > 1 else 0.0
+    m = sum(rs) / n
+    by = {}
+    for r, d in zip(rs, days):
+        by[d] = by.get(d, 0.0) + (r - m)
+    se = (sum(v * v for v in by.values())) ** 0.5 / n
     return n, m, 1.96 * se
 
 
-Z99 = 2.58      # отметки ✅/❌ ставятся по 99%-интервалу: подгрупп много, при 95% часть
-                # отметок возникает случайно (на случайном блуждании так и вышло)
+def _line(evs, label, key="r"):
+    vals = [(e[key], e["day"]) for e in evs if e.get(key) is not None]
+    if not vals:
+        return f"  {label}: сделок нет"
+    rs, days = [v for v, _ in vals], [d for _, d in vals]
+    n, m, ci = cluster_ci(rs, days)
+    wr = sum(1 for x in rs if x > 0) / n * 100
+    mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
+    return f"  {mark} {label}: {n:4} сд, ВР {wr:3.0f}%, <b>{m:+.3f}R</b> (±{ci:.3f}), {sum(rs):+.0f}R"
 
 
-def share_stats(obs):
-    """(наблюдений, доля «первым к скоплению», полуширина интервала ПО ВРЕМЕНИ).
-    Интервал по времени честнее: наблюдения одного момента связаны через общий рынок."""
-    dec = [o for o in obs if o["first"] in ("toward", "opp")]
-    if len(dec) < 30:
-        return None
-    by_t = {}
-    for o in dec:
-        by_t.setdefault(o["T"], []).append(1.0 if o["first"] == "toward" else 0.0)
-    tm = [sum(v) / len(v) for v in by_t.values()]
-    ci = Z99 * statistics.pstdev(tm) / (len(tm) ** 0.5) if len(tm) > 1 else 0.0
-    p = sum(1 for o in dec if o["first"] == "toward") / len(dec)
-    return len(dec), p, ci
+def _stat(evs, key="r"):
+    vals = [(e[key], e["day"]) for e in evs if e.get(key) is not None]
+    return cluster_ci([v for v, _ in vals], [d for _, d in vals]) if vals else None
 
 
-def _share_line(label, obs):
-    st = share_stats(obs)
-    if not st:
-        return f"  {label}: мало наблюдений"
-    n, p, ci = st
-    rt = sum(1 for o in obs if o["hit_t"]) / len(obs) * 100
-    ro = sum(1 for o in obs if o["hit_o"]) / len(obs) * 100
-    mark = "✅" if p - ci > 0.5 else "❌" if p + ci < 0.5 else "  "
-    return (f"  {mark} {label}: {n:5} набл., первым к скоплению <b>{p * 100:.1f}%</b> "
-            f"(±{ci * 100:.1f}) | достигнут: скопление {rt:.0f}% / зеркало {ro:.0f}%")
+def evaluate_criteria(ev):
+    """Критерии ①–④ по объединённой выборке.
+    ① различает ТРИ исхода: эффект есть / эффекта нет / сделок мало для вывода.
+    Возвращает (строки, статус① 'ok'|'no'|'few', ②)."""
+    main = [e for e in ev if e["cat"] == "main"]
+    novol = [e for e in ev if e["cat"] == "novol"]
+    outw = [e for e in ev if e["cat"] == "outwin"]
+    sm, sn, so = _stat(main), _stat(novol), _stat(outw)
+    if not sm:
+        st1 = "few"
+    elif sm[0] < N_MIN:
+        st1 = "few"
+    else:
+        st1 = "ok" if sm[1] - sm[2] > 0.08 else "no"
+    ok2 = bool(sm and sn and sm[1] - sn[1] >= 0.05)
+    ok3 = bool(sm and (not so or sm[1] >= so[1]))
+    ok4 = False
+    if len(main) >= 20:
+        ms = sorted(main, key=lambda e: e["t"])
+        h = len(ms) // 2
+        a, b = _stat(ms[:h]), _stat(ms[h:])
+        ok4 = bool(a and b and a[1] > 0 and b[1] > 0)
+    mark1 = {"ok": "✅", "no": "❌", "few": "⚠️"}[st1]
+    tail1 = (f" (n={sm[0]}, {sm[1]:+.3f}R, ±{sm[2]:.3f})" if sm else "")
+    if st1 == "few" and sm:
+        tail1 += f" — сделок меньше {N_MIN}, вывод по этому пункту невозможен"
+    rows = [f"  {mark1} ① MAIN ≥ +0.08R значимо при n ≥ {N_MIN}" + tail1,
+            f"  {'✅' if ok2 else '❌'} ② MAIN ≥ NOVOL + 0.05R"
+            + (f" ({sm[1] - sn[1]:+.3f}R)" if sm and sn else ""),
+            f"  {'✅' if ok3 else '❌'} ③ MAIN не хуже OUTWIN"
+            + (f" ({sm[1] - so[1]:+.3f}R)" if sm and so else ""),
+            f"  {'✅' if ok4 else '❌'} ④ обе половины периода в плюсе"]
+    return rows, st1, ok2
 
 
-def verdict(obs, top, low, trades_top):
-    """Три условия сразу — иначе это шум. Возвращает (подтверждено, строки)."""
-    sa, st_, sl = share_stats(obs), share_stats(top), share_stats(low)
-    c1 = bool(sa and sa[1] - sa[2] > 0.5)
-    c2 = bool(st_ and sl and st_[1] > 0.5 and st_[1] - sl[1] >= 0.02)
-    c3 = bool(trades_top and trades_top[1] - trades_top[2] > 0)
-    rows = [f"  {'✅' if c1 else '❌'} 1) общая доля значимо выше 50%"
-            + (f" ({sa[1] * 100:.1f}%, ±{sa[2] * 100:.1f})" if sa else ""),
-            f"  {'✅' if c2 else '❌'} 2) у сильных скоплений доля выше, чем у слабых"
-            + (f" ({st_[1] * 100:.1f}% против {sl[1] * 100:.1f}%)" if st_ and sl else ""),
-            f"  {'✅' if c3 else '❌'} 3) сделки по сильным значимо в плюсе"
-            + (f" ({trades_top[1]:+.3f}R, ±{trades_top[2]:.3f})" if trades_top else "")]
-    return (c1 and c2 and c3), rows
-
-
-# ═════════════ прогон ═════════════
+# ═════════════ отчёт ═════════════
 
 def run():
-    rng = random.Random(4242)
-    pairs = B.UPSCALE_PAIRS[:PAIRS_N] if PAIRS_N else B.UPSCALE_PAIRS
-    hold_bars = HORIZON_H * 4
-    t0 = time.time()
-    obs = []
-    n_pairs = 0
-
-    for i, sym in enumerate(pairs, 1):
-        try:
-            c1h = _fetch_candles(sym, "1h", DAYS)
-            f15 = _fetch_candles(sym, "15m", DAYS)
-            oi = _fetch_oi(sym, DAYS)
-        except Exception:
+    rnd = random.Random(2024)
+    L = [f"🔥 <b>RANGE IGNITION v1.2</b>: {', '.join(PAIRS)}, запрошено {DAYS} дн 15м"
+         + (f"\n⏪ <b>СДВИНУТ НА {OFFSET} ДН</b> — проверка на чужом периоде" if OFFSET else ""),
+         f"<i>сжатие 6ч: "
+         + (f"диапазон в нижних {SQ_PCT:.0f}% за 7 суток" if SQ_MODE == "pct"
+            else f"диапазон ≤ {SQ_K}×ATR15")
+         + f" → пробой +{BUF_K}×ATR, объём ≥{VOL_K}× медианы суток, окно "
+         f"{WIN[0] // 60:02d}:{WIN[0] % 60:02d}–{WIN[1] // 60:02d}:{WIN[1] % 60:02d} МСК</i>",
+         f"<i>вход по открытию следующей свечи | стоп max({STOP_MIN}%, {STOP_ATR}×ATR15) | "
+         f"TP {TP1R}R/{TP2R}R 50/50, безубыток после TP1 | выход не позже 22:00 МСК и +{MAX_HOLD_H:.0f}ч | "
+         f"издержки {(FEE + SLIP) * 2:.2f}% на круг + проскальзывание стопа {STOP_SLIP}%</i>", ""]
+    all_ev = []
+    for sym in PAIRS:
+        c, src, note = fetch(sym)
+        cov = (c[-1]["t"] - c[0]["t"]) / 86400 if len(c) > 1 else 0.0
+        gaps = sum(1 for a, b in zip(c, c[1:]) if b["t"] - a["t"] != SEC)
+        L.append(f"── <b>{sym}</b> ── источник: {src}, охват {cov:.0f} дн, {len(c)} свечей, "
+                 f"пропусков {gaps}" + (f" <i>({note})</i>" if note else ""))
+        ev, fn = find_events(c)
+        if not fn:
+            L.append("  ⚠️ истории слишком мало для расчёта")
+            L.append("")
             continue
-        if len(c1h) < (WARM_D + 8) * 24 or len(f15) < 800 or len(oi) < (WARM_D + 8) * 12:
-            continue
-        c1h, f15 = c1h[:-1], f15[:-1]
-        n_pairs += 1
-        idx15 = {c["t"]: k for k, c in enumerate(f15)}
-        cl = build_clusters(c1h, oi, WARM_D * 24)
-        for bi, m in cl.items():
-            T = c1h[bi]["t"] + 3600
-            k = idx15.get(T)
-            if k is None or k + hold_bars >= len(f15):
-                continue
-            Pe = f15[k]["o"]
-            if Pe <= 0 or m["oi"] <= 0:
-                continue
-            cand = []
-            for side, key in (("up", "up"), ("dn", "dn")):
-                cc = m[key]
-                if not cc:
-                    continue
-                lvl, w = cc
-                d = abs(lvl - Pe) / Pe * 100
-                if MIN_D <= d <= MAX_D:
-                    cand.append({"dir": side, "level": lvl, "d": d, "s": w / m["oi"]})
-            if not cand:
-                continue
-            best_c = max(cand, key=lambda x: x["s"])
-            path = f15[k:k + hold_bars]
-            first, ht, ho = touch_result(best_c["dir"], Pe, best_c["d"], path)
-            obs.append({"sym": sym, "T": T, "dir": best_c["dir"], "d": best_c["d"],
-                        "level": best_c["level"], "s": best_c["s"], "Pe": Pe,
-                        "path": path, "first": first, "hit_t": ht, "hit_o": ho})
-        if i % 10 == 0:
-            print(f"[MAGNET] {i}/{len(pairs)} | пар {n_pairs} | наблюдений {len(obs)} | "
-                  f"{time.time() - t0:.0f}с")
+        add_controls(ev, rnd)
+        for e in ev:
+            e["sym"] = sym
+        all_ev += ev
+        L.append(f"  воронка: баров {fn['bars']} → пробоев {fn['breakouts']} → "
+                 f"со сжатием {fn['squeezed']} → с объёмом {fn['vol_ok']} (среди всех пробоев) "
+                 f"→ в окне {fn['in_window']}")
+        L.append(f"  <i>для справки: прежнее сжатие «≤{SQ_K}×ATR15» выполнено у {fn['squeezed_atr']} "
+                 f"пробоев из {fn['breakouts']}</i>")
+        L.append(_line([e for e in ev if e["cat"] == "main"], "MAIN"))
+        L.append(_line([e for e in ev if e["cat"] == "novol"], "NOVOL (слабый объём)"))
+        L.append(_line([e for e in ev if e["cat"] == "nosq"], "NOSQ  (без сжатия)"))
+        L.append(_line([e for e in ev if e["cat"] == "outwin"], "OUTWIN (вне окна)"))
+        mains = [e for e in ev if e["cat"] == "main"]
+        L.append(_line(mains, "COIN (случайное направление)", "r_coin"))
+        L.append(_line(mains, "ANTI (против пробоя)", "r_anti"))
+        L.append(_line([e for e in mains if e["up"]], "  MAIN лонги"))
+        L.append(_line([e for e in mains if not e["up"]], "  MAIN шорты"))
+        L.append("")
 
-    L = [f"🧲 <b>КАРТА ЛИКВИДАЦИЙ: работает ли магнит</b> ({n_pairs} пар, ~{DAYS - WARM_D} дн "
-         f"после прогрева)",
-         "<i>карта строится расчётом из OI и цены и на момент T использует только данные до T. "
-         "Это МОДЕЛЬ, а не реальные чужие позиции</i>",
-         f"Плечи: {', '.join(f'{int(l)}x:{w:.2f}' for l, w in LEV)} | полураспад {HL_D}д | "
-         f"корзина {BW * 100:.2f}% | окно {MIN_D}–{MAX_D}% | горизонт {HORIZON_H}ч",
-         f"Наблюдений: {len(obs)} (раз в {SAMPLE_H}ч на пару)", ""]
-    if len(obs) < 200:
-        L.append("⚠️ Наблюдений мало для выводов. Проверь PM_DAYS, PM_MIN_D, PM_PAIRS")
-        _send(L)
-        return
-
-    # ── 1. первое касание ──
-    L.append("<b>1. ЧТО ЦЕНА ДОСТИГАЕТ ПЕРВЫМ: СКОПЛЕНИЕ ИЛИ ЗЕРКАЛО</b>")
-    L.append("  <i>зеркало — уровень на том же расстоянии в другую сторону. Без притяжения "
-             "будет 50%. ✅/❌ — только если интервал по ВРЕМЕНИ не включает 50%</i>")
-    L.append(_share_line("все наблюдения", obs))
-    L.append(_share_line("магнит ВВЕРХ (шорты над ценой)", [o for o in obs if o["dir"] == "up"]))
-    L.append(_share_line("магнит ВНИЗ (лонги под ценой)", [o for o in obs if o["dir"] == "dn"]))
-    L.append("")
-
-    # ── 2. доза-эффект ──
-    ss = sorted(o["s"] for o in obs)
-    q33, q66 = ss[len(ss) // 3], ss[2 * len(ss) // 3]
-    L.append("<b>2. ЗАВИСИТ ЛИ ОТ СИЛЫ СКОПЛЕНИЯ</b> (сила — доля OI на уровне, по модели)")
-    L.append("  <i>настоящий эффект растёт с силой. Если слабые скопления работают так же — "
-             "дело не в карте</i>")
-    low = [o for o in obs if o["s"] <= q33]
-    mid = [o for o in obs if q33 < o["s"] <= q66]
-    top = [o for o in obs if o["s"] > q66]
-    L.append(_share_line(f"слабые (≤{q33 * 100:.2f}% OI)", low))
-    L.append(_share_line(f"средние", mid))
-    L.append(_share_line(f"сильные (>{q66 * 100:.2f}% OI)", top))
-    L.append("")
-
-    # ── 3. расстояние ──
-    L.append("<b>3. ПО РАССТОЯНИЮ ДО СКОПЛЕНИЯ</b>")
-    for a, b in ((MIN_D, 2.0), (2.0, 4.0), (4.0, MAX_D)):
-        sel = [o for o in obs if a <= o["d"] < b]
-        if sel:
-            L.append(_share_line(f"{a:.0f}–{b:.0f}%", sel))
-    L.append("")
-
-    # ── 4. сделки ──
-    L.append("<b>4. СДЕЛКИ</b> (вход к скоплению, тейк на "
-             f"{BUF_PCT}% раньше уровня, стоп {STOP_PCT}% против)")
-
-    def trades(sel, coin=False):
-        out = []
-        for o in sel:
-            dtp = o["d"] - BUF_PCT
-            if dtp < 0.8:
-                continue
-            up = o["dir"] == "up"
-            if coin:
-                up = rng.random() < 0.5
-            is_long = up
-            Pe = o["Pe"]
-            ent = Pe * (1 + SLIP / 100) if is_long else Pe * (1 - SLIP / 100)
-            stp = Pe * (1 - STOP_PCT / 100) if is_long else Pe * (1 + STOP_PCT / 100)
-            tp = Pe * (1 + dtp / 100) if is_long else Pe * (1 - dtp / 100)
-            r = sim_single(o["path"], is_long, ent, stp, tp)
-            if r is not None:
-                out.append(r)
-        return out
-
-    def trade_line(label, sel):
-        rs, cs = trades(sel), trades(sel, coin=True)
-        st, sc = _mean_ci(rs), _mean_ci(cs)
-        if not st or st[0] < 30:
-            return f"  {label}: мало сделок"
-        n, m, ci = st
-        wr = sum(1 for r in rs if r > 0) / n * 100
-        mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
-        tail = f" | монетка {sc[1]:+.3f}R, эдж {m - sc[1]:+.3f}R" if sc else ""
-        return f"  {mark} {label}: {n:5} сд, ВР {wr:3.0f}%, <b>{m:+.3f}R</b> (±{ci:.3f}){tail}"
-
-    L.append(trade_line("все наблюдения", obs))
-    L.append(trade_line("сильные скопления", top))
-    L.append(trade_line("слабые скопления", low))
-    L.append(trade_line("сильные, магнит вверх (лонг)", [o for o in top if o["dir"] == "up"]))
-    L.append(trade_line("сильные, магнит вниз (шорт)", [o for o in top if o["dir"] == "dn"]))
-    L.append("  <i>по расстоянию до цели, только сильные — стоп 1% душит ближние цели:</i>")
-    for a, b in ((MIN_D, 2.0), (2.0, 4.0), (4.0, MAX_D)):
-        L.append(trade_line(f"сильные, {a:.0f}–{b:.0f}%", [o for o in top if a <= o["d"] < b]))
-    L.append("")
-
-    # ── вывод ──
-    rs_top = trades(top)
-    st_top = _mean_ci(rs_top) if len(rs_top) >= 30 else None
-    ok, rows = verdict(obs, top, low, st_top)
-    L.append("<b>ВЫВОД</b> (три условия СРАЗУ, интервалы 99%)")
-    L += rows
-    L.append("  → <b>" + ("ПРИТЯЖЕНИЕ ПОДТВЕРЖДЕНО" if ok else "ПРИТЯЖЕНИЕ НЕ ПОДТВЕРЖДЕНО") + "</b>")
-    L.append("  <i>ОГОВОРКА: цена и без всякой карты любит возвращаться к уровням, где недавно "
-             "торговалась. Даже при подтверждении карту надо сравнить с такой же, построенной "
-             "по объёму, а не по OI — иначе неясно, что именно притягивает</i>")
-    _send(L)
-
-
-def _send(L):
+    if all_ev:
+        L.append("── <b>ОБЪЕДИНЕНО</b> ──")
+        mains = [e for e in all_ev if e["cat"] == "main"]
+        for cat, lbl in (("main", "MAIN"), ("novol", "NOVOL"), ("nosq", "NOSQ"),
+                         ("outwin", "OUTWIN")):
+            L.append(_line([e for e in all_ev if e["cat"] == cat], lbl))
+        L.append(_line(mains, "COIN", "r_coin"))
+        L.append(_line(mains, "ANTI", "r_anti"))
+        if len(mains) >= 20:
+            ms = sorted(mains, key=lambda e: e["t"])
+            h = len(ms) // 2
+            a, b = _stat(ms[:h]), _stat(ms[h:])
+            if a and b:
+                L.append(f"  половины MAIN по порядку: {a[1]:+.3f}R ({a[0]} сд) | "
+                         f"{b[1]:+.3f}R ({b[0]} сд)")
+            by_m = {}
+            for e in mains:
+                by_m.setdefault(e["month"], []).append(e["r"])
+            if len(by_m) >= 3:
+                w = min(by_m.items(), key=lambda kv: sum(kv[1]))
+                L.append(f"  худший месяц: {w[0]} ({sum(w[1]):+.1f}R, {len(w[1])} сд)")
+        L.append("")
+        rows, st1, ok2 = evaluate_criteria(all_ev)
+        L.append("<b>КРИТЕРИИ</b> (интервалы по дням, объединённая выборка)")
+        L += rows
+        L.append("  ⑤ повторить с IG_OFFSET=180 — знак должен совпасть (не автоматизируется)")
+        sm_ = _stat([e for e in all_ev if e["cat"] == "main"])
+        if st1 == "ok" and ok2:
+            verdict = "КРИТЕРИИ ①+② ВЫПОЛНЕНЫ — смотреть ③–⑤"
+        elif st1 == "few" and sm_ and sm_[1] + sm_[2] < 0:
+            verdict = "ВЫБОРКА МАЛА, НО MAIN ЗНАЧИМО В МИНУСЕ — архив"
+        elif st1 == "few":
+            verdict = "ВЫВОД НЕВОЗМОЖЕН: СДЕЛОК МАЛО — нужна длиннее история или мягче сжатие"
+        else:
+            verdict = "КРИТЕРИИ НЕ ВЫПОЛНЕНЫ — архив"
+        L.append("  → <b>" + verdict + "</b>")
+        L.append("<i>если MAIN в плюсе, а NOVOL или NOSQ такой же — эдж не в объёме или не в "
+                 "сжатии, а в самом пробое; это другая гипотеза, не эта</i>")
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     try:
         B.send_blocks(msg.split("\n"))
     except Exception as e:
-        print(f"[MAGNET] отправка не удалась: {e}")
+        print(f"[IG] отправка: {e}")
 
 
 def main():
     try:
         run()
-    except Exception as e:
-        import traceback
+    except Exception:
         traceback.print_exc()
         try:
-            B.send_telegram(f"⚠️ Прогон «магнит» упал: {e}")
+            B.send_telegram(f"⚠️ ignition упал: {traceback.format_exc()[-400:]}")
         except Exception:
             pass
 
