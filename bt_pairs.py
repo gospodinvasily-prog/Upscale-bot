@@ -1,72 +1,66 @@
 """
-bt_pairs.py — разбор ПО ПАРАМ и по группам пар.
+bt_pairs.py — X-MOM: кросс-секционный моментум.
 
-Зачем. Общая средняя около −0.2R может скрывать разные пары: где-то система в плюсе,
-где-то глубоко в минусе, а среднее это смешивает. Проверяем три вещи:
+Запускается привычным RUN_BACKTEST=pairs — менять bot.py не нужно.
 
-  1. Таблица по каждой паре: сделок, винрейт, средняя.
-  2. Группы по волатильности (ATR в % от цены). Если «уставки» работают только на
-     спокойных или только на дёрганых парах — это видно здесь.
-  3. Персональный стоп: для каждой группы перебираем стоп в % и в ATR.
+Гипотеза: монеты, обгонявшие рынок за MOM_H часов, продолжают обгонять следующие
+HOLD_D дней. Лонг топ-N по доходности, шорт боттом-N, равные слоты.
 
-ГЛАВНАЯ ОПАСНОСТЬ — отбор задним числом. Если взять 103 пары и оставить лучшие,
-они будут лучшими и при полностью случайных данных. Поэтому:
-  • рядом с каждой парой считается МОНЕТКА на тех же сделках;
-  • период делится пополам: первая половина — отбор, вторая — ПРОВЕРКА.
-    Пара попадает в «подтверждённые» только если она в плюсе в ОБЕИХ половинах.
-  • показывается, сколько пар прошло бы такой отбор на случайных данных.
+Почему это может работать там, где не сработало всё прежнее. Горизонт дневной,
+а не часовой: издержки (комиссия + проскальзывание ≈0.2% на круг) размазываются
+по движению в несколько процентов, а не съедают его целиком. Все прошлые системы
+упирались ровно в это — найденное преимущество было меньше стоимости входа.
 
-Запуск: RUN_BACKTEST=pairs
-Настройки: BP_DAYS (60), BP_PAIRS (0=все), BP_DIST (1.5), BP_MIN_TRADES (12)
+Тайминг честный: ранжирование считается по свече, ЗАКРЫТОЙ до момента входа;
+вход по открытию следующей свечи; выход по открытию свечи через HOLD_D дней.
+
+КОНТРОЛЬ встроен: тот же портфель из СЛУЧАЙНЫХ пар. Если наш не лучше случайного —
+ранжирование не работает, и в живой режим это не идёт.
+
+Настройки (переменные Render):
+  XM_DAYS (90)      — сколько дней истории
+  XM_OFFSET (0)     — сдвиг окна назад; 90 даст предыдущие 90 дней — проверка на подгонку
+  XM_MOM_H (72)     — окно доходности для ранжирования, часов
+  XM_TOP (5)        — сколько пар в каждую сторону
+  XM_HOLD_D (3)     — длина цикла, дней
+  XM_POSITION (500) — размер слота, $
+  XM_FEE (0.05), XM_SLIP (0.05) — издержки на сторону, %
 """
 import os
 import time
+import random
 import statistics
 
 import bot as B
 
-DAYS       = int(os.environ.get("BP_DAYS", "60"))
-OFFSET     = int(os.environ.get("BP_OFFSET", "0"))
-PAIRS_N    = int(os.environ.get("BP_PAIRS", "0"))
-DIST       = float(os.environ.get("BP_DIST", "1.5"))
-MIN_TRADES = int(os.environ.get("BP_MIN_TRADES", "12"))
-SLIP       = float(os.environ.get("BP_SLIP", "0.10"))
-COST       = float(os.environ.get("BP_COST", "0.065"))
-STOP_SLIP  = float(os.environ.get("BP_STOP_SLIP", "0.05"))
-HOLD_H     = int(os.environ.get("BP_HOLD_H", "12"))
-BTC_MARGIN = float(os.environ.get("BP_BTC_MARGIN", "0.2"))
-ENTRY_MINS = [0, 30]
+DAYS      = int(os.environ.get("XM_DAYS", "90"))
+OFFSET    = int(os.environ.get("XM_OFFSET", "0"))
+MOM_H     = int(os.environ.get("XM_MOM_H", "72"))
+TOP_N     = int(os.environ.get("XM_TOP", "5"))
+HOLD_D    = int(os.environ.get("XM_HOLD_D", "3"))
+POS_USD   = float(os.environ.get("XM_POSITION", "500"))
+FEE_PCT   = float(os.environ.get("XM_FEE", "0.05"))
+SLIP_PCT  = float(os.environ.get("XM_SLIP", "0.05"))
 
-FINE_SEC = 900
-STOP, TP1, TP3 = 1.0, 1.0, 2.0
-PARTS = (1 / 3, 1 / 3, 1 / 3)
-VW_BARS = 97
-
-# ── ОТСКОК ОТ ГРАНИЦЫ КОРИДОРА ──
-# Другой вход: не от середины к границе, а ОТ самой границы. Цена подошла к краю
-# коридора, оттолкнулась — идём с отскоком к противоположному краю.
-# Главная развилка: отскок и пробой до факта выглядят одинаково, поэтому проверяем
-# и вход по касанию, и вход с подтверждением (свеча закрылась обратно внутрь).
-BOUNCE_DEPTH  = [0.0, 0.3, 0.6]        # насколько глубоко за границу пускаем (% от цены)
-BOUNCE_STOPS  = [0.5, 1.0, 1.5]        # стоп ЗА границей, % от неё
-BOUNCE_MINROOM = 1.0                   # минимум хода до противоположной границы, %
-
-STOP_GRID = [0.75, 1.0, 1.5, 2.0, 3.0]        # персональный стоп, % от цены
-ATR_GRID  = [1.0, 1.5, 2.0, 3.0]              # персональный стоп, во сколько ATR
+# Дополнительные окна доходности и длины цикла — заодно смотрим, не лучше ли другое.
+MOM_GRID  = [int(x) for x in os.environ.get("XM_MOM_GRID", "24,48,72,120,168").split(",")]
+HOLD_GRID = [int(x) for x in os.environ.get("XM_HOLD_GRID", "1,2,3,5").split(",")]
 
 
-def _fetch(sym, tf, days):
-    sec = {"15m": 900, "1h": 3600}[tf]
+def _fetch_1h(sym, days):
+    """Часовые свечи за days дней. Если данных с начала окна нет, не сдаёмся,
+    а щупаем вперёд: Gate хранит историю не для всех пар одинаково."""
+    sec = 3600
     now = int(time.time()) - OFFSET * 86400
     out, cur, probes = [], now - days * 86400, 0
     while cur < now:
-        to = min(now, cur + 1900 * sec)
-        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": tf,
+        to = min(now, cur + 900 * sec)
+        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1h",
                                          "from": cur, "to": to})
         part = B.parse_candles(raw) if raw else []
         if not part:
             probes += 1
-            if probes > 40:
+            if probes > 30:
                 break
             cur += 5 * 86400
             continue
@@ -83,469 +77,190 @@ def _fetch(sym, tf, days):
     return uniq
 
 
-def _vwap(win):
-    vol = sum(x["v"] for x in win)
-    if not win or vol <= 0:
+def _stat(vals):
+    if not vals:
         return None
-    return sum((x["h"] + x["l"] + x["c"]) / 3 * x["v"] for x in win) / vol
+    n = len(vals)
+    m = sum(vals) / n
+    se = (statistics.pstdev(vals) / (n ** 0.5)) if n > 1 else 0.0
+    return n, m, 1.96 * se
 
 
-def _sim(bars, side, entry, stop, t1, t2, t3):
-    risk = abs(entry - stop)
-    if risk <= 0:
-        return None
-    is_long = side == "long"
-    tg = [t1, t2, t3]
-    for i in range(1, 3):
-        if is_long and tg[i] <= tg[i - 1]:
-            tg[i] = tg[i - 1] * 1.001
-        if not is_long and tg[i] >= tg[i - 1]:
-            tg[i] = tg[i - 1] * 0.999
-    done, cur_stop, acc = 0, stop, 0.0
-    cost = COST / 100 * entry / risk
-    for c in bars:
-        if (c["l"] <= cur_stop) if is_long else (c["h"] >= cur_stop):
-            fill = cur_stop * (1 - STOP_SLIP / 100) if is_long else cur_stop * (1 + STOP_SLIP / 100)
-            r = (fill - entry) / risk if is_long else (entry - fill) / risk
-            return acc + r * sum(PARTS[done:]) - cost
-        while done < 3:
-            t = tg[done]
-            if (c["h"] >= t) if is_long else (c["l"] <= t):
-                acc += PARTS[done] * (abs(t - entry) / risk)
-                done += 1
-                if done == 1:
-                    cur_stop = entry
-                elif done == 2:
-                    cur_stop = tg[0]
-            else:
-                break
-        if done >= 3:
-            return acc - cost
-    last = bars[-1]["c"] if bars else entry
-    r = (last - entry) / risk if is_long else (entry - last) / risk
-    return acc + r * sum(PARTS[done:]) - cost
-
-
-def _stat(rs):
-    if not rs:
-        return None
-    n = len(rs)
-    e = sum(rs) / n
-    se = (statistics.pstdev(rs) / (n ** 0.5)) if n > 1 else 0.0
-    return n, e, 1.96 * se, sum(1 for r in rs if r > 0) / n * 100
+def _line(vals, label):
+    st = _stat(vals)
+    if not st:
+        return f"  {label}: циклов нет"
+    n, m, ci = st
+    mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
+    return f"  {mark} {label}: <b>{m:+.2f}%</b> за цикл (±{ci:.2f}), циклов {n}"
 
 
 def run():
-    import random as _rnd
-    rng = _rnd.Random(20251005)
-    pairs = B.UPSCALE_PAIRS[:PAIRS_N] if PAIRS_N else B.UPSCALE_PAIRS
-    hold = max(6, int(HOLD_H * 3600 / FINE_SEC))
-
-    # ── уклон BTC по его VWAP ──
-    btc15 = _fetch("BTC", "15m", DAYS + 2)
-    vw_dev = {}
-    for k in range(VW_BARS, len(btc15)):
-        vw = _vwap(btc15[max(0, k - VW_BARS + 1):k + 1])
-        if vw:
-            vw_dev[btc15[k].get("t", 0) + FINE_SEC] = (btc15[k]["c"] - vw) / vw * 100
-
-    def btc_side(ts):
-        t = ts - ts % FINE_SEC
-        for back in range(0, 8):
-            v = vw_dev.get(t - back * FINE_SEC)
-            if v is not None:
-                return "long" if v > BTC_MARGIN else "short" if v < -BTC_MARGIN else "neutral"
-        return None
-
-    # ── сделки по каждой паре ──
-    per = {}            # sym -> список (ts, side, px, bnd, atr_pct, seg)
-    bounces = {}        # sym -> отскоки от границ коридора
+    pairs = B.UPSCALE_PAIRS
+    need = DAYS + max(MOM_GRID) // 24 + 5
+    print(f"[XMOM] качаю 1ч свечи: {len(pairs)} пар × {need} дн (сдвиг назад {OFFSET} дн)")
     t0 = time.time()
-    cov = 0.0
+
+    data = {}
     for i, sym in enumerate(pairs, 1):
-        if sym == "BTC":
-            continue
         try:
-            fine = _fetch(sym, "15m", DAYS)
-            base = _fetch(sym, "1h", DAYS + 5)
+            ch = _fetch_1h(sym, need)
         except Exception:
             continue
-        if len(fine) < 500 or len(base) < 150:
-            continue
-        fine, base = fine[:-1], base[:-1]
-        if not cov:
-            cov = (fine[-1].get("t", 0) - fine[0].get("t", 0)) / 86400
-        idx = {c.get("t"): k for k, c in enumerate(fine)}
-        last_end = 0
-        corr_list = []        # коридоры зарядов этой пары — для поиска отскоков
-        for e in range(B.BASE_FROM + B.ACC_WINDOW, len(base)):
-            upto = base[:e]
-            sl = upto[-B.BASE_FROM:-B.BASE_TO]
-            if len(sl) < 10:
-                continue
-            vb = B.trimmed_mean([c["v"] for c in sl])
-            ab = B.trimmed_mean(B.true_ranges(upto)[-B.BASE_FROM:-B.BASE_TO])
-            if not vb or not ab or vb <= 0 or ab <= 0:
-                continue
-            cts = upto[-1].get("t", 0)
-            if cts + 3600 <= last_end:
-                continue
-            c = B.detect_charge(sym, upto, upto[-1]["c"], vb, ab,
-                                {"btc_chg_win": 0.0, "do_charge": True},
-                                {"funding": 0.0, "change_24h": 0.0},
-                                lambda s: None, P=B.ALT_P)
-            if not c:
-                continue
-            corr_list.append((cts, c["hi"], c["lo"]))
-            for em in ENTRY_MINS:
-                ts = cts + 3600 + em * 60
-                k = idx.get(ts)
-                if k is None or k + hold + 2 >= len(fine) or k < VW_BARS + 2:
-                    continue
-                px = fine[k]["o"]
-                bs = btc_side(ts)
-                if bs is None or bs == "neutral":
-                    continue
-                side = c["side"] if c["side"] in ("long", "short") else bs
-                if side != bs:
-                    continue
-                vw = _vwap(fine[k - VW_BARS:k])          # VWAP пары по закрытым свечам
-                if not vw:
-                    continue
-                pside = "long" if fine[k - 1]["c"] > vw else "short"
-                if pside != side:                        # фильтр v10.3: сторона VWAP пары
-                    continue
-                is_l = side == "long"
-                bnd = c["hi"] if is_l else c["lo"]
-                room = (bnd - px) / px * 100 if is_l else (px - bnd) / px * 100
-                if room < DIST:
-                    continue
-                atr_pct = c["atr"] / px * 100 if px > 0 else 0
-                per.setdefault(sym, []).append((ts, side, px, bnd, atr_pct,
-                                                fine[k:k + hold], fine[k:k + 49]))
-                last_end = fine[min(k + hold, len(fine) - 1)].get("t", 0)
-                break
-        # ── ОТСКОКИ: по тем же зарядам, но вход у границы ──
-        # Берём коридор заряда и ищем на 15м свечах касание его края. Сделка — в сторону
-        # ПРОТИВОПОЛОЖНОЙ границы. Всё по закрытым свечам: касание видим на свече j,
-        # входим по открытию j+1.
-        for cts, hi, lo in corr_list:
-            k0 = idx.get(cts + 3600)
-            if k0 is None:
-                continue
-            h_ = hi - lo
-            if h_ <= 0:
-                continue
-            for j in range(k0, min(k0 + 48, len(fine) - hold - 2)):
-                cj = fine[j]
-                if j + 1 >= len(fine):
-                    break
-                px_ = fine[j + 1]["o"]
-                for side_b, edge, opp in (("long", lo, hi), ("short", hi, lo)):
-                    is_l = side_b == "long"
-                    touched = (cj["l"] <= edge) if is_l else (cj["h"] >= edge)
-                    if not touched:
-                        continue
-                    # как глубоко ушли за границу (0 — только коснулись)
-                    depth = ((edge - cj["l"]) / edge * 100) if is_l else ((cj["h"] - edge) / edge * 100)
-                    # подтверждение: свеча закрылась обратно ВНУТРЬ коридора
-                    confirmed = (cj["c"] > edge) if is_l else (cj["c"] < edge)
-                    room_b = (opp - px_) / px_ * 100 if is_l else (px_ - opp) / px_ * 100
-                    if room_b < BOUNCE_MINROOM:
-                        continue
-                    atrp = (h_ / px_ * 100) / 4 if px_ > 0 else 0
-                    bounces.setdefault(sym, []).append(
-                        (fine[j + 1].get("t", 0), side_b, px_, edge, opp, depth,
-                         confirmed, atrp, fine[j + 1:j + 1 + hold], fine[j + 1:j + 50]))
-                    break
+        if len(ch) > (max(MOM_GRID) // 24 + max(HOLD_GRID) + 2) * 24:
+            data[sym] = {c["t"]: c for c in ch[:-1]}      # последняя свеча незакрыта
         if i % 20 == 0:
-            tot = sum(len(v) for v in per.values())
-            nb_ = sum(len(v) for v in bounces.values())
-            print(f"[PAIRS] {i}/{len(pairs)} | пар с сделками {len(per)} | сделок {tot} | "
-                  f"отскоков {nb_} | {time.time()-t0:.0f}с")
+            print(f"[XMOM] {i}/{len(pairs)} | пар с данными {len(data)} | "
+                  f"{time.time() - t0:.0f}с")
 
-    def run_trade(rec, stop_pct=None, atr_k=None, coin=False):
-        ts, side, px, bnd, atr_pct, seg = rec[:6]
-        sd = rng.choice(("long", "short")) if coin else side
-        is_l = sd == "long"
-        b = bnd if sd == side else (px * (1 + DIST / 100) if is_l else px * (1 - DIST / 100))
-        sp = (atr_k * atr_pct) if atr_k else (stop_pct or STOP)
-        if sp <= 0.05 or sp > 15:
-            return None
-        ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
-        stp = px * (1 - sp / 100) if is_l else px * (1 + sp / 100)
-        y1 = px * (1 + TP1 / 100) if is_l else px * (1 - TP1 / 100)
-        y3 = px * (1 + TP3 / 100) if is_l else px * (1 - TP3 / 100)
-        return _sim(seg, sd, ent, stp, y1, b, y3)
-
-    all_recs = [(s, r) for s, v in per.items() for r in v]
-    all_recs.sort(key=lambda x: x[1][0])
-    if not all_recs:
-        B.send_telegram("⚠️ bt_pairs: сделок не набралось")
+    print(f"[XMOM] пар с данными: {len(data)}")
+    if len(data) < 20:
+        B.send_telegram("⚠️ X-MOM: данных не хватило (менее 20 пар)")
         return
-    mid_ts = all_recs[len(all_recs) // 2][1][0]
 
-    L = [f"🧩 <b>РАЗБОР ПО ПАРАМ</b> (~{cov:.0f} дн, {len(pairs)} пар)"
-         + (f"\n⏪ период сдвинут назад на {OFFSET} дней" if OFFSET else ""),
-         "<i>настройки как в боте: заряд 1ч, фильтр BTC, сторона VWAP пары, "
-         f"ход ≥{DIST}%, стоп {STOP}%, цели по трети</i>",
-         f"Сделок всего: {len(all_recs)} | пар с сделками: {len(per)}",
-         f"Проскальзывание {SLIP}%, издержки {COST}%", ""]
+    ref = max(data.values(), key=len)
+    times = sorted(ref.keys())
+    cost = (FEE_PCT + SLIP_PCT) / 100 * 2        # вход и выход
+    rnd = random.Random(12345)
 
-    # ── 0. ЕСТЬ ЛИ ВООБЩЕ ДВИЖЕНИЕ В НАШУ СТОРОНУ ──
-    # Главная проверка: убираем стопы, цели, подтяжки и комиссии. Остаётся вопрос,
-    # на который всё опирается: уходит ли цена после заряда в сторону уклона?
-    # Если движения нет, никакая схема выхода его не создаст — и тогда все переборы
-    # фильтров были перестановкой без смысла. Ломаться тут почти нечему: две цены и вычитание.
-    HORIZONS = [(1, 4), (2, 8), (4, 16), (8, 32), (12, 48)]      # часы → 15м свечей
-    L.append("<b>0. ЕСТЬ ЛИ ДВИЖЕНИЕ В НАШУ СТОРОНУ</b> (без стопов и целей)")
-    L.append("  <i>средний ход цены в сторону уклона через N часов, в % от входа. "
-             "Рядом — то же при случайном направлении</i>")
-    any_edge = False
-    for hh, nb in HORIZONS:
-        mine, rnd_ = [], []
-        for s_, v in per.items():
-            for rec in v:
-                ts, side, px, bnd, atr_pct, seg = rec[:6]
-                tail = rec[6] if len(rec) > 6 else seg
-                if len(tail) <= nb or px <= 0:
-                    continue
-                move = (tail[nb]["c"] - px) / px * 100
-                mine.append(move if side == "long" else -move)
-                rnd_.append(move if rng.random() < 0.5 else -move)
-        if not mine:
-            continue
-        n = len(mine)
-        avg = sum(mine) / n
-        se = (statistics.pstdev(mine) / (n ** 0.5)) if n > 1 else 0.0
-        pos = sum(1 for x in mine if x > 0) / n * 100
-        ravg = sum(rnd_) / len(rnd_) if rnd_ else 0.0
-        mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
-        if avg - 1.96 * se > 0:
-            any_edge = True
-        L.append(f"  {mark} через {hh:2}ч: {n:4} набл., средний ход <b>{avg:+.3f}%</b> "
-                 f"(±{1.96*se:.3f}), в плюс {pos:.0f}% | случайно {ravg:+.3f}%")
-    L.append("  <i>" + ("есть горизонт со значимым плюсом — сигнал существует, "
-                        "дальше имеет смысл подбирать схему выхода"
-                        if any_edge else
-                        "ни на одном горизонте значимого плюса нет — движения в нашу сторону "
-                        "не обнаружено, и схемой выхода это не лечится") + "</i>")
+    def slot(sym, side, t_in, t_out):
+        en, ex = data[sym].get(t_in), data[sym].get(t_out)
+        if not en or not ex or en["o"] <= 0:
+            return None
+        raw = (ex["o"] / en["o"] - 1) * (1 if side == "long" else -1)
+        return raw - cost
+
+    def ranking(t_close, mom_h):
+        """Доходность за mom_h часов по ЗАКРЫТЫМ свечам. Подглядывания нет."""
+        t_old = t_close - mom_h * 3600
+        rets = {}
+        for sym, m in data.items():
+            a, b = m.get(t_old), m.get(t_close)
+            if a and b and a["c"] > 0:
+                rets[sym] = b["c"] / a["c"] - 1
+        if len(rets) < TOP_N * 4:
+            return None
+        srt = sorted(rets.items(), key=lambda kv: kv[1], reverse=True)
+        return [s for s, _ in srt[:TOP_N]], [s for s, _ in srt[-TOP_N:]], rets
+
+    def cycles_for(mom_h, hold_d, with_control=False):
+        """Прогон по циклам. Возвращает (портфель, лонги, шорты, случайный)."""
+        cyc, lon, sho, rc = [], [], [], []
+        cycle_sec = hold_d * 86400
+        t = times[0] + (mom_h + 2) * 3600
+        while t + cycle_sec <= times[-1]:
+            r = ranking(t - 3600, mom_h)
+            t_out = t + cycle_sec
+            if r is None or t_out not in ref:
+                t += cycle_sec
+                continue
+            longs, shorts, _ = r
+            pls = [x for x in (slot(s, "long", t, t_out) for s in longs) if x is not None]
+            pss = [x for x in (slot(s, "short", t, t_out) for s in shorts) if x is not None]
+            ps = pls + pss
+            if len(ps) >= TOP_N * 2 - 2:
+                cyc.append(sum(ps) / len(ps) * 100)
+                if pls:
+                    lon.append(sum(pls) / len(pls) * 100)
+                if pss:
+                    sho.append(sum(pss) / len(pss) * 100)
+                if with_control:
+                    pool = [s for s in data if t in data[s] and t_out in data[s]]
+                    if len(pool) >= TOP_N * 2:
+                        pick = rnd.sample(pool, TOP_N * 2)
+                        rs = [x for x in ([slot(s, "long", t, t_out) for s in pick[:TOP_N]]
+                                          + [slot(s, "short", t, t_out) for s in pick[TOP_N:]])
+                              if x is not None]
+                        if rs:
+                            rc.append(sum(rs) / len(rs) * 100)
+            t += cycle_sec
+        return cyc, lon, sho, rc
+
+    cov = (times[-1] - times[0]) / 86400
+    L = [f"📈 <b>X-MOM: кросс-секционный моментум</b> (~{cov:.0f} дн, {len(data)} пар)"
+         + (f"\n⏪ <b>ПЕРИОД СДВИНУТ НАЗАД НА {OFFSET} ДНЕЙ</b> — проверка на чужих данных"
+            if OFFSET else ""),
+         f"<i>лонг топ-{TOP_N} / шорт боттом-{TOP_N} по доходности за {MOM_H}ч, "
+         f"цикл {HOLD_D} дн, слот ${POS_USD:.0f}</i>",
+         f"Издержки {(FEE_PCT + SLIP_PCT):.2f}% на круг. Решение по закрытой свече, "
+         f"вход по открытию следующей", ""]
+
+    # ── основная настройка ──
+    cyc, lon, sho, rc = cycles_for(MOM_H, HOLD_D, with_control=True)
+    if not cyc:
+        L.append("⚠️ Циклов не набралось")
+        B.send_blocks(L)
+        return
+
+    L.append(f"<b>ОСНОВНАЯ НАСТРОЙКА</b> (ret{MOM_H}ч, цикл {HOLD_D} дн)")
+    L.append(_line(cyc, "портфель лонг+шорт"))
+    eq, peak, dd, usd = 0.0, 0.0, 0.0, 0.0
+    for c in cyc:
+        step = c / 100 * POS_USD * TOP_N * 2
+        usd += step
+        eq += step
+        peak = max(peak, eq)
+        dd = min(dd, eq - peak)
+    wins = sum(1 for c in cyc if c > 0)
+    L.append(f"     итого ${usd:+,.0f} | прибыльных циклов {wins}/{len(cyc)} "
+             f"({wins / len(cyc) * 100:.0f}%) | макс. просадка ${dd:,.0f}")
+    half = len(cyc) // 2
+    if half >= 5:
+        a = statistics.mean(cyc[:half])
+        b = statistics.mean(cyc[half:])
+        L.append(f"     по половинам: первая {a:+.2f}% | вторая {b:+.2f}% — "
+                 + ("держится" if a > 0 and b > 0 else "разваливается"))
+    L.append(_line(lon, "только лонги (топ)"))
+    L.append(_line(sho, "только шорты (боттом)"))
     L.append("")
 
-    # ── 1. группы по волатильности ──
-    vol_of = {s: statistics.median([r[4] for r in v]) for s, v in per.items() if v}
-    vals = sorted(vol_of.values())
-    # Границы берём ПО ДАННЫМ (квартили), а не выдуманные: так в каждой группе примерно
-    # поровну пар при любом распределении волатильности. Раньше пороги 0.6/1.0/1.5%
-    # были взяты на глаз и при другом рынке могли оставить группы пустыми.
-    def q(p):
-        return vals[min(len(vals) - 1, int(len(vals) * p))] if vals else 0.0
-    q1, q2, q3 = q(0.25), q(0.50), q(0.75)
-    groups = [(f"1 самые спокойные (ATR < {q1:.2f}%)", lambda a, x=q1: a < x),
-              (f"2 ниже среднего ({q1:.2f}–{q2:.2f}%)", lambda a, x=q1, y=q2: x <= a < y),
-              (f"3 выше среднего ({q2:.2f}–{q3:.2f}%)", lambda a, x=q2, y=q3: x <= a < y),
-              (f"4 самые дёрганые (≥{q3:.2f}%)", lambda a, x=q3: a >= x)]
-    if vals:
-        L.append(f"<b>РАЗБРОС ВОЛАТИЛЬНОСТИ</b> (медианный ATR пары, % от цены): "
-                 f"мин {vals[0]:.2f} | 25% {q1:.2f} | медиана {q2:.2f} | 75% {q3:.2f} | "
-                 f"макс {vals[-1]:.2f}")
-        L.append("")
-    L.append("<b>1. ГРУППЫ ПО ВОЛАТИЛЬНОСТИ</b> (границы — квартили по самим парам)")
-    L.append("  <i>рядом монетка на тех же сделках: если наш результат не лучше её, "
-             "группа ничего не доказывает</i>")
-    for gname, cond in groups:
-        syms = [s for s, a in vol_of.items() if cond(a)]
-        rs = [x for x in (run_trade(r) for s in syms for r in per[s]) if x is not None]
-        cl = [x for x in (run_trade(r, coin=True) for s in syms for r in per[s]) if x is not None]
-        st, sc = _stat(rs), _stat(cl)
-        if not st:
-            L.append(f"  {gname}: сделок нет")
-            continue
-        mark = "✅" if st[1] - st[2] > 0 else "❌" if st[1] + st[2] < 0 else "  "
-        tail = f" | монетка {sc[1]:+.3f}R, эдж {st[1]-sc[1]:+.3f}R" if sc else ""
-        L.append(f"  {mark} {gname}: {len(syms)} пар, {st[0]:4} сд, ВР {st[3]:3.0f}%, "
-                 f"<b>{st[1]:+.3f}R</b> (±{st[2]:.3f}){tail}")
+    # ── контроль ──
+    L.append("<b>КОНТРОЛЬ: случайные пары вместо ранжированных</b>")
+    L.append("  <i>если наш портфель не лучше случайного — ранжирование не работает</i>")
+    L.append(_line(rc, "случайный портфель"))
+    if rc and cyc:
+        diff = statistics.mean(cyc) - statistics.mean(rc)
+        n = min(len(cyc), len(rc))
+        ci = 1.96 * ((statistics.pstdev(cyc) ** 2 + statistics.pstdev(rc) ** 2) / n) ** 0.5
+        verdict = ("ранжирование работает" if diff - ci > 0 else
+                   "ранжирование ВРЕДИТ" if diff + ci < 0 else
+                   "разница в пределах шума — преимущества не видно")
+        L.append(f"  → <b>наш сигнал против случайного: {diff:+.2f}% за цикл</b> "
+                 f"(±{ci:.2f}) — {verdict}")
     L.append("")
 
-    # ── 2. персональный стоп по группам ──
-    L.append("<b>2. ПЕРСОНАЛЬНЫЙ СТОП ПО ГРУППАМ</b>")
-    L.append("  <i>цели не меняются (1% → граница → 2%), меняется только стоп</i>")
-    for gname, cond in groups:
-        syms = [s for s, a in vol_of.items() if cond(a)]
-        recs = [r for s in syms for r in per[s]]
-        if len(recs) < 30:
-            continue
-        best = None
-        line = []
-        for sp in STOP_GRID:
-            rs = [x for x in (run_trade(r, stop_pct=sp) for r in recs) if x is not None]
-            st = _stat(rs)
-            if st:
-                line.append(f"{sp}%: {st[1]:+.2f}")
+    # ── сетка: окно доходности × длина цикла ──
+    L.append("<b>ПЕРЕБОР: окно доходности × длина цикла</b>")
+    L.append("  <i>ячейка — средний результат портфеля за цикл, %</i>")
+    L.append("   ret\\цикл | " + " | ".join(f" {h}д  " for h in HOLD_GRID))
+    best = None
+    for mh in MOM_GRID:
+        row = []
+        for hd in HOLD_GRID:
+            c2, _, _, _ = cycles_for(mh, hd)
+            st = _stat(c2)
+            if st and st[0] >= 8:
+                row.append(f"{st[1]:+.2f}")
                 if best is None or st[1] > best[1]:
-                    best = (f"{sp}%", st[1], st[0])
-        for ak in ATR_GRID:
-            rs = [x for x in (run_trade(r, atr_k=ak) for r in recs) if x is not None]
-            st = _stat(rs)
-            if st:
-                line.append(f"{ak}×ATR: {st[1]:+.2f}")
-                if best is None or st[1] > best[1]:
-                    best = (f"{ak}×ATR", st[1], st[0])
-        L.append(f"  <b>{gname}</b> ({len(recs)} сд): " + " | ".join(line))
-        if best:
-            L.append(f"     лучший стоп: {best[0]} → {best[1]:+.3f}R")
+                    best = ((mh, hd), st[1], st[0], st[2])
+            else:
+                row.append("  —  ")
+        L.append(f"   {mh:4}ч    | " + " | ".join(row))
+    if best:
+        L.append(f"  → лучшее: ret{best[0][0]}ч, цикл {best[0][1]}д → {best[1]:+.2f}% "
+                 f"за цикл (±{best[3]:.2f}), циклов {best[2]}")
+        L.append("  <i>лучшая ячейка выбрана задним числом из 20 — верить ей можно только "
+                 "если она подтвердится на сдвинутом периоде (XM_OFFSET=90)</i>")
     L.append("")
-
-    # ── 3. по парам, с проверкой на второй половине ──
-    L.append("<b>3. ПО ПАРАМ: отбор на первой половине, ПРОВЕРКА на второй</b>")
-    L.append("  <i>пара «подтверждена», только если в плюсе в ОБЕИХ половинах периода</i>")
-    rows, confirmed, cand_a = [], [], 0
-    for s, v in per.items():
-        a = [r for r in v if r[0] <= mid_ts]
-        b = [r for r in v if r[0] > mid_ts]
-        ra = [x for x in (run_trade(r) for r in a) if x is not None]
-        rb = [x for x in (run_trade(r) for r in b) if x is not None]
-        rall = [x for x in (run_trade(r) for r in v) if x is not None]
-        if len(rall) < MIN_TRADES:
-            continue
-        sa, sb, sall = _stat(ra), _stat(rb), _stat(rall)
-        rows.append((s, sall, sa, sb, vol_of.get(s, 0)))
-        if sa and sa[1] > 0 and len(ra) >= 4:
-            cand_a += 1
-            if sb and sb[1] > 0:
-                confirmed.append(s)
-    rows.sort(key=lambda x: -x[1][1])
-    L.append(f"  <i>пар с ≥{MIN_TRADES} сделками: {len(rows)}</i>")
-    L.append("  <b>Лучшие 12:</b>")
-    for s, sall, sa, sb, vol in rows[:12]:
-        ta = f"{sa[1]:+.2f}" if sa else "  —  "
-        tb = f"{sb[1]:+.2f}" if sb else "  —  "
-        L.append(f"   {s:9} ATR {vol:.2f}% | всего {sall[0]:3} сд {sall[1]:+.3f}R "
-                 f"(ВР {sall[3]:.0f}%) | 1-я пол {ta} | 2-я пол {tb}")
-    L.append("  <b>Худшие 8:</b>")
-    for s, sall, sa, sb, vol in rows[-8:]:
-        ta = f"{sa[1]:+.2f}" if sa else "  —  "
-        tb = f"{sb[1]:+.2f}" if sb else "  —  "
-        L.append(f"   {s:9} ATR {vol:.2f}% | всего {sall[0]:3} сд {sall[1]:+.3f}R "
-                 f"(ВР {sall[3]:.0f}%) | 1-я пол {ta} | 2-я пол {tb}")
-    L.append("")
-
-    # ── 4. проверка отбора: держится ли он на второй половине ──
-    L.append("<b>4. ВЫДЕРЖИВАЕТ ЛИ ОТБОР ПРОВЕРКУ</b>")
-    sel = [r for s in confirmed for r in per[s] if r[0] > mid_ts]
-    rest = [r for s, v in per.items() if s not in confirmed for r in v if r[0] > mid_ts]
-    rs_sel = [x for x in (run_trade(r) for r in sel) if x is not None]
-    rs_rest = [x for x in (run_trade(r) for r in rest) if x is not None]
-    ss, sr = _stat(rs_sel), _stat(rs_rest)
-    L.append(f"  в плюсе на 1-й половине: {cand_a} пар | из них и на 2-й: "
-             f"<b>{len(confirmed)}</b>")
-    if ss:
-        L.append(f"  2-я половина, отобранные пары: {ss[0]} сд, <b>{ss[1]:+.3f}R</b> (±{ss[2]:.3f})")
-    if sr:
-        L.append(f"  2-я половина, остальные пары:  {sr[0]} сд, {sr[1]:+.3f}R (±{sr[2]:.3f})")
-    # сколько пар прошло бы такой отбор СЛУЧАЙНО
-    rnd_conf = 0
-    for s, v in per.items():
-        a = [r for r in v if r[0] <= mid_ts]
-        b = [r for r in v if r[0] > mid_ts]
-        ra = [x for x in (run_trade(r, coin=True) for r in a) if x is not None]
-        rb = [x for x in (run_trade(r, coin=True) for r in b) if x is not None]
-        if len(ra) >= 4 and len(rb) >= 1 and sum(ra) > 0 and sum(rb) > 0:
-            rnd_conf += 1
-    L.append(f"  <i>тот же отбор на СЛУЧАЙНОМ направлении подтвердил бы {rnd_conf} пар — "
-             f"если это число близко к {len(confirmed)}, отбор ничего не значит</i>")
-    if confirmed:
-        L.append("  Подтверждённые: " + ", ".join(sorted(confirmed)))
-
-    # ── 5. ОТСКОК ОТ ГРАНИЦЫ КОРИДОРА ──
-    all_b = [(s_, b) for s_, v in bounces.items() for b in v]
-    L.append("")
-    L.append("═══ <b>5. ОТСКОК ОТ ГРАНИЦЫ КОРИДОРА</b> ═══")
-    L.append("  <i>вход не от середины к границе, а ОТ границы в сторону противоположной. "
-             "Касание видим на закрытой свече, входим по открытию следующей</i>")
-    if not all_b:
-        L.append("  отскоков не найдено")
-    else:
-        L.append(f"  найдено касаний границы: {len(all_b)}")
-
-        def b_move(recs, nb):
-            """Чистый ход после отскока, без стопов и целей."""
-            out = []
-            for _s, r in recs:
-                tail = r[9]
-                if len(tail) <= nb or r[2] <= 0:
-                    continue
-                mv = (tail[nb]["c"] - r[2]) / r[2] * 100
-                out.append(mv if r[1] == "long" else -mv)
-            return out
-
-        def b_trade(r, stop_pct, coin=False):
-            ts, side, px, edge, opp, depth, conf, atrp, seg, tail = r
-            sd = rng.choice(("long", "short")) if coin else side
-            is_l = sd == "long"
-            # стоп ЗА границей, от которой отскочили
-            stp = edge * (1 - stop_pct / 100) if is_l else edge * (1 + stop_pct / 100)
-            if abs(px - stp) / px * 100 > 8 or abs(px - stp) <= 0:
-                return None
-            tgt = opp if sd == side else (px * (1 + 1.5 / 100) if is_l else px * (1 - 1.5 / 100))
-            ent = px * (1 + SLIP / 100) if is_l else px * (1 - SLIP / 100)
-            risk_pct = abs(ent - stp) / ent * 100
-            y1 = ent * (1 + risk_pct / 100) if is_l else ent * (1 - risk_pct / 100)
-            y3 = ent * (1 + 2 * risk_pct / 100) if is_l else ent * (1 - 2 * risk_pct / 100)
-            return _sim(seg, sd, ent, stp, y1, tgt, y3)
-
-        # 5.1 чистое движение после касания
-        L.append("  <b>5.1 Движение после касания</b> (без стопов и целей)")
-        for hh, nb in [(1, 4), (2, 8), (4, 16), (12, 48)]:
-            for lbl, sel in (("все касания", all_b),
-                             ("только подтверждённые", [x for x in all_b if x[1][6]])):
-                mv = b_move(sel, nb)
-                if len(mv) < 30:
-                    continue
-                n = len(mv)
-                avg = sum(mv) / n
-                se = (statistics.pstdev(mv) / (n ** 0.5)) if n > 1 else 0.0
-                mark = "✅" if avg - 1.96 * se > 0 else "❌" if avg + 1.96 * se < 0 else "  "
-                L.append(f"   {mark} через {hh:2}ч, {lbl:22}: {n:4} набл., "
-                         f"<b>{avg:+.3f}%</b> (±{1.96*se:.3f}), в плюс "
-                         f"{sum(1 for x in mv if x > 0)/n*100:.0f}%")
-
-        # 5.2 сделки: глубина захода × стоп, с подтверждением и без
-        L.append("  <b>5.2 Сделки: цель — противоположная граница</b>")
-        best_b = None
-        for conf_only in (False, True):
-            sel0 = [x for x in all_b if (x[1][6] if conf_only else True)]
-            tag = "с подтверждением" if conf_only else "по касанию"
-            for dep in BOUNCE_DEPTH:
-                sel = [x for x in sel0 if x[1][5] <= dep] if dep else \
-                      [x for x in sel0 if x[1][5] <= 0.05]
-                if len(sel) < 30:
-                    continue
-                for sp in BOUNCE_STOPS:
-                    rs = [x for x in (b_trade(r, sp) for _s, r in sel) if x is not None]
-                    cl = [x for x in (b_trade(r, sp, coin=True) for _s, r in sel) if x is not None]
-                    st, sc = _stat(rs), _stat(cl)
-                    if not st or st[0] < 30:
-                        continue
-                    mark = "✅" if st[1] - st[2] > 0 else "❌" if st[1] + st[2] < 0 else "  "
-                    edge_v = st[1] - (sc[1] if sc else 0)
-                    L.append(f"   {mark} {tag}, заход ≤{dep}%, стоп {sp}% за границей: "
-                             f"{st[0]:4} сд, ВР {st[3]:3.0f}%, <b>{st[1]:+.3f}R</b> "
-                             f"(±{st[2]:.3f}) | монетка {sc[1]:+.3f}R, эдж {edge_v:+.3f}R")
-                    if st[0] >= 60 and (best_b is None or st[1] > best_b[1]):
-                        best_b = (f"{tag}, заход ≤{dep}%, стоп {sp}%", st[1], st[0], edge_v)
-        if best_b:
-            L.append(f"   → <b>лучшее: {best_b[0]}</b> — {best_b[2]} сд, {best_b[1]:+.3f}R, "
-                     f"эдж {best_b[3]:+.3f}R")
-        else:
-            L.append("   ни один вариант не набрал 60 сделок")
+    L.append("<i>фандинг не учтён: шорты обычно получают платёж, поэтому реальность "
+             "скорее чуть лучше цифр</i>")
 
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
     try:
         B.send_blocks(msg.split("\n"))
     except Exception as e:
-        print(f"[PAIRS] отправка не удалась: {e}")
+        print(f"[XMOM] отправка не удалась: {e}")
 
 
 def main():
@@ -555,7 +270,7 @@ def main():
         import traceback
         traceback.print_exc()
         try:
-            B.send_telegram(f"⚠️ Разбор по парам упал: {e}")
+            B.send_telegram(f"⚠️ X-MOM упал: {e}")
         except Exception:
             pass
 
