@@ -1,4 +1,34 @@
 """
+bt_pairs.py — IGNITION + SWEEP: две интрадей-проверки на BTC/ETH в одном файле.
+
+Запуск: RUN_BACKTEST=pairs    (бот менять не нужно; прогоняются ОБЕ стратегии подряд)
+  PAIRS_RUN=both|ignition|sweep   — что именно гонять (по умолчанию both)
+
+Общее: свечи 15м BTC/ETH. Gate отдаёт ~100 дней, поэтому при нехватке берутся публичные
+свечи Binance (источник и охват печатаются). Вход по ОТКРЫТИЮ следующей свечи, выход не позже
+ближайших 22:00 МСК и не позже чем через 8ч, пауза после сигнала, контроли «монетка» и «против»
+со СТОПОМ НА СВОЕЙ СТОРОНЕ, интервалы по дням, критерии по объединённой выборке BTC+ETH.
+
+IGNITION — сжатие диапазона 6ч → пробой с объёмом (настройки IG_*).
+SWEEP    — снятие суточных экстремумов (настройки SW_*):
+  CONT — закрытие за экстремум 24ч, диапазон свечи >= K×ATR, объём >= K×медианы → по ходу;
+  FAKE — прокол экстремума и закрытие обратно внутрь → против выноса.
+  Контроли: COIN (случайное направление), ANTI (против), NOVOL (слабый объём), OUTWIN
+  (вне окна), разрез EQ/одиночные экстремумы (касания считаются раздельно, не соседние бары).
+
+ЧТО ИСПРАВЛЕНО ПРИ АУДИТЕ SWEEP v1.1:
+ 1. Свеча, проколовшая ОБА суточных экстремума, давала «лонг» со стопом ВЫШЕ входа и
+    записывалась как +0.92R. Такие свечи теперь пропускаются.
+ 2. Вход по закрытию сигнальной свечи → по открытию следующей.
+ 3. sim() падал на пустом пути (ветка NOVOL без проверки длины).
+ 4. EQ-разрез считал соседние бары у вершины как разные касания — теперь касания должны
+    быть разделены минимум SW_EQ_GAP барами.
+ 5. История 540 дней у Gate недоступна → запасной источник Binance.
+ 6. Контроль считался по входу со сдвигом в другую сторону проскальзывания; теперь та же
+    функция trade() и для основной сделки, и для контролей.
+ 7. Критерии по объединённой выборке с тремя исходами: есть эффект / нет / мало сделок.
+"""
+IGNITION_DOC = """
 bt_pairs.py — RANGE IGNITION v1.2 (после аудита): интрадей-расширение волатильности BTC/ETH.
 
 Запуск: RUN_BACKTEST=pairs   (бот менять не нужно)
@@ -35,6 +65,7 @@ bt_pairs.py — RANGE IGNITION v1.2 (после аудита): интрадей-
 ② MAIN ≥ NOVOL + 0.05R; ③ MAIN не хуже OUTWIN; ④ обе половины в плюсе;
 ⑤ знак держится при IG_OFFSET=180. ①+② обязательны.
 """
+
 import os
 import time
 import random
@@ -142,24 +173,39 @@ def _dedupe(rows):
     return u
 
 
-def fetch(sym):
-    """Возвращает (свечи, источник, примечание). Последняя (незакрытая) свеча отбрасывается."""
+_CACHE = {}
+
+
+def fetch_for(sym, days, offset):
+    """Возвращает (свечи, источник, примечание). Последняя (незакрытая) свеча отбрасывается.
+    Результат кэшируется: IGNITION и SWEEP на одном периоде качают данные один раз."""
+    key = (sym, days, offset, SOURCE)
+    if key in _CACHE:
+        return _CACHE[key]
     notes = []
     gate = []
     if SOURCE in ("auto", "gate"):
-        gate = fetch_gate(sym, DAYS, OFFSET)
+        gate = fetch_gate(sym, days, offset)
     cov = (gate[-1]["t"] - gate[0]["t"]) / 86400 if len(gate) > 1 else 0.0
     if SOURCE == "gate" or (SOURCE == "auto" and cov >= MIN_DAYS):
-        return gate[:-1], "Gate", ""
-    if SOURCE == "auto":
-        notes.append(f"у Gate только {cov:.0f} дн 15м-свечей")
-    bn, note = fetch_binance(sym, DAYS, OFFSET)
-    if note:
-        notes.append(note)
-    bcov = (bn[-1]["t"] - bn[0]["t"]) / 86400 if len(bn) > 1 else 0.0
-    if bcov > cov:
-        return bn[:-1], "Binance (спот)", "; ".join(notes)
-    return gate[:-1], "Gate", "; ".join(notes + ["Binance не дал больше данных"])
+        res = (gate[:-1], "Gate", "")
+    else:
+        if SOURCE == "auto":
+            notes.append(f"у Gate только {cov:.0f} дн 15м-свечей")
+        bn, note = fetch_binance(sym, days, offset)
+        if note:
+            notes.append(note)
+        bcov = (bn[-1]["t"] - bn[0]["t"]) / 86400 if len(bn) > 1 else 0.0
+        if bcov > cov:
+            res = (bn[:-1], "Binance (спот)", "; ".join(notes))
+        else:
+            res = (gate[:-1], "Gate", "; ".join(notes + ["Binance не дал больше данных"]))
+    _CACHE[key] = res
+    return res
+
+
+def fetch(sym):
+    return fetch_for(sym, DAYS, OFFSET)
 
 
 # ═════════════ сделка ═════════════
@@ -377,7 +423,7 @@ def evaluate_criteria(ev):
 
 # ═════════════ отчёт ═════════════
 
-def run():
+def run_ignition():
     rnd = random.Random(2024)
     L = [f"🔥 <b>RANGE IGNITION v1.2</b>: {', '.join(PAIRS)}, запрошено {DAYS} дн 15м"
          + (f"\n⏪ <b>СДВИНУТ НА {OFFSET} ДН</b> — проверка на чужом периоде" if OFFSET else ""),
@@ -467,13 +513,285 @@ def run():
         print(f"[IG] отправка: {e}")
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SWEEP — разгон и ложный вынос при снятии суточных экстремумов (BTC/ETH, интрадей)
+# ═════════════════════════════════════════════════════════════════════════════
+SW_DAYS      = int(os.environ.get("SW_DAYS", str(DAYS)))
+SW_OFFSET    = int(os.environ.get("SW_OFFSET", str(OFFSET)))
+SW_LOOK      = int(os.environ.get("SW_LOOK", "96"))               # сутки по 15м
+SW_RNG_K     = float(os.environ.get("SW_RNG_K", "1.3"))           # диапазон сигнальной >= K×ATR
+SW_VOL_K     = float(os.environ.get("SW_VOL_K", "1.5"))           # объём >= K×медианы
+SW_EQ_TOL    = float(os.environ.get("SW_EQ_TOL", "0.12"))         # % допуск касания экстремума
+SW_EQ_GAP    = int(os.environ.get("SW_EQ_GAP", "8"))              # касания раздельны, если >= N баров
+SW_STOP_F    = float(os.environ.get("SW_STOP_F", "0.4"))          # % пол стопа
+SW_MAX_HOLD_H = float(os.environ.get("SW_MAX_HOLD_H", "8"))
+SW_SKIP_BARS = int(os.environ.get("SW_SKIP_BARS", "8"))
+SW_WIN       = (7 * 60, 21 * 60)                                  # закрытие сигнала, МСК
+SW_N_CONT    = int(os.environ.get("SW_N_MIN", "300"))
+SW_N_FAKE    = int(os.environ.get("SW_N_MIN_FAKE", "200"))
+
+
+def sweep_entry_stop(px, is_long, ext, atr):
+    """Вход по px со сдвигом, стоп за экстремум сигнальной свечи ±0.05×ATR, пол SW_STOP_F %.
+    Если структурный стоп оказался не с той стороны (цена открылась за ним) — тоже пол."""
+    ent = px * (1 + SLIP / 100) if is_long else px * (1 - SLIP / 100)
+    stp = ext - 0.05 * atr if is_long else ext + 0.05 * atr
+    wrong = (stp >= ent) if is_long else (stp <= ent)
+    if wrong or abs(ent - stp) / ent * 100 < SW_STOP_F:
+        stp = ent * (1 - SW_STOP_F / 100) if is_long else ent * (1 + SW_STOP_F / 100)
+    return ent, stp
+
+
+def count_touches(prev, level, is_high):
+    """Сколько РАЗДЕЛЬНЫХ касаний экстремума было за сутки. Соседние бары у вершины —
+    одно касание, иначе почти любая вершина считалась бы «двойной»."""
+    tol = SW_EQ_TOL / 100
+    idx = [k for k, x in enumerate(prev)
+           if (x["h"] >= level * (1 - tol) if is_high else x["l"] <= level * (1 + tol))]
+    if not idx:
+        return 0
+    n = 1
+    for a, b in zip(idx, idx[1:]):
+        if b - a >= SW_EQ_GAP:
+            n += 1
+    return n
+
+
+def find_sweep(c):
+    """События CONT / FAKE и контроли NOVOL / OUTWIN. Только данные ДО сигнала."""
+    n = len(c)
+    if n < SW_LOOK + 400:
+        return [], {}
+    gaps = [0] * n
+    for j in range(1, n):
+        gaps[j] = gaps[j - 1] + (1 if c[j]["t"] - c[j - 1]["t"] != SEC else 0)
+    fn = {"bars": 0, "beyond": 0, "beyond_range": 0, "vol_ok": 0, "fake_raw": 0, "fake_both": 0}
+    events, last_i = [], {}
+    for i in range(SW_LOOK + 2, n - MIN_BARS_PATH - 2):
+        if gaps[i + 1] - gaps[i - 100] > 0:
+            continue
+        fn["bars"] += 1
+        s = c[i]
+        atr = B.trimmed_mean(B.true_ranges(c[i - 1 - 96:i]))
+        if not atr or atr <= 0:
+            continue
+        prev = c[i - SW_LOOK:i]
+        hi, lo = max(x["h"] for x in prev), min(x["l"] for x in prev)
+        if hi <= 0 or lo <= 0:
+            continue
+        close_ts = s["t"] + SEC
+        dt = datetime.fromtimestamp(close_ts, MSK)
+        mins = dt.hour * 60 + dt.minute
+        inwin = SW_WIN[0] <= mins < SW_WIN[1]
+        beyond_up, beyond_dn = s["c"] > hi, s["c"] < lo
+        fake_up = s["h"] > hi and s["c"] < hi
+        fake_dn = s["l"] < lo and s["c"] > lo
+        up = False
+        eq = None
+        if beyond_up or beyond_dn:
+            fn["beyond"] += 1
+            if (s["h"] - s["l"]) < SW_RNG_K * atr:
+                continue
+            fn["beyond_range"] += 1
+            vmed = statistics.median([x.get("v", 0) or 0 for x in prev]) or 0
+            volok = vmed > 0 and (s.get("v", 0) or 0) >= SW_VOL_K * vmed
+            fn["vol_ok"] += 1 if volok else 0
+            up = beyond_up
+            ext = s["l"] if up else s["h"]
+            cat = ("cont" if inwin else "outwin") if volok else "novol"
+            if cat == "novol" and not inwin:
+                continue
+            eq = count_touches(prev, hi if up else lo, up) >= 2
+        elif fake_up or fake_dn:
+            fn["fake_raw"] += 1
+            if fake_up and fake_dn:
+                fn["fake_both"] += 1                    # свеча шире суточного диапазона — не считаем
+                continue
+            if not inwin:
+                continue
+            cat = "fake"
+            up = fake_up                                # вынос вверх → ШОРТ
+            ext = s["h"] if fake_up else s["l"]
+        else:
+            continue
+        if i - last_i.get(cat, -10 ** 9) < SW_SKIP_BARS:
+            continue
+        t_limit = min(next_eod_ts(close_ts), close_ts + SW_MAX_HOLD_H * 3600)
+        j = i + 1
+        while j < n and c[j]["t"] + SEC <= t_limit:
+            j += 1
+        fut = c[i + 1:j]
+        if len(fut) < MIN_BARS_PATH or fut[0]["t"] != s["t"] + SEC:
+            continue
+        px = fut[0]["o"]                                # вход по ОТКРЫТИЮ следующей свечи
+        is_long = (not up) if cat == "fake" else up     # FAKE — против выноса
+        ent, stp = sweep_entry_stop(px, is_long, ext, atr)
+        r = sim(fut, is_long, ent, stp)
+        if r is None:
+            continue
+        last_i[cat] = i
+        events.append({"cat": cat, "r": r, "up": is_long, "t": close_ts, "px": px, "fut": fut,
+                       "risk_pct": abs(ent - stp) / ent * 100, "eq": eq,
+                       "day": dt.strftime("%Y-%m-%d"), "month": dt.strftime("%Y-%m")})
+    return events, fn
+
+
+def add_sweep_controls(events, rng):
+    """COIN и ANTI на тех же входах CONT и FAKE. Риск тот же, стоп на своей стороне."""
+    for e in events:
+        if e["cat"] not in ("cont", "fake"):
+            continue
+        e["r_anti"] = trade(e["fut"], e["px"], not e["up"], e["risk_pct"])
+        e["r_coin"] = trade(e["fut"], e["px"], rng.random() < 0.5, e["risk_pct"])
+        if e["r_coin"] is not None:
+            e["d_coin"] = e["r"] - e["r_coin"]
+
+
+def _status(evs, n_min, thr):
+    """Исход критерия ①: ok / no / few (мало сделок для вывода)."""
+    st = _stat(evs)
+    if not st or st[0] < n_min:
+        return "few", st
+    return ("ok" if st[1] - st[2] > thr else "no"), st
+
+
+def sweep_verdict(ev, kind):
+    """Критерии одной формы (cont или fake) по объединённой выборке."""
+    main = [e for e in ev if e["cat"] == kind]
+    n_min, thr = (SW_N_CONT, 0.05) if kind == "cont" else (SW_N_FAKE, 0.05)
+    st1, sm = _status(main, n_min, thr)
+    dc = _stat(main, "d_coin")
+    ok2 = bool(dc and dc[1] >= 0.05)
+    mark1 = {"ok": "✅", "no": "❌", "few": "⚠️"}[st1]
+    rows = [f"  {mark1} ① {kind.upper()} ≥ +0.05R значимо при n ≥ {n_min}"
+            + (f" (n={sm[0]}, {sm[1]:+.3f}R, ±{sm[2]:.3f})" if sm else "")
+            + (" — сделок мало, вывод по пункту невозможен" if st1 == "few" and sm else "")]
+    rows.append(f"  {'✅' if ok2 else '❌'} ② {kind.upper()} − COIN ≥ +0.05R"
+                + (f" ({dc[1]:+.3f}R, ±{dc[2]:.3f})" if dc else ""))
+    ok3 = None
+    if kind == "cont":
+        nv = [e for e in ev if e["cat"] == "novol"]
+        snv = _stat(nv)
+        ok3 = bool(sm and snv and sm[1] - snv[1] >= 0.03)
+        rows.append(f"  {'✅' if ok3 else '❌'} ③ CONT − NOVOL ≥ +0.03R"
+                    + (f" ({sm[1] - snv[1]:+.3f}R)" if sm and snv else ""))
+    ok4 = False
+    if len(main) >= 20:
+        ms = sorted(main, key=lambda e: e["t"])
+        h = len(ms) // 2
+        a, b = _stat(ms[:h]), _stat(ms[h:])
+        ok4 = bool(a and b and a[1] > 0 and b[1] > 0)
+        rows.append(f"  {'✅' if ok4 else '❌'} ⑤ обе половины в плюсе"
+                    + (f" ({a[1]:+.3f}R | {b[1]:+.3f}R)" if a and b else ""))
+    if st1 == "ok" and ok2:
+        verdict = "①+② ВЫПОЛНЕНЫ — смотреть ③ и ⑤, потом offset"
+    elif st1 == "few" and sm and sm[1] + sm[2] < 0:
+        verdict = "сделок мало, но значимо в минусе — закрывать"
+    elif st1 == "few":
+        verdict = "ВЫВОД НЕВОЗМОЖЕН: сделок мало"
+    else:
+        verdict = "КРИТЕРИИ НЕ ВЫПОЛНЕНЫ"
+    return rows, verdict
+
+
+def run_sweep():
+    rnd = random.Random(777)
+    L = [f"⚡ <b>SWEEP v1.2</b>: {', '.join(PAIRS)}, запрошено {SW_DAYS} дн 15м"
+         + (f"\n⏪ <b>СДВИНУТ НА {SW_OFFSET} ДН</b> — проверка на чужом периоде" if SW_OFFSET else ""),
+         f"<i>CONT: закрытие за экстремум {SW_LOOK // 4}ч, диапазон свечи ≥{SW_RNG_K}×ATR, "
+         f"объём ≥{SW_VOL_K}× медианы → по ходу | FAKE: прокол и закрытие внутрь → против</i>",
+         f"<i>вход по открытию следующей свечи | стоп за свечу ±0.05×ATR, пол {SW_STOP_F}% | "
+         f"TP {TP1R}R/{TP2R}R 50/50, безубыток после TP1 | выход не позже 22:00 МСК и "
+         f"+{SW_MAX_HOLD_H:.0f}ч | окно {SW_WIN[0] // 60:02d}:00–{SW_WIN[1] // 60:02d}:00 МСК | "
+         f"издержки {(FEE + SLIP) * 2:.2f}% на круг</i>", ""]
+    all_ev = []
+    for sym in PAIRS:
+        c, src, note = fetch_for(sym, SW_DAYS, SW_OFFSET)
+        cov = (c[-1]["t"] - c[0]["t"]) / 86400 if len(c) > 1 else 0.0
+        gaps = sum(1 for a, b in zip(c, c[1:]) if b["t"] - a["t"] != SEC)
+        L.append(f"── <b>{sym}</b> ── источник: {src}, охват {cov:.0f} дн, {len(c)} свечей, "
+                 f"пропусков {gaps}" + (f" <i>({note})</i>" if note else ""))
+        ev, fn = find_sweep(c)
+        if not fn:
+            L.append("  ⚠️ истории слишком мало для расчёта")
+            L.append("")
+            continue
+        add_sweep_controls(ev, rnd)
+        for e in ev:
+            e["sym"] = sym
+        all_ev += ev
+        L.append(f"  воронка: баров {fn['bars']} → закрытий за экстремум {fn['beyond']} → "
+                 f"с размахом ≥{SW_RNG_K}×ATR {fn['beyond_range']} → с объёмом {fn['vol_ok']} | "
+                 f"проколов с возвратом {fn['fake_raw']} (двусторонних отброшено {fn['fake_both']})")
+        for kind, name in (("cont", "CONT"), ("fake", "FAKE")):
+            m = [e for e in ev if e["cat"] == kind]
+            L.append(_line(m, name))
+            L.append(_line(m, f"  {name} COIN (случайно)", "r_coin"))
+            L.append(_line(m, f"  {name} ANTI (против)", "r_anti"))
+            L.append(_line([e for e in m if e["up"]], f"  {name} лонги"))
+            L.append(_line([e for e in m if not e["up"]], f"  {name} шорты"))
+            if kind == "cont":
+                L.append(_line([e for e in ev if e["cat"] == "novol"], "  NOVOL (слабый объём)"))
+                L.append(_line([e for e in ev if e["cat"] == "outwin"], "  OUTWIN (вне окна)"))
+                L.append(_line([e for e in m if e["eq"]], "  CONT на двойных экстремумах"))
+                L.append(_line([e for e in m if e["eq"] is False], "  CONT на одиночных"))
+        L.append("")
+
+    if all_ev:
+        L.append("── <b>ОБЪЕДИНЕНО</b> ──")
+        for kind, name in (("cont", "CONT"), ("fake", "FAKE")):
+            m = [e for e in all_ev if e["cat"] == kind]
+            L.append(_line(m, name))
+            L.append(_line(m, f"  {name} COIN", "r_coin"))
+            L.append(_line(m, f"  {name} ANTI", "r_anti"))
+            by_m = {}
+            for e in m:
+                by_m.setdefault(e["month"], []).append(e["r"])
+            if len(by_m) >= 3:
+                w = min(by_m.items(), key=lambda kv: sum(kv[1]))
+                L.append(f"  худший месяц {name}: {w[0]} ({sum(w[1]):+.1f}R, {len(w[1])} сд)")
+        L.append("")
+        L.append("<b>КРИТЕРИИ</b> (интервалы по дням, объединённая выборка)")
+        for kind in ("cont", "fake"):
+            rows, verdict = sweep_verdict(all_ev, kind)
+            L += rows
+            L.append(f"  → <b>{kind.upper()}: {verdict}</b>")
+        L.append("  ⑤ повторить со сдвигом (SW_OFFSET=180) — знак должен совпасть")
+        L.append("<i>CONT и FAKE оцениваются независимо — может выжить один. Если провал ① у "
+                 "обоих, ускорение при снятии стопов после издержек не монетизируется входом "
+                 "по закрытию 15м</i>")
+    _send(L)
+
+
+def _send(L):
+    msg = "\n".join(L)
+    print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
+    try:
+        B.send_blocks(msg.split("\n"))
+    except Exception as e:
+        print(f"[PAIRS] отправка: {e}")
+
+
+# ═════════════ запуск ═════════════
+
+PAIRS_RUN = os.environ.get("PAIRS_RUN", "both").lower()
+
+
+def run():
+    if PAIRS_RUN in ("both", "ignition"):
+        run_ignition()
+    if PAIRS_RUN in ("both", "sweep"):
+        run_sweep()
+
+
 def main():
     try:
         run()
     except Exception:
         traceback.print_exc()
         try:
-            B.send_telegram(f"⚠️ ignition упал: {traceback.format_exc()[-400:]}")
+            B.send_telegram(f"⚠️ pairs (ignition/sweep) упал: {traceback.format_exc()[-400:]}")
         except Exception:
             pass
 
