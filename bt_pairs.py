@@ -176,6 +176,43 @@ def run():
             t += cycle_sec
         return cyc, lon, sho, rc
 
+    def cycles_long(mom_h, hold_d, rng):
+        """Long-only: топ-N по рангу против СЛУЧАЙНЫХ N лонгов.
+        Зачем отдельно: лонг топ-N несёт в себе общий рост рынка. Сравнение со
+        случайными лонгами вычитает этот общий рост и оставляет вклад самого
+        ранжирования. Общий контроль (лонги+шорты вместе) этого не показывает."""
+        cyc, rc = [], []
+        cycle_sec = hold_d * 86400
+        t = times[0] + (mom_h + 2) * 3600
+        while t + cycle_sec <= times[-1]:
+            r = ranking(t - 3600, mom_h)
+            t_out = t + cycle_sec
+            if r is None or t_out not in ref:
+                t += cycle_sec
+                continue
+            longs, _, _ = r
+            pls = [x for x in (slot(s_, "long", t, t_out) for s_ in longs) if x is not None]
+            pool = [s_ for s_ in data if t in data[s_] and t_out in data[s_]]
+            if len(pls) >= TOP_N - 1 and len(pool) >= TOP_N:
+                pick = rng.sample(pool, TOP_N)
+                rs = [x for x in (slot(s_, "long", t, t_out) for s_ in pick) if x is not None]
+                if rs:                      # пара считается только когда есть ОБЕ половины
+                    cyc.append(sum(pls) / len(pls) * 100)
+                    rc.append(sum(rs) / len(rs) * 100)
+            t += cycle_sec
+        return cyc, rc
+
+    def alpha_of(cyc, rc):
+        """Разница «наши лонги минус случайные» с доверительным интервалом.
+        Считается по ПАРАМ циклов, поэтому общий рост рынка вычитается честно."""
+        if not cyc or len(cyc) != len(rc) or len(cyc) < 5:
+            return None
+        d = [a - b for a, b in zip(cyc, rc)]
+        n = len(d)
+        m = sum(d) / n
+        se = (statistics.pstdev(d) / (n ** 0.5)) if n > 1 else 0.0
+        return n, m, 1.96 * se
+
     cov = (times[-1] - times[0]) / 86400
     L = [f"📈 <b>X-MOM: кросс-секционный моментум</b> (~{cov:.0f} дн, {len(data)} пар)"
          + (f"\n⏪ <b>ПЕРИОД СДВИНУТ НАЗАД НА {OFFSET} ДНЕЙ</b> — проверка на чужих данных"
@@ -251,6 +288,34 @@ def run():
                  f"за цикл (±{best[3]:.2f}), циклов {best[2]}")
         L.append("  <i>лучшая ячейка выбрана задним числом из 20 — верить ей можно только "
                  "если она подтвердится на сдвинутом периоде (XM_OFFSET=90)</i>")
+    L.append("")
+    L.append("<b>LONG-ONLY: альфа над СЛУЧАЙНЫМИ лонгами</b>")
+    L.append("  <i>лонг топ-N несёт общий рост рынка. Сравнение со случайными лонгами "
+             "вычитает его и оставляет вклад ранжирования. Ячейка — альфа, %/цикл</i>")
+    L.append("   ret\\цикл | " + " | ".join(f" {h}д  " for h in HOLD_GRID))
+    rnd2 = random.Random(54321)
+    best_a = None
+    for mh in MOM_GRID:
+        row = []
+        for hd in HOLD_GRID:
+            cl, rl = cycles_long(mh, hd, rnd2)
+            a = alpha_of(cl, rl)
+            if a and a[0] >= 8:
+                row.append(f"{a[1]:+.2f}")
+                if best_a is None or a[1] > best_a[1][1]:
+                    best_a = ((mh, hd), a)
+            else:
+                row.append("  —  ")
+        L.append(f"   {mh:4}ч    | " + " | ".join(row))
+    if best_a:
+        (mh, hd), (n, m, ci) = best_a
+        verdict = ("альфа значима" if m - ci > 0 else
+                   "в пределах шума — ранжирование ничего не добавляет")
+        L.append(f"  → лучшая альфа: ret{mh}ч, цикл {hd}д → <b>{m:+.2f}%/цикл</b> "
+                 f"(±{ci:.2f}, {n} циклов) — {verdict}")
+        L.append("  <i>критерий: альфа ≥ +0.3%/цикл, значима, держится у СОСЕДНИХ ячеек "
+                 "и повторяется при XM_OFFSET=90. Одиночный пик — артефакт перебора: "
+                 "максимум из 20 ячеек при нулевом эдже сам по себе даёт ~1.4–1.9σ</i>")
     L.append("")
     L.append("<i>фандинг не учтён: шорты обычно получают платёж, поэтому реальность "
              "скорее чуть лучше цифр</i>")
