@@ -242,7 +242,7 @@ def run():
         by_d.setdefault(dts, []).append(net)
     tot_pct = sum(n for _, n, _ in fills)
     tot_usd = tot_pct * SLOT / 100
-    day_sums = list(by_d.values())
+    day_sums = [sum(v) for v in by_d.values()]   # сумма % за каждый торговый день
     se = statistics.pstdev(day_sums) if len(day_sums) > 1 else 0.0
     ci_usd = Z * se * math.sqrt(len(day_sums)) * SLOT / 100
     # MaxDD по торговым дням
