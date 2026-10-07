@@ -2,8 +2,16 @@
 Слой исполнения для Upscale API (v1: dry + отправка ордеров ТОЛЬКО на демо-счёт).
 
 Умеет: читать счета/рынки/позиции; считать план сделки; в режиме dry писать «что бы открыл»;
-в режиме demo — открывать market со стопом сразу, ставить TP1/TP2 отдельными take-ордерами
-через TP_DELAY_SEC (правило 60с); самопроверка /uptest; kill-switch (/halt) и /closeall.
+в режиме demo — открывать market со стопом сразу.
+Два режима выхода (выбираются полем сигнала exit_mode):
+  - "tp_ladder" (по умолчанию, старое поведение) — TP1/TP2/TP3 отдельными
+    take-ордерами через TP_DELAY_SEC (правило 60с), после TP1 перевод в
+    безубыток (BREAKEVEN_*).
+  - "trailing" (v4.4, donchian) — без TP вообще: только начальный стоп со
+    входом. Подтяжку стопа / закрытие по развороту сигнала / по времени
+    считает и вызывает стратегия (exec_donchian_regime_v42.py) на дневном
+    скане через публичные move_stop()/close_position().
+Самопроверка /uptest; kill-switch (/halt) и /closeall.
 Жёсткая защита: ордера уходят только если тип счёта == demo.
 Сигналы в телеграм от этого модуля не зависят: любая ошибка здесь гасится.
 
@@ -18,12 +26,13 @@
   EXEC_MAX_OPEN       максимум одновременных позиций (3)
   EXEC_MAX_TRADES_DAY максимум входов за сутки UTC (8)
   EXEC_BREAKEVEN      on|off — перевод стопа в безубыток после TP1 (по умолчанию on)
-  EXEC_DAY_SOFT_FRAC / EXEC_DAY_HARD_FRAC   доля дневного лимита: стоп входов (0.6) / аварийное закрытие (0.8)
+  EXEC_DAY_SOFT_FRAC / EXEC_DAY_HARD_FRAC   доля дневного лимита: стоп входов (0.6) / аварийное закрытие + стоп бота (0.9)
   EXEC_TOT_SOFT_FRAC / EXEC_TOT_HARD_FRAC   то же для максимальной просадки (0.6 / 0.7)
   EXEC_DAY_GAIN_CAP_PCT  потолок дневного плюса в % (правило 30%), 0 = выключено
 """
 import os
 import re
+import json
 import time
 import threading
 import traceback
@@ -33,7 +42,7 @@ from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import requests
 
-EXEC_VERSION  = "2.7"   # смотри в /up и /uptest: так видно, какой файл реально запущен
+EXEC_VERSION  = "2.10"   # смотри в /up и /uptest: так видно, какой файл реально запущен
 BASE_URL      = os.environ.get("UPSCALE_API_URL", "https://api.upscale.trade")
 FP            = Decimal(10) ** 9
 LEVERAGE      = Decimal(os.environ.get("EXEC_LEVERAGE", "5"))
@@ -46,11 +55,12 @@ MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "0"))       # 0 = без л�
 # три сделки, открытые 40 минут назад, из счётчика выпадали, и пачка проходила заново —
 # так набиралось 6 позиций в одну сторону вместо пяти. Здесь считаем то, что реально
 # висит на счёте, и это уже не обойти временем.
-MAX_SAME_SIDE_OPEN = int(os.environ.get("EXEC_MAX_SAME_SIDE", "5"))
+MAX_SAME_SIDE_OPEN = int(os.environ.get("EXEC_MAX_SAME_SIDE", "3"))
+API_TIMEOUT   = float(os.environ.get("EXEC_API_TIMEOUT", "20"))   # сек на запрос к Upscale
 MAX_TRADES_DAY = int(os.environ.get("EXEC_MAX_TRADES_DAY", "0"))  # 0 = без лимита, ориентир только на риск
 # Защита по просадке — доли от лимитов счёта (при 5%/10%: стоп входов 3%/6%, аварийное закрытие 4%/7%)
 DAY_SOFT_FRAC = Decimal(os.environ.get("EXEC_DAY_SOFT_FRAC", "0.6"))
-DAY_HARD_FRAC = Decimal(os.environ.get("EXEC_DAY_HARD_FRAC", "0.8"))
+DAY_HARD_FRAC = Decimal(os.environ.get("EXEC_DAY_HARD_FRAC", "0.9"))  # -$450 при дне $500 (10k, 5%)
 TOT_SOFT_FRAC = Decimal(os.environ.get("EXEC_TOT_SOFT_FRAC", "0.6"))
 TOT_HARD_FRAC = Decimal(os.environ.get("EXEC_TOT_HARD_FRAC", "0.7"))
 DAY_GAIN_CAP_PCT = Decimal(os.environ.get("EXEC_DAY_GAIN_CAP_PCT", "0"))   # >0: не входить, если плюс за день ≥ N% (правило 30%); 0 = выкл
@@ -64,6 +74,36 @@ BREAKEVEN_OFFSET  = Decimal(os.environ.get("EXEC_BREAKEVEN_OFFSET", "0.0005"))  
 BREAKEVEN_POLL    = int(os.environ.get("EXEC_BREAKEVEN_POLL", "20"))            # как часто смотреть, сработал ли TP1
 BREAKEVEN_MAX_MIN = int(os.environ.get("EXEC_BREAKEVEN_MAX_MIN", "720"))        # сколько всего следить, мин
 MARKETS_TTL   = 30 * 60
+
+# v2.9: вход исполняется синхронно (маркет+стоп), но TP ставятся через
+# threading.Timer на TP_DELAY_SEC, а перевод в безубыток — через
+# threading.Thread на BREAKEVEN_MAX_MIN. Оба живут ТОЛЬКО в памяти процесса.
+# Обычный SIGTERM при деплое Render (см. _on_shutdown в bot.py) или OOM убьёт
+# процесс в любой момент — если это произойдёт в окне между входом и
+# постановкой TP, позиция останется ТОЛЬКО со стопом навсегда, и ни один
+# код в системе не заметит и не исправит эту дыру. Персистентный файл ниже —
+# чтобы при перезапуске восстановить и доставить то, что не успело сработать.
+PENDING_TP_FILE = os.environ.get("EXEC_PENDING_TP_FILE", "/tmp/pending_tp_upscale_exec.json")
+
+
+def _atomic_write_json(path: str, data) -> None:
+    """Запись во временный файл + os.replace() — атомарно на уровне ОС, в
+    отличие от прямого open(path,"w"), который оставляет битый файл, если
+    процесс убьют посреди записи (SIGKILL/OOM)."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _load_json(path: str, default):
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
 
 
 # ── fp9: числа как строки ×10⁹, только Decimal ───────────────────────────────
@@ -97,7 +137,10 @@ class UpscaleClient:
                 time.sleep(wait)
             self._last = time.time()
         auth = f"{self.scheme} {self.key}".strip()
-        r = requests.get(self.base + path, params=params, timeout=10,
+        # v2.8: было 10с. Когда параллельно идёт бэктест (сотни запросов свечей),
+        # опрос счёта не успевал ответить и в лог сыпался ReadTimeout. Исполнение от
+        # этого не ломалось (вызовы обёрнуты в try), но сообщения пугали.
+        r = requests.get(self.base + path, params=params, timeout=API_TIMEOUT,
                          headers={"Authorization": auth, "Accept": "application/json"})
         if r.status_code == 429:
             raise UpscaleError("429: лимит запросов")
@@ -368,8 +411,81 @@ class Executor:
         self._mk, self._mk_ts = {}, 0.0
         self._day = {"date": "", "n": 0}
         self._lock = threading.Lock()
+        self._pending_lock = threading.Lock()   # сериализует запись PENDING_TP_FILE
+        self._watching_be = set()               # id позиций, за которыми уже следит поток _watch_breakeven
         if self.mode == "demo" and self.client:
             threading.Thread(target=self._watchdog, daemon=True).start()
+
+    # -- персистентность TP/безубытка (переживает перезапуск процесса) --
+    def _pending_set(self, info, stage, due_ts=None):
+        rec = dict(info)
+        rec["entry"] = str(rec.get("entry"))
+        rec["stage"] = stage
+        if due_ts is not None:
+            rec["due_ts"] = due_ts
+        with self._pending_lock:
+            data = _load_json(PENDING_TP_FILE, {})
+            data[info["id"]] = rec
+            _atomic_write_json(PENDING_TP_FILE, data)
+
+    def _pending_drop(self, pos_id):
+        with self._pending_lock:
+            data = _load_json(PENDING_TP_FILE, {})
+            if pos_id in data:
+                del data[pos_id]
+                _atomic_write_json(PENDING_TP_FILE, data)
+
+    def _recover_pending_tps(self):
+        """Восстановление после перезапуска процесса (SIGTERM при деплое Render,
+        OOM). TP ставятся через threading.Timer, безубыток отслеживается через
+        threading.Thread — оба живут только в памяти и пропадают при перезапуске,
+        поэтому без этого позиция могла бы остаться навсегда только со стопом.
+        Вызывается один раз при старте watchdog-потока: читает PENDING_TP_FILE и
+        либо сразу ставит TP (если время уже прошло), либо планирует оставшееся
+        ожидание, либо перезапускает наблюдение за безубытком — как если бы
+        процесс не перезапускался."""
+        try:
+            data = _load_json(PENDING_TP_FILE, {})
+            if not data:
+                return
+            self._ensure_account()
+            if not self.client or not self.account_id:
+                return
+            try:
+                live_ids = {_pos_id(p) for p in self._positions()}
+            except Exception:
+                live_ids = None   # не смогли проверить — не сносим записи вслепую
+            changed = False
+            for pos_id, rec in list(data.items()):
+                if live_ids is not None and pos_id not in live_ids:
+                    del data[pos_id]      # позиция уже закрыта — восстанавливать нечего
+                    changed = True
+                    continue
+                info = {k: v for k, v in rec.items() if k not in ("stage", "due_ts")}
+                try:
+                    info["entry"] = Decimal(str(info.get("entry")))
+                except Exception:
+                    info["entry"] = Decimal(0)
+                stage = rec.get("stage")
+                if stage == "pending_tp":
+                    remain = max(0.0, float(rec.get("due_ts", 0)) - time.time())
+                    self.send(f"♻️ {info.get('sym','?')}: восстановил отложенную постановку TP "
+                              f"после перезапуска ({'сразу' if remain <= 0 else f'через {remain:.0f}с'}).")
+                    threading.Timer(remain, self._fire_scheduled_tp, args=(info,)).start()
+                elif stage == "watching_be":
+                    if pos_id in self._watching_be:
+                        continue
+                    self._watching_be.add(pos_id)
+                    self.send(f"♻️ {info.get('sym','?')}: восстановил наблюдение за безубытком после перезапуска.")
+                    threading.Thread(target=self._watch_breakeven, args=(info,), daemon=True).start()
+                else:
+                    del data[pos_id]
+                    changed = True
+            if changed:
+                with self._pending_lock:
+                    _atomic_write_json(PENDING_TP_FILE, data)
+        except Exception:
+            print(f"[EXEC] recover_pending_tps: {traceback.format_exc()}")
 
     # -- служебное --
     def _refresh_markets(self):
@@ -409,9 +525,10 @@ class Executor:
 
     def _day_count(self):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if self._day["date"] != today:
-            self._day = {"date": today, "n": 0}
-        return self._day["n"]
+        with self._lock:
+            if self._day["date"] != today:
+                self._day = {"date": today, "n": 0}
+            return self._day["n"]
 
     # -- контроль баланса и просадки --
     def _snapshot(self):
@@ -441,7 +558,8 @@ class Executor:
 
     def _guard_skip(self, snap, new_risk: Decimal):
         """Причина отказа от входа по риску или None. Открытый риск считаем по стопам открытых позиций."""
-        open_risk = sum(self._open_risk.values(), Decimal(0))
+        with self._lock:
+            open_risk = sum(self._open_risk.values(), Decimal(0))
         if snap["day_loss"] + open_risk + new_risk > snap["day_soft"]:
             return (f"дневной риск: убыток ${snap['day_loss']:.0f} + открытый ${open_risk:.0f} + новый ${new_risk:.0f} "
                     f"> порога ${snap['day_soft']:.0f} (лимит ${snap['day_lim']:.0f})")
@@ -495,6 +613,10 @@ class Executor:
         self._check_hard(snap)
 
     def _watchdog(self):
+        try:
+            self._recover_pending_tps()
+        except Exception:
+            print(f"[EXEC] recover_pending_tps(старт): {traceback.format_exc()}")
         while True:
             time.sleep(WATCHDOG_SEC)
             try:
@@ -517,7 +639,8 @@ class Executor:
                      f"стоп входов ${snap['day_soft']:.0f}, аварийное закрытие ${snap['day_hard']:.0f}")
             L.append(f"Общая просадка ${snap['tot_loss']:.2f} из лимита ${snap['tot_lim']:.0f} ({snap['td_pct']}%) — "
                      f"стоп входов ${snap['tot_soft']:.0f}, аварийное закрытие ${snap['tot_hard']:.0f}")
-            open_risk = sum(self._open_risk.values(), Decimal(0))
+            with self._lock:
+                open_risk = sum(self._open_risk.values(), Decimal(0))
             L.append(f"Открытый риск по стопам (по данным бота): ${open_risk:.0f}")
             profit = snap["equity"] - from_fp9(rs.get("periodStartEquity") or 0)
             best = from_fp9(rs.get("maxPeriodDailyEquityDelta") or 0)
@@ -568,8 +691,22 @@ class Executor:
                             for f_ in ("price", "stop", "tp1_price", "tp2_price", "tp3_price"):
                                 if b.get(f_):
                                     b[f_] = float(Decimal(str(b[f_])) * k)
+                # risk_usd/max_pos_usd можно переопределить В САМОМ сигнале (b) —
+                # так разные стратегии на одном EXECUTOR считают риск по-своему
+                # (например, donchian_regime_v42 — compound sizing от equity),
+                # не трогая общие self.risk_usd/self.max_pos_usd и не создавая
+                # гонку между потоками разных сигналов. Без этих полей в b —
+                # прежнее поведение (общий риск из bot.py / ACCOUNT_USD).
+                risk_usd    = b.get("risk_usd", self.risk_usd)
+                max_pos_usd = b.get("max_pos_usd", self.max_pos_usd)
+                # v4.4/donchian: exit_mode="trailing" — сигнал без TP1/TP2 (выход
+                # по trailing-стопу, а не по лестнице целей). build_plan() всё
+                # равно хочет два числа для tp1_fp9/tp2_fp9 — они не используются
+                # нигде по этому пути (видно по _execute() ниже), поэтому в их
+                # отсутствие подставляем entry просто как безопасную заглушку.
                 plan = build_plan(b["price"], b["stop_pct"], side, b["stop"],
-                                  b["tp1_price"], b["tp2_price"], self.risk_usd, self.max_pos_usd)
+                                  b.get("tp1_price", b["price"]), b.get("tp2_price", b["price"]),
+                                  risk_usd, max_pos_usd)
             if not skip and self.mode == "demo":
                 skip = self._real_block()
                 if not skip and MAX_TRADES_DAY and self._day_count() >= MAX_TRADES_DAY:
@@ -603,14 +740,30 @@ class Executor:
             return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
         if any(_pos_market(p) == mid for p in pos_now):
             return "пропуск: по монете уже есть позиция"
-        if MAX_SAME_SIDE_OPEN:
+        # same_side_limit можно переопределить В СИГНАЛЕ (поле max_same_side) —
+        # так стратегия (donchian) передаёт свой риск-зависимый лимит, и он не
+        # расходится со статичным MAX_SAME_SIDE_OPEN (который иначе был бы
+        # вторым, независимым источником правды с похожим именем и риском
+        # разъехаться, если риск на сделку когда-нибудь изменится).
+        same_side_limit = b.get("max_same_side", MAX_SAME_SIDE_OPEN)
+        if same_side_limit:
             same = sum(1 for p in pos_now if _pos_dir(p) == side)
-            if same >= MAX_SAME_SIDE_OPEN:
+            if same >= same_side_limit:
                 return (f"пропуск: уже {same} открытых позиций в {side} "
-                        f"(лимит {MAX_SAME_SIDE_OPEN}) — не набираем одну ставку")
+                        f"(лимит {same_side_limit}) — не набираем одну ставку")
         before = {_pos_id(p) for p in pos_now}
-        live = set(before)
-        self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
+        # _open_risk читается/пишется из нескольких потоков одновременно —
+        # on_signal() запускает КАЖДЫЙ сигнал в своём потоке (специально, чтобы
+        # несколько входов за один скан не блокировали друг друга), поэтому без
+        # self._lock здесь была гонка: поток A может переписать весь словарь
+        # (оставив только "live" на момент СВОЕГО старта) уже ПОСЛЕ того, как
+        # поток B успел добавить туда риск своей только что открытой позиции —
+        # запись B стирается, и следующая проверка риска считает открытый риск
+        # заниженным именно в момент, когда одновременно открывается несколько
+        # позиций и риск-контроль нужнее всего.
+        with self._lock:
+            live = set(before)
+            self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
         snap = self._snapshot()
         if snap is None:
             return f"пропуск: не смог прочитать risk-status ({self._snap_err})"
@@ -622,7 +775,8 @@ class Executor:
             self.client.order(body)
         except UpscaleError as e:
             return f"ордер отклонён: {e}"
-        self._day["n"] += 1
+        with self._lock:
+            self._day["n"] += 1
         pos = self._wait_position(mid, side, before)
         if not pos:
             return "ордер отправлен, но позицию не нашёл (проверь терминал)"
@@ -651,21 +805,37 @@ class Executor:
         # диапазона. Пересчёт «чтобы сохранить RR» вынес бы их за структуру —
         # в живой сделке SAND TP2 уехал бы выше самой границы.
         # Проскальзывание честно ухудшает RR, и это надо ПОКАЗАТЬ, а не замаскировать.
-        rr1_real = abs(Decimal(str(b["tp1_price"])) - fill) / (risk_px or Decimal(1))
-        info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size,
-                "tp1": b["tp1_price"], "tp2": b["tp2_price"],
-                "tp3": b.get("tp3_price"), "sym": sym, "entry": fill}
-        self._open_risk[info["id"]] = real_risk
-        threading.Timer(TP_DELAY_SEC, self._place_tps, args=(info,)).start()
-        self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
-                  f"вход {fill:.6g} (проскальзывание {slip:+.2f}% к сигналу), "
-                  f"риск по стопу ≈ ${real_risk:.1f} (план ${plan['real_risk_usd']:.1f}, "
-                  f"стоп {real_stop_pct:.2f}% от входа). "
-                  f"Стоп {b['stop']:.6g} со входом. TP "
-                  + " / ".join(f"{b[k]:.6g}" for k in ("tp1_price", "tp2_price", "tp3_price") if b.get(k))
-                  + " "
-                  f"(реальное RR к TP1 = 1:{float(rr1_real):.1f}) через {TP_DELAY_SEC}с.")
-        if rr1_real < Decimal("1"):
+        exit_mode = b.get("exit_mode", "tp_ladder")
+        has_tp = exit_mode != "trailing" and b.get("tp1_price") is not None
+        rr1_real = abs(Decimal(str(b["tp1_price"])) - fill) / (risk_px or Decimal(1)) if has_tp else None
+        info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size, "sym": sym, "entry": fill}
+        if has_tp:
+            info.update(tp1=b["tp1_price"], tp2=b["tp2_price"], tp3=b.get("tp3_price"))
+        with self._lock:
+            self._open_risk[info["id"]] = real_risk
+        if exit_mode == "trailing":
+            # v4.4: без TP вообще — выходит trailing-стопом/сигналом/по времени,
+            # которые считает и шлёт exec_donchian_regime_v42.py на дневном скане
+            # (Executor.move_stop()/close_position()). Здесь ничего планировать
+            # не нужно — начальный стоп уже ушёл со входом (open_body выше).
+            self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
+                      f"вход {fill:.6g} (проскальзывание {slip:+.2f}% к сигналу), "
+                      f"риск по стопу ≈ ${real_risk:.1f} (план ${plan['real_risk_usd']:.1f}, "
+                      f"стоп {real_stop_pct:.2f}% от входа). "
+                      f"Стоп {b['stop']:.6g} со входом. Выход — trailing-стоп "
+                      f"(2×ATR, без TP), разворот сигнала или по времени.")
+        else:
+            self._pending_set(info, "pending_tp", due_ts=time.time() + TP_DELAY_SEC)
+            threading.Timer(TP_DELAY_SEC, self._fire_scheduled_tp, args=(info,)).start()
+            self.send(f"✅ <b>DEMO · {sym} {side.upper()} открыт</b>: размер {size_base:.6g} ≈ ${notional:.0f}, "
+                      f"вход {fill:.6g} (проскальзывание {slip:+.2f}% к сигналу), "
+                      f"риск по стопу ≈ ${real_risk:.1f} (план ${plan['real_risk_usd']:.1f}, "
+                      f"стоп {real_stop_pct:.2f}% от входа). "
+                      f"Стоп {b['stop']:.6g} со входом. TP "
+                      + " / ".join(f"{b[k]:.6g}" for k in ("tp1_price", "tp2_price", "tp3_price") if b.get(k))
+                      + " "
+                      f"(реальное RR к TP1 = 1:{float(rr1_real):.1f}) через {TP_DELAY_SEC}с.")
+        if rr1_real is not None and rr1_real < Decimal("1"):
             self.send(f"⚠️ {sym}: проскальзывание {slip:+.2f}% срезало RR до 1:{float(rr1_real):.1f} — "
                       f"цель ближе стопа. Цели структурные, двигать их нельзя; "
                       f"если такое повторяется, увеличивай буфер входа или стоп.")
@@ -687,13 +857,28 @@ class Executor:
                 last = e
         raise last
 
+    def _fire_scheduled_tp(self, info):
+        """Обёртка над _place_tps для threading.Timer (как обычного, так и
+        восстановленного после перезапуска). Снимает pending-запись ДО попытки
+        постановки TP, чтобы обычный таймер и восстановление при перезапуске,
+        если пересекутся, не поставили один и тот же TP дважды."""
+        self._pending_drop(info["id"])
+        self._place_tps(info)
+
     def _place_tps(self, info):
         try:
             if self.halted or not self.client:
+                # _fire_scheduled_tp уже снял pending-запись до вызова (чтобы обычный
+                # таймер и восстановление после перезапуска не поставили TP дважды) —
+                # возвращаем её назад с due_ts=сейчас, иначе при остановленном боте
+                # эта TP безвозвратно пропадёт из PENDING_TP_FILE и не восстановится
+                # даже после /resume + перезапуска процесса.
+                self._pending_set(info, "pending_tp", due_ts=time.time())
                 return
             cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
             if not cur:
                 self.send(f"ℹ️ {info['sym']}: позиция уже закрыта (стоп?) — TP не ставлю.")
+                self._pending_drop(info["id"])
                 return
             size = _pos_size(cur) or info["size"]
             tps = [t for t in (info.get("tp1"), info.get("tp2"), info.get("tp3")) if t]
@@ -716,7 +901,13 @@ class Executor:
             if done and BREAKEVEN_ENABLED and len(legs) > 1:
                 info["size"] = size
                 info["n_legs"] = len(legs)
+                self._pending_set(info, "watching_be")
+                self._watching_be.add(info["id"])
                 threading.Thread(target=self._watch_breakeven, args=(info,), daemon=True).start()
+            else:
+                # TP поставлены (или не принялись вовсе) и безубыток не нужен —
+                # больше нечего восстанавливать при перезапуске.
+                self._pending_drop(info["id"])
         except Exception as e:
             print(f"[EXEC] place_tps: {traceback.format_exc()}")
             self.send(f"⚠️ {info['sym']}: ошибка постановки TP: {e}")
@@ -741,49 +932,110 @@ class Executor:
         Именно подтяжка даёт основной прирост: в бэктесте те же три цели без неё
         давали +0.174R, с ней +0.264R, винрейт 66% против 77%.
         Факт взятия цели определяем по уменьшению размера позиции."""
-        deadline = time.time() + BREAKEVEN_MAX_MIN * 60
-        start = info["size"]
-        legs = max(2, int(info.get("n_legs", 2)))
-        moved = 0
-        while time.time() < deadline:
-            time.sleep(BREAKEVEN_POLL)
-            try:
-                if not self.client:
+        try:
+            deadline = time.time() + BREAKEVEN_MAX_MIN * 60
+            start = info["size"]
+            legs = max(2, int(info.get("n_legs", 2)))
+            moved = 0
+            while time.time() < deadline:
+                time.sleep(BREAKEVEN_POLL)
+                try:
+                    if not self.client:
+                        return
+                    cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
+                    if not cur:
+                        return                               # позиция закрыта целиком
+                    size_now = _pos_size(cur)
+                    if size_now <= 0:
+                        return
+                    taken = round((start - size_now) / start * legs)   # сколько целей взято
+                    if taken <= moved:
+                        continue
+                    if taken == 1:
+                        lvl, what = breakeven_price(info["entry"], info["dir"]), "безубыток"
+                    elif taken >= 2 and info.get("tp1"):
+                        lvl, what = Decimal(str(info["tp1"])), "уровень TP1"
+                    else:
+                        continue
+                    self._send_stop(info, size_now, lvl)
+                    moved = taken
+                    self.send(f"🔒 {info['sym']}: взята цель {taken} — стоп переставлен "
+                              f"в {what} ({float(lvl):.6g}) на остаток.")
+                    if taken >= legs - 1:
+                        return
+                except UpscaleError as e:
+                    self.send(f"⚠️ {info['sym']}: стоп не переставлен: {_trunc(e, 250)} — "
+                              f"перенеси руками.")
                     return
-                cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
-                if not cur:
-                    return                               # позиция закрыта целиком
-                size_now = _pos_size(cur)
-                if size_now <= 0:
+                except Exception:
+                    print(f"[EXEC] trail: {traceback.format_exc()}")
                     return
-                taken = round((start - size_now) / start * legs)   # сколько целей взято
-                if taken <= moved:
-                    continue
-                if taken == 1:
-                    lvl, what = breakeven_price(info["entry"], info["dir"]), "безубыток"
-                elif taken >= 2 and info.get("tp1"):
-                    lvl, what = Decimal(str(info["tp1"])), "уровень TP1"
-                else:
-                    continue
-                self._send_stop(info, size_now, lvl)
-                moved = taken
-                self.send(f"🔒 {info['sym']}: взята цель {taken} — стоп переставлен "
-                          f"в {what} ({float(lvl):.6g}) на остаток.")
-                if taken >= legs - 1:
-                    return
-            except UpscaleError as e:
-                self.send(f"⚠️ {info['sym']}: стоп не переставлен: {_trunc(e, 250)} — "
-                          f"перенеси руками.")
-                return
-            except Exception:
-                print(f"[EXEC] trail: {traceback.format_exc()}")
-                return
+        finally:
+            # Чем бы поток ни закончился (дедлайн, закрытие позиции, ошибка,
+            # перезапуск-рекавери отработал своё) — запись в PENDING_TP_FILE и
+            # отметка "уже слежу" больше не нужны и не должны их блокировать.
+            self._pending_drop(info["id"])
+            self._watching_be.discard(info["id"])
+
+    # -- v4.4: trailing-стоп режим (без TP) — вызывается из exec_donchian_regime_v42.py
+    # на дневном скане для уже открытых позиций. info нужен минимальный:
+    # {"id": position_id, "mid": market_id, "dir": "long"|"short"}.
+    def move_stop(self, info, new_price) -> str:
+        """Подтягивает защитный стоп к новой, более выгодной цене. Приём тот же,
+        что у перевода в безубыток выше (BREAKEVEN_ENABLED): Upscale не даёт
+        изменить/отменить уже выставленный stopTriggerPrice, поэтому стоп
+        переставляется ДОПОЛНИТЕЛЬНЫМ stop-ордером, который ближе к цене и
+        поэтому срабатывает первым; старые стоп-ордера остаются неиспользованным
+        «хвостом» и не мешают. Вызывающая сторона отвечает за то, чтобы
+        new_price было ТОЛЬКО теснее предыдущего — здесь это не проверяется."""
+        try:
+            if not self.client:
+                return "нет клиента"
+            cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
+            if not cur:
+                return "позиция уже закрыта"
+            size_now = _pos_size(cur)
+            if size_now <= 0:
+                return "позиция уже закрыта"
+            self._send_stop(info, size_now, new_price)
+            return f"стоп → {float(new_price):.6g}"
+        except UpscaleError as e:
+            return f"ошибка: {_trunc(e, 250)}"
+        except Exception as e:
+            print(f"[EXEC] move_stop: {traceback.format_exc()}")
+            return f"ошибка: {e}"
+
+    def close_position(self, info, size=None, reason: str = "") -> str:
+        """Закрывает позицию ПОЛНОСТЬЮ по рынку прямо сейчас — take-ордер с
+        triggerPrice=0 (тот же приём, что у /uptest: цена не важна, исполняется
+        немедленно). Нужен для выходов, которые решает сам бот (разворот сигнала,
+        максимальный срок удержания), а не биржевой уровень."""
+        try:
+            if not self.client:
+                return "нет клиента"
+            cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
+            if not cur:
+                return "позиция уже закрыта"
+            size_now = size if size is not None else _pos_size(cur)
+            if size_now <= 0:
+                return "позиция уже закрыта"
+            self._send_take(info, size_now, 0)
+            with self._lock:
+                self._open_risk.pop(info["id"], None)
+            return f"закрыта по рынку{f' ({reason})' if reason else ''}"
+        except UpscaleError as e:
+            return f"ошибка закрытия: {_trunc(e, 250)}"
+        except Exception as e:
+            print(f"[EXEC] close_position: {traceback.format_exc()}")
+            return f"ошибка закрытия: {e}"
 
     # -- отчёт --
     def _report(self, b, score, plan, skip, result=""):
         sym, side = b["symbol"], b["side"]
+        has_tp = b.get("exit_mode") != "trailing" and b.get("tp1_price") is not None
         row = {"ts": int(time.time()), "symbol": sym, "side": side, "score": score,
-               "price": b["price"], "stop": b["stop"], "tp1": b["tp1_price"], "tp2": b["tp2_price"],
+               "price": b["price"], "stop": b["stop"],
+               "tp1": b.get("tp1_price", ""), "tp2": b.get("tp2_price", ""),
                "ext_atr": b.get("ext_atr"), "skip": skip or "",
                "pos_usd": round(float(plan["pos_usd"]), 2) if plan else "",
                "margin_usd": round(float(plan["margin_usd"]), 2) if plan else "",
@@ -796,11 +1048,12 @@ class Executor:
         if skip:
             self.send(f"🧪 <b>{self.mode.upper()} · {sym} {arrow}: пропускаю</b> — {skip}")
         elif self.mode == "dry":
+            tp_line = (f"TP1 {b['tp1_price']:.6g} и TP2 {b['tp2_price']:.6g} через {plan['tp_delay_sec']}с (правило 60с)"
+                       if has_tp else "выход — trailing-стоп/сигнал/время (без TP)")
             self.send(f"🧪 <b>DRY · открыл бы {sym} {arrow}</b>\n"
                       f"позиция ${plan['pos_usd']:.0f} (риск ${plan['real_risk_usd']:.1f}), "
                       f"плечо {plan['leverage']}×, маржа ≈ ${plan['margin_usd']:.0f}\n"
-                      f"вход ≈ {b['price']:.6g} | стоп {b['stop']:.6g} со входом | "
-                      f"TP1 {b['tp1_price']:.6g} и TP2 {b['tp2_price']:.6g} через {plan['tp_delay_sec']}с (правило 60с)")
+                      f"вход ≈ {b['price']:.6g} | стоп {b['stop']:.6g} со входом | " + tp_line)
         elif result and not result.startswith("открыт"):
             self.send(f"⚠️ <b>DEMO · {sym} {arrow}</b>: {result}")
 
