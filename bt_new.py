@@ -84,10 +84,51 @@ def _fetch_daily_candles(sym, days, offset):
     return u[:-1]
 
 
-def _fetch_hourly_stats(sym, days, offset):
+def _fetch_funding_history(sym, days, offset):
     """
-    contract_stats по часам (поля: time, open_interest, funding_rate...).
-    Возвращает список сырых строк.
+    GET /futures/usdt/funding_rate — история выплат фандинга.
+    Возвращает {day_int: avg_funding_rate_%} (среднее по выплатам за день).
+    Gate.io возвращает поля: t (unix), r (rate как строка).
+    Выплаты 3 раза в день (00:00 / 08:00 / 16:00 UTC), агрегируем в дни.
+    """
+    now = int(time.time()) - offset * DAY
+    start = now - (days + 10) * DAY
+    out = []
+    # Gate.io /funding_rate: limit макс 1000, пагинация по from/to
+    cur = start
+    while cur < now:
+        raw = B.api_get("funding_rate", {
+            "contract": f"{sym}_USDT",
+            "from": cur,
+            "to":   min(now, cur + 200 * DAY),
+            "limit": 1000,
+        })
+        rows = raw if isinstance(raw, list) else []
+        if not rows:
+            break
+        out.extend(rows)
+        nxt = int(float(rows[-1].get("t", 0))) + 1
+        if nxt <= cur:
+            break
+        cur = nxt
+
+    by_day = {}
+    for r in out:
+        ts = int(float(r.get("t", 0)))
+        d  = ts // DAY
+        try:
+            rate = float(r.get("r", 0)) * 100   # в % за один период
+        except (ValueError, TypeError):
+            continue
+        by_day.setdefault(d, []).append(rate)
+
+    return {d: sum(v) / len(v) for d, v in by_day.items()}
+
+
+def _fetch_oi_daily(sym, days, offset):
+    """
+    OI из contract_stats по часам, агрегируем в дни (последнее значение дня).
+    Возвращает {day_int: oi_float}.
     """
     now = int(time.time()) - offset * DAY
     out, cur = [], now - (days + 5) * DAY
@@ -105,48 +146,18 @@ def _fetch_hourly_stats(sym, days, offset):
         if nxt <= cur:
             break
         cur = nxt
-    # дедупликация
-    seen, u = set(), []
-    for r in sorted(out, key=lambda x: int(float(x.get("time", x.get("t", 0))))):
-        ts = int(float(r.get("time", r.get("t", 0))))
-        if ts not in seen:
-            seen.add(ts); u.append(r)
-    return u
 
-
-def _agg_stats_to_days(hourly_rows):
-    """
-    Агрегируем почасовые contract_stats в дневные:
-    - funding_rate: среднее за сутки (или последнее значение дня)
-    - open_interest: последнее значение дня
-    Возвращает {day_int: {"fr": float, "oi": float}}
-    """
     by_day = {}
-    for r in hourly_rows:
-        ts  = int(float(r.get("time", r.get("t", 0))))
-        d   = ts // DAY
-        fr  = r.get("funding_rate")
-        oi  = r.get("open_interest", r.get("oi"))
-        if d not in by_day:
-            by_day[d] = {"fr_sum": 0.0, "fr_n": 0, "oi_last": 0.0}
-        if fr is not None:
-            try:
-                by_day[d]["fr_sum"] += float(fr) * 100
-                by_day[d]["fr_n"]   += 1
-            except (ValueError, TypeError):
-                pass
+    for r in out:
+        ts = int(float(r.get("time", r.get("t", 0))))
+        d  = ts // DAY
+        oi = r.get("open_interest", r.get("oi"))
         if oi is not None:
             try:
-                by_day[d]["oi_last"] = float(oi)
+                by_day[d] = float(oi)   # перезаписываем — берём последнее значение дня
             except (ValueError, TypeError):
                 pass
-    result = {}
-    for d, v in by_day.items():
-        result[d] = {
-            "fr": v["fr_sum"] / v["fr_n"] if v["fr_n"] > 0 else None,
-            "oi": v["oi_last"] if v["oi_last"] > 0 else None,
-        }
-    return result
+    return by_day
 
 
 def _day_ci(pairs):
@@ -197,24 +208,22 @@ def run_funding_fade():
 
     for sym in LIQ10:
         print(f"[FF]   {sym}...")
-        candles = _fetch_daily_candles(sym, BT_DAYS, BT_OFFSET)
-        hourly  = _fetch_hourly_stats(sym, BT_DAYS, BT_OFFSET)
-        day_stats = _agg_stats_to_days(hourly)
+        candles  = _fetch_daily_candles(sym, BT_DAYS, BT_OFFSET)
+        fund_idx = _fetch_funding_history(sym, BT_DAYS, BT_OFFSET)  # {day_int: avg_fr%}
 
         for i in range(len(candles) - 1):
             c0, c1 = candles[i], candles[i + 1]
             if c0["c"] <= 0 or c1["o"] <= 0:
                 continue
             d  = c0["t"] // DAY
-            fr = day_stats.get(d, {}).get("fr")
             nd = (c1["c"] / c1["o"] - 1) * 100
 
             # nd_all собираем всегда (для market mean)
             nd_all.setdefault(d, {})[sym] = nd
 
-            # fund только если есть fr
-            if fr is not None:
-                fund_by_day.setdefault(d, {})[sym] = fr
+            # fund только если есть данные за этот день
+            if d in fund_idx:
+                fund_by_day.setdefault(d, {})[sym] = fund_idx[d]
 
     days       = sorted(set(fund_by_day))
     dm_market  = _day_mean_market(nd_all)
@@ -286,7 +295,7 @@ def run_funding_fade():
                  f"momentum: {mom_m:+.3f}% → fade {'>' if st[2] > mom_m else '<'} momentum"
                  + ("  ← ПЛАНКА ✅" if ok else ""))
     else:
-        L.append("  ⚠️ недостаточно данных (фандинг не доступен через hourly contract_stats)")
+        L.append("  ⚠️ недостаточно данных (проверь доступность /funding_rate для этих пар)")
 
     by_year = {}
     for dt, net, _ in rev:
@@ -317,9 +326,8 @@ def run_oi_divergence():
 
     for sym in LIQ10:
         print(f"[OI]   {sym}...")
-        candles   = _fetch_daily_candles(sym, BT_DAYS, BT_OFFSET)
-        hourly    = _fetch_hourly_stats(sym, BT_DAYS, BT_OFFSET)
-        day_stats = _agg_stats_to_days(hourly)
+        candles = _fetch_daily_candles(sym, BT_DAYS, BT_OFFSET)
+        oi_idx  = _fetch_oi_daily(sym, BT_DAYS, BT_OFFSET)  # {day_int: oi}
 
         for i in range(1, len(candles) - 1):
             c_prev, c_cur, c_next = candles[i - 1], candles[i], candles[i + 1]
@@ -331,8 +339,8 @@ def run_oi_divergence():
             nd = (c_next["c"] / c_next["o"] - 1) * 100
             nd_all.setdefault(d, {})[sym] = nd
 
-            oi_cur  = day_stats.get(d,      {}).get("oi")
-            oi_prev = day_stats.get(d_prev, {}).get("oi")
+            oi_cur  = oi_idx.get(d)
+            oi_prev = oi_idx.get(d_prev)
             if oi_cur is None or oi_prev is None or oi_prev <= 0:
                 continue
 
@@ -408,7 +416,7 @@ def run_oi_divergence():
         if sts and sts[0] >= 20:
             L.append(f"      шорт-нога (цена↑ + OI↓): {sts[0]} сд, NET {sts[2]:+.3f}% (±{sts[3]:.3f})")
     else:
-        L.append("  ⚠️ недостаточно данных (OI не доступен через hourly contract_stats)")
+        L.append("  ⚠️ недостаточно данных (OI из hourly contract_stats — проверь покрытие)")
 
     by_year = {}
     for dt, net, _ in rev_all:
