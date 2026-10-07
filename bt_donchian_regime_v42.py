@@ -82,12 +82,12 @@ YEAR_LOSS_LIMIT  = -500.0
 
 BTC_CONTRACT     = "BTC_USDT"
 
-# --- Период: 130 дней назад (~60 торговых дней после прогрева) ---
 def _default_start():
-    d = dt.date.today() - dt.timedelta(days=130)
+    d = dt.date.today() - dt.timedelta(days=60)
     return d.isoformat()
 
 BACKTEST_START_ISO = os.environ.get("BT_START", "") or _default_start()
+BACKTEST_END_ISO = os.environ.get("BT_END", "")
 
 
 # =====================================================================
@@ -404,8 +404,11 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
     funding_snap = get_funding_snapshot()
 
     start_ts = int(dt.datetime.fromisoformat(start_iso).replace(tzinfo=dt.timezone.utc).timestamp())
+    end_iso = os.environ.get("BT_END", BACKTEST_END_ISO)
+    end_ts = int(dt.datetime.fromisoformat(end_iso).replace(tzinfo=dt.timezone.utc).timestamp()) if end_iso else None
     all_days = sorted(set(
-        c['t'] for p in data for c in data[p] if c['t'] >= start_ts
+        c['t'] for p in data for c in data[p]
+        if c['t'] >= start_ts and (end_ts is None or c['t'] <= end_ts)
     ))
     if len(all_days) < DONCHIAN_PERIOD + BTC_REGIME_SMA + 5:
         raise RuntimeError(f"Слишком мало дней: {len(all_days)}")
