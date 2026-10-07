@@ -160,7 +160,8 @@ def run():
 
     yf = {}
     for dt, v in fills.get(1.0, {}).get("full", []):
-        yf.setdefault(dt[:4], []).append(v)
+        y = str(datetime.fromtimestamp(dt * DAY, MSK).year)
+        yf.setdefault(y, []).append(v)
     if len(yf) >= 3:
         L.append("<b>Годы (KNIFE+REGIME, −1.0%)</b>: " +
                  " | ".join(f"{y}: {sum(v) / len(v):+.2f}% ({len(v)})"
