@@ -163,11 +163,13 @@ _CANDLE_CACHE = {}
 
 def fetch_candles(contract, interval="1d", limit=2000):
     """Получить и распарсить свечи через B.api_get. Кэшируется в памяти."""
-    key = (contract, interval, limit)
+    # Принимаем как «BTC», так и «BTC_USDT»
+    gate_contract = contract if contract.endswith("_USDT") else f"{contract}_USDT"
+    key = (gate_contract, interval, limit)
     if key in _CANDLE_CACHE:
         return _CANDLE_CACHE[key]
     raw = B.api_get("candlesticks", {
-        "contract": contract,
+        "contract": gate_contract,
         "interval": interval,
         "limit":    limit,
     })
@@ -262,9 +264,10 @@ def live_signal_filters(contract):
     Возвращает (ok: bool, reason: str).
     В бэктесте НЕ вызываются — только при live-сигнале.
     """
+    gate_contract = contract if contract.endswith("_USDT") else f"{contract}_USDT"
     try:
         tickers = B.api_get("tickers", {})
-        t = next((x for x in tickers if x.get("contract") == contract), None)
+        t = next((x for x in tickers if x.get("contract") == gate_contract), None)
         if t is None:
             return False, "no ticker"
         funding = float(t.get("funding_rate", 0))
@@ -273,7 +276,7 @@ def live_signal_filters(contract):
             return False, f"funding={funding*100:.3f}%"
 
         stats = B.api_get("contract_stats", {
-            "contract": contract,
+            "contract": gate_contract,
             "interval": "5m",
             "limit":    50,
         })
@@ -362,9 +365,10 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
     try:
         funding_snap = {}
         for t in B.api_get("tickers", {}):
-            c = t.get("contract")
-            if c:
-                funding_snap[c] = float(t.get("funding_rate", 0))
+            c = t.get("contract", "")
+            if c and c.endswith("_USDT"):
+                # ключ — голый символ, как в B.UPSCALE_PAIRS
+                funding_snap[c[:-5]] = float(t.get("funding_rate", 0))
     except Exception:
         funding_snap = {}
 
