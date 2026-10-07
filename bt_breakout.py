@@ -414,9 +414,10 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
             continue
 
         e50d  = ema50d[d_idx];  e100d = ema100d[d_idx]
-        e200d = ema200d[d_idx]
+        e200d = ema200d[d_idx]  # может быть None если < 200 дней истории
         if any(x is None for x in [e50d, e100d]):
             continue
+        # e200d проверяем позже только если use_daily_ema200=True
 
         # ATR перцентиль
         if p["atr_percentile"]:
@@ -511,6 +512,8 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
 
         # тренд дневной
         if p["use_daily_ema200"]:
+            if e200d is None:
+                continue   # нет EMA200d — пропускаем бар
             trend_long  = c > e200d
             trend_short = c < e200d
         else:
