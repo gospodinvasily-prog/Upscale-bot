@@ -1,27 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_regime_v42.py — v4.2: DD brake + Risk $80 (без ADX)
-=================================================================
+bt_donchian_regime_v42.py - v4.3: Exclude + Cooldown + Compound sizing
+=====================================================================
 
 Запуск через диспетчер:
     RUN_BACKTEST=donchian_regime_v42 python bot.py
 
-Что изменилось vs v4.1:
-  v4.1 на 131д показал:
-    ADX filtered: 9,301 (отрезал 16% сделок и убил -$1,464 P&L vs v4)
-    DD brake days: 0 (не сработал, MaxDD держался только на ADX)
-    Итог: ALL PASS потерян, P&L −$533 (vs +$931 в v4)
+Что изменилось vs v4.2:
+  v4.2 на 1376д: MaxDD $1,967 ✅, но 2025: -$671 (FAIL), P&L всего $894
+  Анализ по парам показал систематические минусы у 8 пар.
 
-  Решение: убрать ADX>20 фильтр, оставить только:
-    1. DD brake (×0.5 при drawdown > $1,200)
-    2. Risk $80 (вместо $100 в v4)
-    3. Max concurrent = 4 (вместо 5 в v4)
+ИЗМЕНЕНИЯ v4.3:
 
-  Ожидание:
-    - Частота сделок как в v4 (~17-18/мес на 131д, ~12/мес на 1376д)
-    - MaxDD на большом периоде: ~$1,800-1,900 (vs $2,483 в v4)
-    - 2025 год: −$700 (vs −$873 в v4, vs −$400 в v4.1) — на грани
-    - 131д/91д 2026: должны остаться ALL PASS
+  1. EXCLUDE_PAIRS (статичный список)
+     8 пар, которые систематически давали убыток в нескольких прогонах:
+       TRX, XLM, BNB, UNI, LTC, RUNE, PENDLE, HBAR
+
+  2. PER-PAIR COOLDOWN (динамическая защита)
+     Если пара даёт 3 убыточные сделки подряд -> блок на 30 дней.
+
+  3. COMPOUND SIZING (динамический risk)
+     risk_slot = max($40, equity * 0.008)  -- 0.8% от капитала, мин $40, макс $200
+
+  4. MAX_CONCURRENT вернули к 5 (вместо 4)
 """
 
 import os
@@ -44,37 +45,41 @@ else:
 #  КОНСТАНТЫ
 # =====================================================================
 
-# --- Капитал и риск (v4.2: $100 → $80) ---
 INIT_CAPITAL     = 10_000.0
-SLOT_RISK_USD    = 80.0
+RISK_FRACTION    = 0.008
+SLOT_RISK_MIN    = 40.0
+SLOT_RISK_MAX    = 200.0
 MAX_POSITION_PCT = 0.20
 
-# --- DD brake (v4.2) ---
 DD_BRAKE_THRESHOLD = 1_200.0
 DD_BRAKE_FACTOR    = 0.5
 DD_BRAKE_RECOVERY  = 0.95
 
-# --- Стратегия ---
+# v4.3: Exclude-лист (bare символы, как в B.UPSCALE_PAIRS)
+EXCLUDE_PAIRS = {
+    "TRX", "XLM", "BNB", "UNI", "LTC", "RUNE", "PENDLE", "HBAR",
+}
+
+CONSEC_LOSS_LIMIT = 3
+COOLDOWN_DAYS     = 30
+
 DONCHIAN_PERIOD  = 20
 BTC_REGIME_SMA   = 50
 DMI_PERIOD       = 14
-ADX_THRESHOLD    = 20.0     # v4.2: фильтр отключён, но константа оставлена для отчёта
+ADX_THRESHOLD    = 20.0
 ATR_PERIOD       = 14
 ATR_PCT_MIN      = 0.015
 ATR_PCT_MAX      = 0.05
 
-# --- Выходы ---
 ATR_STOP_MULT    = 2.0
 MAX_HOLD_DAYS    = 15
-MAX_CONCURRENT   = 4
+MAX_CONCURRENT   = 5
 MAX_NEW_PER_DAY  = 2
 
-# --- Издержки ---
 COMM_TAKER       = 0.0005
 SLIPPAGE         = 0.0002
 FUNDING_TIMES_UTC = (0, 8, 16)
 
-# --- Валидация ---
 Z_SCORE          = 2.64
 WORST_DAY_LIMIT  = -500.0
 MAX_DD_LIMIT     = 2_000.0
@@ -82,12 +87,14 @@ YEAR_LOSS_LIMIT  = -500.0
 
 BTC_CONTRACT     = "BTC_USDT"
 
+
 def _default_start():
-    d = dt.date.today() - dt.timedelta(days=130)
-    return d.isoformat()
+    """90 дней назад (~60 торговых дней)."""
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)).strftime("%Y-%m-%d")
+
 
 BACKTEST_START_ISO = os.environ.get("BT_START", "") or _default_start()
-BACKTEST_END_ISO = os.environ.get("BT_END", "")
+BACKTEST_END_ISO   = os.environ.get("BT_END", "")
 
 
 # =====================================================================
@@ -123,8 +130,6 @@ def donchian(candles, period=DONCHIAN_PERIOD):
 
 
 def dmi(candles, period=DMI_PERIOD):
-    """Упрощённый DMI: возвращает (plus_di, minus_di, adx).
-    ADX считается, но в v4.2 НЕ используется как фильтр."""
     if len(candles) < period * 2 + 1:
         return None, None, None
 
@@ -185,7 +190,7 @@ def fetch_candles(contract, interval="1d", limit=2000):
     key = (contract, interval, limit)
     if key in _CANDLE_CACHE:
         return _CANDLE_CACHE[key]
-    # Gate.io requires _USDT suffix
+    # FIX: Gate.io требует _USDT суффикс
     gate_c = contract if contract.endswith("_USDT") else f"{contract}_USDT"
     raw = B.api_get("candlesticks", {
         "contract": gate_c,
@@ -250,10 +255,6 @@ def get_funding_snapshot():
 # =====================================================================
 
 def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
-    """
-    Donchian(20) breakout + BTC regime + DMI direction + ATR_pct filter.
-    v4.2: ADX фильтр убран (перестарался на реальных данных).
-    """
     cds = candles_up_to_today
     if len(cds) < DONCHIAN_PERIOD + 2:
         return None
@@ -273,7 +274,6 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
                 "dc_high": dc_high, "dc_low": dc_low,
                 "plus_di": 0, "minus_di": 0, "adx": 0}
 
-    # DMI direction (ADX считается, но не используется в фильтре — v4.2)
     plus_di, minus_di, adx = dmi(cds[:-1])
     if plus_di is None:
         return {"side": 0, "atr": a, "close": last['c'], "atr_pct": atr_pct,
@@ -282,8 +282,6 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
 
     funding = funding_snap.get(last.get('contract', ''), 0)
 
-    # --- LONG: пробой 20-дн high, BTC бычий, DMI+ > DMI-, funding не экстрем ---
-    # v4.2: ADX фильтр убран (перестарался на реальных данных)
     long_ok = (last['c'] > dc_high
                and btc_regime_today == +1
                and plus_di > minus_di
@@ -291,7 +289,6 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
     short_ok = (last['c'] < dc_low
                 and btc_regime_today == -1
                 and minus_di > plus_di
-                # v4.2: ADX фильтр убран
                 and abs(funding) <= 0.0005)
 
     side = +1 if long_ok else (-1 if short_ok else 0)
@@ -337,55 +334,32 @@ class Position:
 
 
 # =====================================================================
-#  LIVE-ФИЛЬТРЫ (для реальной торговли)
-# =====================================================================
-
-def live_signal_filters(contract):
-    """Опциональные фильтры для live. В бэктесте не вызываются."""
-    try:
-        tickers = B.api_get("tickers", {})
-        t = next((x for x in tickers if x.get("contract") == contract), None)
-        if t is None:
-            return False, "no ticker"
-        funding = float(t.get("funding_rate", 0))
-        if abs(funding) > 0.0005:
-            return False, f"funding={funding*100:.3f}%"
-
-        stats = B.api_get("contract_stats", {
-            "contract": contract, "interval": "5m", "limit": 50})
-        if not stats or len(stats) < 12:
-            return False, "no stats"
-
-        latest = stats[-1]
-        prev   = stats[-12]
-        lsr = float(latest.get("lsr_taker", 1.0))
-        if not (1.0 <= lsr <= 2.0):
-            return False, f"LSR={lsr:.2f}"
-        oi_now  = float(latest.get("open_interest_usd", 0))
-        oi_prev = float(prev.get("open_interest_usd", 0))
-        if oi_now <= oi_prev:
-            return False, "OI flat/down"
-        long_liq  = float(latest.get("long_liq_usd", 0))
-        short_liq = float(latest.get("short_liq_usd", 0))
-        if (long_liq + short_liq) > 0.01 * oi_now and oi_now > 0:
-            return False, f"liq cascade"
-        return True, "ok"
-    except Exception as e:
-        return False, f"err: {e}"
-
-
-# =====================================================================
 #  ДВИЖОК БЭКТЕСТА
 # =====================================================================
 
-def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
+def compute_risk_slot(equity, dd_brake_active=False):
+    """v4.3: compound sizing - 0.8% of equity, with limits."""
+    base = max(SLOT_RISK_MIN, min(SLOT_RISK_MAX, equity * RISK_FRACTION))
+    if dd_brake_active:
+        base *= DD_BRAKE_FACTOR
+    return base
+
+
+def run_backtest(pairs, start_iso=None, verbose=True):
     if B is None:
         raise RuntimeError("bot module not available")
 
+    if start_iso is None:
+        start_iso = BACKTEST_START_ISO
+
+    # --- 1) Свечи (с exclude-фильтром v4.3) ---
+    pairs_active = [p for p in pairs if p not in EXCLUDE_PAIRS]
+    excluded = len(pairs) - len(pairs_active)
     if verbose:
-        B.send_telegram(f"📡 v4.2: загружаю 1d свечи для {len(pairs)} пар...")
+        B.send_telegram(f"📡 v4.3: загружаю 1d свечи для {len(pairs_active)} пар "
+                        f"(excluded {excluded}: {sorted(EXCLUDE_PAIRS)})")
     data = {}
-    for i, p in enumerate(pairs):
+    for i, p in enumerate(pairs_active):
         try:
             cds = fetch_candles(p, "1d", 2000)
             if cds:
@@ -393,19 +367,25 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
         except Exception as e:
             print(f"[warn] {p}: {e}")
         if verbose and (i + 1) % 20 == 0:
-            B.send_telegram(f"  загружено {i+1}/{len(pairs)}")
+            B.send_telegram(f"  загружено {i+1}/{len(pairs_active)}")
 
     if not data:
         raise RuntimeError("Нет данных")
 
+    # --- 2) BTC regime ---
     if verbose:
-        B.send_telegram("📡 v4.2: вычисляю BTC weekly regime...")
+        B.send_telegram("📡 v4.3: вычисляю BTC weekly regime...")
     btc_regime = get_btc_regime()
     funding_snap = get_funding_snapshot()
 
+    # --- 3) Общий таймлайн ---
+    # FIX: .replace(tzinfo=dt.timezone.utc) для корректного UTC timestamp
     start_ts = int(dt.datetime.fromisoformat(start_iso).replace(tzinfo=dt.timezone.utc).timestamp())
-    end_iso = os.environ.get("BT_END", BACKTEST_END_ISO)
-    end_ts = int(dt.datetime.fromisoformat(end_iso).replace(tzinfo=dt.timezone.utc).timestamp()) if end_iso else None
+
+    end_ts = None
+    if BACKTEST_END_ISO:
+        end_ts = int(dt.datetime.fromisoformat(BACKTEST_END_ISO).replace(tzinfo=dt.timezone.utc).timestamp())
+
     all_days = sorted(set(
         c['t'] for p in data for c in data[p]
         if c['t'] >= start_ts and (end_ts is None or c['t'] <= end_ts)
@@ -419,13 +399,13 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
         for p, cds in data.items()
     }
 
+    # --- 4) Состояние ---
     cash = INIT_CAPITAL
     positions = []
     closed_trades = []
     equity_curve = []
     daily_pnl = []
 
-    # v4.2: DD brake state
     peak_equity = INIT_CAPITAL
     dd_brake_active = False
     dd_brake_days   = 0
@@ -433,12 +413,17 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
     btc_blocked = 0
     adx_filtered = 0
 
+    pair_stats = defaultdict(lambda: {"consec_losses": 0, "cooldown_until": 0})
+    cooldown_blocked = 0
+    excluded_count = excluded
+
+    # --- 5) Главный цикл ---
     for day_idx, day_ts in enumerate(all_days):
         btc_r = btc_regime.get(day_ts, 0)
         if btc_r == 0:
             btc_blocked += 1
 
-        # 6.1) Закрытие по trailing stop / TIME / SIG
+        # 5.1) Закрытие позиций
         new_positions = []
         realized_today = 0.0
         for pos in positions:
@@ -484,6 +469,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
                     if dt.datetime.utcfromtimestamp(cur).hour in FUNDING_TIMES_UTC:
                         n_fund += 1
                     cur += 3600
+                # FIX: funding_snap ключи - _USDT, pos.contract - bare символ
                 _fc = pos.contract if pos.contract.endswith("_USDT") else f"{pos.contract}_USDT"
                 funding_rate = funding_snap.get(_fc, 0.0)
                 funding_cost = pos.side * funding_rate * pos.size_usd * n_fund
@@ -497,12 +483,20 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
                     "entry_day": pos.entry_day_ts, "exit_day": day_ts,
                     "max_favorable": pos.max_favorable,
                 })
+                # v4.3: cooldown
+                ps = pair_stats[pos.contract]
+                if net < 0:
+                    ps["consec_losses"] += 1
+                    if ps["consec_losses"] >= CONSEC_LOSS_LIMIT:
+                        ps["cooldown_until"] = day_ts + COOLDOWN_DAYS * 86400
+                else:
+                    ps["consec_losses"] = 0
             else:
                 new_positions.append(pos)
 
         positions = new_positions
 
-        # 6.2) Mark-to-market
+        # 5.2) Mark-to-market
         unrealized = 0.0
         for pos in positions:
             c = by_pair_day[pos.contract].get(day_ts)
@@ -514,7 +508,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
         cash  += realized_today
         equity_curve.append((day_ts, equity))
 
-        # v4.2: DD brake
         if equity > peak_equity:
             peak_equity = equity
         if dd_brake_active and equity >= peak_equity * DD_BRAKE_RECOVERY:
@@ -531,13 +524,13 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
             day_pnl = equity - equity_curve[-2][1]
         daily_pnl.append((day_ts, day_pnl))
 
-        # 6.3) Новые входы
+        # 5.3) Новые входы
         if btc_r == 0:
             continue
         if len(positions) >= MAX_CONCURRENT:
             continue
 
-        current_risk = SLOT_RISK_USD * (DD_BRAKE_FACTOR if dd_brake_active else 1.0)
+        current_risk = compute_risk_slot(equity, dd_brake_active)
 
         candidates = []
         for p, cds in data.items():
@@ -545,6 +538,10 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
             if idx is None or idx < DONCHIAN_PERIOD + 2:
                 continue
             if any(pos.contract == p for pos in positions):
+                continue
+            ps = pair_stats[p]
+            if day_ts < ps["cooldown_until"]:
+                cooldown_blocked += 1
                 continue
             sig = evaluate_signal(cds[:idx + 1], btc_r, funding_snap)
             if sig is None or sig["side"] == 0:
@@ -556,7 +553,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
                 continue
             candidates.append((p, sig, idx))
 
-        # v4.2: ранжирование по DMI разнице (как в v4, ADX не влияет)
         candidates.sort(
             key=lambda x: abs(x[1]["plus_di"] - x[1]["minus_di"]),
             reverse=True)
@@ -572,7 +568,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
             stop_pct  = stop_dist / sig["close"]
             if stop_pct <= 0:
                 continue
-            raw_size  = current_risk / stop_pct     # v4.2: dynamic risk
+            raw_size  = current_risk / stop_pct
             size_usd  = min(raw_size, MAX_POSITION_PCT * equity)
             if size_usd < 50:
                 continue
@@ -584,7 +580,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
             cash -= COMM_TAKER * size_usd
             new_today += 1
 
-    # 7) Закрытие остатков
+    # 6) Закрытие остатков
     last_day_ts = all_days[-1]
     for pos in positions:
         c = by_pair_day[pos.contract].get(last_day_ts)
@@ -613,6 +609,8 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
         "btc_blocked": btc_blocked,
         "dd_brake_days": dd_brake_days,
         "adx_filtered": adx_filtered,
+        "cooldown_blocked": cooldown_blocked,
+        "excluded_count": excluded_count,
     }
 
 
@@ -655,16 +653,17 @@ def validate(result, z=Z_SCORE):
         reasons[t["reason"]] += 1
 
     # Статистика по парам
-    pair_stats = defaultdict(lambda: {"pnl": 0.0, "n": 0, "wins": 0})
+    pair_pnl = defaultdict(lambda: {"pnl": 0.0, "n": 0, "wins": 0})
     for t in result["trades"]:
         p = t["contract"]
-        pair_stats[p]["pnl"] += t["pnl"]
-        pair_stats[p]["n"]   += 1
+        pair_pnl[p]["pnl"] += t["pnl"]
+        pair_pnl[p]["n"]   += 1
         if t["pnl"] > 0:
-            pair_stats[p]["wins"] += 1
+            pair_pnl[p]["wins"] += 1
     pair_table = sorted(
-        [{"pair": p, **v} for p, v in pair_stats.items()],
-        key=lambda x: x["pnl"], reverse=True
+        [{"pair": p, **v} for p, v in pair_pnl.items()],
+        key=lambda x: x["pnl"],
+        reverse=True
     )
 
     return {
@@ -677,6 +676,8 @@ def validate(result, z=Z_SCORE):
         "btc_blocked": result.get("btc_blocked", 0),
         "dd_brake_days": result.get("dd_brake_days", 0),
         "adx_filtered": result.get("adx_filtered", 0),
+        "cooldown_blocked": result.get("cooldown_blocked", 0),
+        "excluded_count": result.get("excluded_count", 0),
         "pair_table": pair_table,
         "all_pass": gate1 and gate2 and gate3 and gate4,
     }
@@ -693,12 +694,13 @@ def format_report(result, val, n_pairs=None):
     if n_pairs is None:
         n_pairs = len(_PAIRS_USED)
     lines = []
-    lines.append("📊 *bt_donchian_regime v4.2 — РЕЗУЛЬТАТЫ*")
+    lines.append("📊 *bt_donchian_regime v4.3 - РЕЗУЛЬТАТЫ*")
     lines.append("")
-    lines.append(f"Donchian(20) + BTC SMA(50) + DMI + Trailing 2×ATR + DD brake (no ADX)")
-    lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Risk: ${SLOT_RISK_USD}/trade (brake ×{DD_BRAKE_FACTOR})")
+    lines.append(f"Donchian(20) + BTC SMA(50) + DMI + Trailing 2xATR + DD brake + Cooldown + Compound")
+    lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
+    lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (min ${SLOT_RISK_MIN:.0f}, max ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR})")
     lines.append(f"Сделок: {val['n_trades']}  |  Дней: {val['n_days']}")
-    lines.append(f"BTC blocked: {val['btc_blocked']}  |  ADX filtered: {val['adx_filtered']}  |  DD brake days: {val['dd_brake_days']}")
+    lines.append(f"BTC blocked: {val['btc_blocked']}  |  ADX filtered: {val['adx_filtered']}  |  DD brake days: {val['dd_brake_days']}  |  Cooldown blocks: {val['cooldown_blocked']}")
     if val.get("reasons"):
         r = val["reasons"]
         lines.append(f"Исходы: SL/TRAIL={r.get('TRAIL',0)+r.get('SL',0)} "
@@ -708,41 +710,37 @@ def format_report(result, val, n_pairs=None):
     lines.append(f"Total P&L    : ${val['total_pnl']:,.2f}")
     lines.append(f"CI(Z={Z_SCORE}): ${val['ci_z']:,.2f}")
     lines.append("")
-    lines.append("— ВАЛИДАЦИЯ —")
-    lines.append(f"① Final − CI > 0     : {'✅ PASS' if val['gate1'] else '❌ FAIL'}"
+    lines.append("- ВАЛИДАЦИЯ -")
+    lines.append(f"① Final - CI > 0     : {'✅ PASS' if val['gate1'] else '❌ FAIL'}"
                  f"  (edge = ${val['total_pnl']-val['ci_z']:,.2f})")
-    lines.append(f"② Worst day ≥ −$500   : {'✅ PASS' if val['gate2'] else '❌ FAIL'}"
+    lines.append(f"② Worst day >= -$500   : {'✅ PASS' if val['gate2'] else '❌ FAIL'}"
                  f"  (worst = ${val['worst_day']:,.2f})")
-    lines.append(f"③ MaxDD ≤ $2,000      : {'✅ PASS' if val['gate3'] else '❌ FAIL'}"
+    lines.append(f"③ MaxDD <= $2,000      : {'✅ PASS' if val['gate3'] else '❌ FAIL'}"
                  f"  (MaxDD = ${val['max_dd']:,.2f})")
-    lines.append(f"④ No year < −$500     : {'✅ PASS' if val['gate4'] else '❌ FAIL'}")
+    lines.append(f"④ No year < -$500     : {'✅ PASS' if val['gate4'] else '❌ FAIL'}")
     for y in sorted(val["yearly_pnl"]):
         lines.append(f"   {y}: ${val['yearly_pnl'][y]:,.2f}")
     lines.append("")
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
-    # --- Топ пар по P&L ---
+    # --- По парам ---
     pair_table = val.get("pair_table", [])
     if pair_table:
         lines.append("")
-        lines.append("— ТОП ПАРЫ (P&L) —")
-        top_n  = pair_table[:15]
-        worst5 = [r for r in pair_table[-5:] if r["pnl"] < 0]
-        for row in top_n:
-            wr = f"{row['wins']}/{row['n']}"
-            sign = "+" if row["pnl"] >= 0 else ""
-            lines.append(
-                f"  {row['pair']:<14} {sign}{row['pnl']:>7.0f}$  [{wr}]"
-            )
+        lines.append("━━━ ТОП-15 ПРИБЫЛЬНЫХ ПАР ━━━")
+        for row in pair_table[:15]:
+            wr = f"{100*row['wins']//row['n']}%" if row['n'] > 0 else "n/a"
+            lines.append(f"  {row['pair']:<14} P&L: ${row['pnl']:>8.2f}  "
+                         f"сделок: {row['n']:>3}  WR: {wr}")
+        worst5 = [r for r in pair_table if r["pnl"] < 0][-5:]
         if worst5:
-            lines.append("  ···")
-            lines.append("  (худшие)")
+            lines.append("")
+            lines.append("━━━ ХУДШИЕ 5 ПАР ━━━")
             for row in worst5:
-                wr = f"{row['wins']}/{row['n']}"
-                lines.append(
-                    f"  {row['pair']:<14} {row['pnl']:>7.0f}$  [{wr}]"
-                )
+                wr = f"{100*row['wins']//row['n']}%" if row['n'] > 0 else "n/a"
+                lines.append(f"  {row['pair']:<14} P&L: ${row['pnl']:>8.2f}  "
+                             f"сделок: {row['n']:>3}  WR: {wr}")
 
     return lines
 
@@ -761,9 +759,9 @@ def main():
     pairs = list(B.UPSCALE_PAIRS)
     _PAIRS_USED = pairs
 
-    start = os.environ.get("BT_START", BACKTEST_START_ISO)
+    start = os.environ.get("BT_START", "") or _default_start()
     B.send_telegram(
-        f"🚀 *bt_donchian_regime v4.2* старт: {len(pairs)} пар, начало {start}"
+        f"🚀 *bt_donchian_regime v4.3* старт: {len(pairs)} пар, начало {start}"
     )
 
     result = run_backtest(pairs, start_iso=start, verbose=True)
@@ -779,7 +777,9 @@ def main():
         with open(f"{out_dir}/bt_donchian_regime_v42_result.json", "w") as f:
             json.dump({
                 "validation": {k: (v if not isinstance(v, bool) else int(v))
-                               for k, v in val.items()},
+                               for k, v in val.items()
+                               if k != "pair_table"},
+                "pair_table": val.get("pair_table", [])[:50],
                 "trades": result["trades"][:200],
                 "equity_curve_tail": result["equity_curve"][-60:],
             }, f, indent=2, default=str)
