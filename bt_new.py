@@ -549,7 +549,27 @@ def run_weekly_seasonality():
 # ДИСПЕТЧЕР
 # ════════════════════════════════════════════════════════════════
 
+def _debug_api():
+    """Диагностика: печатает первые записи от обоих эндпоинтов для BTC."""
+    now = int(time.time())
+    start = now - 10 * DAY
+
+    print("[DBG] === /funding_rate (BTC) ===")
+    raw_fr = B.api_get("funding_rate", {
+        "contract": "BTC_USDT", "from": start, "to": now, "limit": 5
+    })
+    print(f"[DBG]   type={type(raw_fr)}, val={str(raw_fr)[:300]}")
+
+    print("[DBG] === /contract_stats hourly (BTC) ===")
+    raw_cs = B.api_get("contract_stats", {
+        "contract": "BTC_USDT", "interval": "1h",
+        "from": start, "to": start + 5 * HOUR, "limit": 5
+    })
+    print(f"[DBG]   type={type(raw_cs)}, val={str(raw_cs)[:300]}")
+
+
 def run():
+    _debug_api()
     results = []
     if BT_MODE in ("all", "funding"):
         try:
