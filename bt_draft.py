@@ -104,43 +104,49 @@ def run():
     fills = []          # (trade_day_str, net%, side)
     for sym in LIQ10:
         h1 = data[sym]
-        if len(h1) < (DAYS + 5) * 24 * 0.9:
+        print(f"[DR] {sym}: {len(h1)} свечей 1h")
+        if len(h1) < DAYS * 24 * 0.5:   # хватит хотя бы половины периода
+            print(f"[DR] {sym}: слишком мало данных, пропуск")
             continue
         by_day = {}
         for c in h1:
             by_day.setdefault(c["t"] // DAY, []).append(c)
         days_sorted = sorted(by_day)
+        dbg = {"days": 0, "bars_short": 0, "knife": 0, "no_frame": 0,
+               "height_fail": 0, "no_after": 0, "no_fill": 0, "ok": 0}
         for k in range(1, len(days_sorted)):
             Xd = days_sorted[k]
             Pd = days_sorted[k-1]
             bars = by_day[Xd]
             prev = by_day[Pd]
+            dbg["days"] += 1
             if len(bars) < 22 or len(prev) < 20:
-                continue
+                dbg["bars_short"] += 1; continue
             prev_close = prev[-1]["c"]
             prev_open = prev[0]["o"]
             if prev_open <= 0: continue
             knife = (prev_close / prev_open - 1) * 100 <= -KNIFE_K
             if knife:
-                continue
+                dbg["knife"] += 1; continue
             side_mode = "long" if reg_day.get(Xd, True) else "short"
             # рамка: 00:00-18:00 UTC дня X
             frame = [c for c in bars if (c["t"] % DAY) < UTC18]
             if len(frame) < 16:
-                continue
+                dbg["no_frame"] += 1; continue
             fh, fl = max(c["h"] for c in frame), min(c["l"] for c in frame)
             height = (fh - fl) / fl * 100
             if not (FRAME_LO <= height <= FRAME_HI) or fl <= 0:
-                continue
+                dbg["height_fail"] += 1; continue
             # вечером 18:00 ставим обе ноги? НЕТ — только ногу режима
             qb = QUEUE / 10000
             if side_mode == "long":
                 lvl = fl * (1 - DIP / 100)
                 # филл: прокол вниз после 18:00
                 after = [c for c in bars if (c["t"] % DAY) >= UTC18]
-                if not after: continue
+                if not after: dbg["no_after"] += 1; continue
                 filled = any(c["l"] <= lvl * (1 - qb) for c in after)
-                if not filled: continue
+                if not filled: dbg["no_fill"] += 1; continue
+                dbg["ok"] += 1
                 stop = fh * (1 + 0.001)
                 tp = (fh + fl) / 2
                 # ведение по свечам после филла
@@ -175,9 +181,10 @@ def run():
             else:
                 lvl = fh * (1 + DIP / 100)
                 after = [c for c in bars if (c["t"] % DAY) >= UTC18]
-                if not after: continue
+                if not after: dbg["no_after"] += 1; continue
                 filled = any(c["h"] >= lvl * (1 + qb) for c in after)
-                if not filled: continue
+                if not filled: dbg["no_fill"] += 1; continue
+                dbg["ok"] += 1
                 stop = fl * (1 - 0.001)
                 tp = (fh + fl) / 2
                 net = None
@@ -206,6 +213,10 @@ def run():
                 net += pos * FUND_D / 100
                 dts = datetime.fromtimestamp(Xd * DAY, MSK).strftime("%Y-%m-%d")
                 fills.append((dts, net / SLOT * 100, "short"))
+        print(f"[DR DBG {sym}] days={dbg['days']} bars_short={dbg['bars_short']} "
+              f"knife={dbg['knife']} no_frame={dbg['no_frame']} "
+              f"height_fail={dbg['height_fail']} no_after={dbg['no_after']} "
+              f"no_fill={dbg['no_fill']} fills={dbg['ok']}")
 
     if not fills:
         print("филлов нет"); return
