@@ -71,10 +71,11 @@ PATCH.update(dict(
     vol_consecutive=True,   # объём растёт 3 свечи подряд
     funding_max_short=0.03,
     funding_symmetric=True, # фандинг фильтр для лонгов тоже
-    use_daily_ema200=False,  # заменяем EMA200d на EMA50d>EMA100d
+    use_daily_ema200=False,  # не используем EMA200d
+    use_daily_trend=False,   # дневной тренд отключён — только 4H тренд достаточен
     use_oi=True,             # OI подтверждение
     cooldown_bars=4,         # пауза после стопа
-    vol_min_usd=50_000_000, # ликвидность $50M
+    vol_min_usd=1_000_000,  # ликвидность $1M (диагностический прогон)
     dynamic_sides=True,     # шорты до 50% в медвежьем рынке
 ))
 
@@ -514,15 +515,18 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
                 vol_ok_long  = vol_ok_long  and all(vols_4h[j] > vols_4h[j-1] for j in range(i-2, i+1))
                 vol_ok_short = vol_ok_long
 
-        # тренд дневной
+        # тренд дневной (опционально — если use_daily_ema200=False и use_daily_trend=False, не блокирует)
         if p["use_daily_ema200"]:
             if e200d is None:
                 continue   # нет EMA200d — пропускаем бар
             trend_long  = c > e200d
             trend_short = c < e200d
-        else:
+        elif p.get("use_daily_trend", True):
             trend_long  = e50d > e100d
             trend_short = e50d < e100d
+        else:
+            trend_long  = True   # дневной тренд отключён — пропускаем фильтр
+            trend_short = True
 
         # фандинг
         fund_long_ok  = True
