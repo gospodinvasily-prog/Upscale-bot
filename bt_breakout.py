@@ -628,9 +628,13 @@ def run():
     if btc_ema200d and btc_ema200d[-1] and btc_closes_d:
         btc_bear = btc_closes_d[-1] < btc_ema200d[-1]
 
+    mode_norm = MODE.lower().strip()
     modes_to_run = []
-    if MODE in ("original", "both"): modes_to_run.append(("Оригинал", ORIG))
-    if MODE in ("patched",  "both"): modes_to_run.append(("С правками", PATCH))
+    if mode_norm in ("original", "both"): modes_to_run.append(("Оригинал", ORIG))
+    if mode_norm in ("patched",  "both"): modes_to_run.append(("С правками", PATCH))
+    if not modes_to_run:
+        print(f"[BRK] неизвестный BRK_MODE={MODE!r}, запускаю оба")
+        modes_to_run = [("Оригинал", ORIG), ("С правками", PATCH)]
 
     all_trades = {label: [] for label, _ in modes_to_run}
     pair_results = []
@@ -681,7 +685,10 @@ def run():
         L.append("")
 
     # топ-5 и антитоп-5 пар (patched или единственный режим)
-    best_label = modes_to_run[-1][0]
+    if not modes_to_run:
+        return
+    # предпочитаем "С правками", иначе последний из запущенных
+    best_label = next((lbl for lbl, _ in modes_to_run if lbl == "С правками"), modes_to_run[-1][0])
     pair_st = [(sym, st) for sym, lbl, st in pair_results if lbl == best_label and st]
     pair_st.sort(key=lambda x: x[1]["total"], reverse=True)
     if pair_st:
