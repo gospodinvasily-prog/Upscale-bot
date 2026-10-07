@@ -258,17 +258,19 @@ def adx_series(candles, n=14):
     return adx_out
 
 def rolling_high(arr, n):
+    """Максимум предыдущих n баров (текущий не включается — для пробоя)."""
     out = []
     for i in range(len(arr)):
-        if i < n - 1: out.append(None)
-        else: out.append(max(arr[i-n+1:i+1]))
+        if i < n: out.append(None)
+        else: out.append(max(arr[i-n:i]))
     return out
 
 def rolling_low(arr, n):
+    """Минимум предыдущих n баров (текущий не включается — для пробоя)."""
     out = []
     for i in range(len(arr)):
-        if i < n - 1: out.append(None)
-        else: out.append(min(arr[i-n+1:i+1]))
+        if i < n: out.append(None)
+        else: out.append(min(arr[i-n:i]))
     return out
 
 def percentile(arr, p):
