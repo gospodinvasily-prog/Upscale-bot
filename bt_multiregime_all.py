@@ -33,7 +33,7 @@ TF     = os.environ.get("MRA_TF", "4h")
 TF_SEC = 14400
 BARS_D = 6
 WINDOWS = {"SLOW": 90, "FAST": 45}
-LIQ_MIN = float(os.environ.get("MRA_LIQ_MIN", "20")) * 1e6
+LIQ_MIN = float(os.environ.get("MRA_LIQ_MIN", "1")) * 1e6
 SLOT    = float(os.environ.get("MRA_SLOT", "60"))
 CAP     = float(os.environ.get("MRA_CAP", "10000"))
 FEE_SIDE = 0.05
@@ -161,12 +161,8 @@ def run():
             continue
         if len(c) < WINDOWS["SLOW"] + 100:
             continue
-        # ликвидность: средний дневной объём за 14 дней
-        v14 = sum(x.get("v", 0) * x["c"] for x in c[-14 * BARS_D:]) / 14
-        if v14 < LIQ_MIN:
-            continue
         data[sym] = c
-    print(f"[MRA] пар прошло фильтр ликвидности: {len(data)}")
+    print(f"[MRA] пар с достаточной историей: {len(data)}")
     if len(data) < 30:
         print("[MRA] мало пар, выход")
         return
