@@ -65,14 +65,23 @@ def fetch_daily(sym):
     return u[:-1]
 
 
+MAX_1H_DAYS = 720   # Gate.io ограничение глубины 1h свечей
+
 def fetch_1h(sym):
     now = int(time.time()) - OFFSET * DAY
-    out, cur = [], now - (DAYS + 10) * DAY
+    days_load = min(DAYS + 10, MAX_1H_DAYS)
+    out, cur = [], now - days_load * DAY
+    empty_streak = 0
     while cur < now:
         raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1h",
-                                         "from": cur, "to": min(now, cur + 1000 * HOUR)})
+                                         "from": cur, "to": min(now, cur + 999 * HOUR)})
         part = B.parse_candles(raw) if raw else []
-        if not part: break
+        if not part:
+            empty_streak += 1
+            if empty_streak >= 3: break
+            cur += 7 * DAY   # перепрыгнуть дыру
+            continue
+        empty_streak = 0
         out.extend(part)
         nxt = part[-1].get("t", 0) + HOUR
         if nxt <= cur: break
@@ -85,7 +94,9 @@ def fetch_1h(sym):
 
 
 def run():
-    print(f"[DR] {len(LIQ10)} пар × {DAYS} дн, queue {QUEUE:.0f} б.п., offset {OFFSET}")
+    effective_days = min(DAYS, MAX_1H_DAYS - 10)
+    print(f"[DR] {len(LIQ10)} пар × {effective_days} дн (запрошено {DAYS}, макс 1h={MAX_1H_DAYS}), "
+          f"queue {QUEUE:.0f} б.п., offset {OFFSET}")
     # BTC для режима: дневные closes
     btc_d = fetch_daily("BTC")
     closes = [c["c"] for c in btc_d]
@@ -105,7 +116,7 @@ def run():
     for sym in LIQ10:
         h1 = data[sym]
         print(f"[DR] {sym}: {len(h1)} свечей 1h")
-        if len(h1) < DAYS * 24 * 0.5:   # хватит хотя бы половины периода
+        if len(h1) < effective_days * 24 * 0.3:   # хватит хотя бы 30% периода
             print(f"[DR] {sym}: слишком мало данных, пропуск")
             continue
         by_day = {}
