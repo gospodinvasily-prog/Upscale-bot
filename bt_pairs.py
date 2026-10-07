@@ -1805,25 +1805,30 @@ if __name__ == "__main__":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+
 # ══════════════════════════════════════════════════════════════════════════════
-# REVERT-SCAN: фэйд дневного экстремума — taker-скрин + maker-разведка
+# REVERT-SCAN v1.1: фэйд дневного экстремума — taker-скрин + maker-разведка
 # ══════════════════════════════════════════════════════════════════════════════
 #
 # ЗАПУСК: RUN_BACKTEST=pairs  PAIRS_RUN=revert
 # Env:    RV_DAYS=1825 RV_OFFSET=0 RV_K_GRID=2,3,4,5,6 RV_D_GRID=0.5,1.0,1.5
 #
+# NET и EXCESS раздельно; разрез по ногам (лонг/шорт); NET по годам (k=3%).
+# КРИТЕРИЙ: excess ≥+0.15% значимо (2.64σ), NET > 0, половины NET одного знака,
+#           реверсия > моментума. Прошедший → RV_OFFSET=365 → maker → форвард.
+#
+
 RV_DAYS   = int(os.environ.get("RV_DAYS", "1825"))
 RV_OFFSET = int(os.environ.get("RV_OFFSET", "0"))
 RV_K_GRID = [float(x) for x in os.environ.get("RV_K_GRID", "2,3,4,5,6").split(",")]
 RV_D_GRID = [float(x) for x in os.environ.get("RV_D_GRID", "0.5,1.0,1.5").split(",")]
 RV_COST_TK = (0.05 + 0.03) * 2      # 0.16% круг: taker обе стороны + slip
 RV_COST_MK = 0.02 + 0.05            # maker вход + taker выход, slip 0
-RV_FUND_D  = 0.03                    # лонг платит, шорт получает
-RV_Z = 2.64
+RV_FUND_D  = 0.03                    # фандинг/день: лонг платит, шорт получает
+RV_Z = 2.64                          # поправка на скрининг (~10 ног)
 RV_MSK = timezone(timedelta(hours=3))
 RV_DAY = 86400
 RV_LIQ10 = ["BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "LTC", "AVAX"]
-
 
 
 def _rv_fetch_daily(sym):
@@ -1843,17 +1848,18 @@ def _rv_fetch_daily(sym):
     seen, u = set(), []
     for c in sorted(out, key=lambda x: x.get("t", 0)):
         if c.get("t", 0) not in seen:
-            seen.add(c["t"]); u.append(c)
-    return u[:-1]
-
+            seen.add(c["t"])
+            u.append(c)
+    return u[:-1]                    # незакрытая не нужна
 
 
 def run_revert():
-    print(f"[RV] {len(RV_LIQ10)} пар x {RV_DAYS} дн (offset {RV_OFFSET})")
-    sig = {}                      # d -> {sym: (ret, o1, h1, l1, c1)}
+    print(f"[RV] {len(RV_LIQ10)} пар × {RV_DAYS} дн (offset {RV_OFFSET})")
+    sig = {}                         # d -> {sym: (ret, o1, h1, l1, c1)}
     for sym in RV_LIQ10:
         c = _rv_fetch_daily(sym)
         if len(c) < RV_DAYS - 30:
+            print(f"  {sym}: история короткая ({len(c)} дн) — пропуск")
             continue
         for i in range(1, len(c) - 1):
             if c[i - 1]["c"] <= 0 or c[i + 1]["o"] <= 0:
@@ -1863,14 +1869,15 @@ def run_revert():
             sig.setdefault(d, {})[sym] = (ret, c[i + 1]["o"], c[i + 1]["h"],
                                           c[i + 1]["l"], c[i + 1]["c"])
     days = sorted(sig)
-    # рынок дня: средний ход open->close всех пар
-    day_mean = {d: sum(v[4] / v[1] for v in sig[d].values()) / len(sig[d]) * 100 - 100
+    # рынок дня: средний ход open->close всех пар на D+1
+    day_mean = {d: sum((v[4] / v[1] - 1) * 100 for v in sig[d].values()) / len(sig[d])
                 for d in days if len(sig[d]) >= 5}
 
     def collect(k):
-        rev_tk, mom_tk = [], []                    # (dt, net, ex)
-        rev_mk = {dv: [] for dv in RV_D_GRID}         # (dt, net)
-        mk_n = {dv: [0, 0] for dv in RV_D_GRID}       # филлы / сигналы
+        rev, mom = [], []            # (dt, net, ex, leg)
+        rev_l, rev_s = [], []
+        mk = {dv: [] for dv in RV_D_GRID}          # (dt, net) maker-филлы
+        mkn = {dv: [0, 0] for dv in RV_D_GRID}     # филлы / сигналы
         for d in days:
             if d not in day_mean:
                 continue
@@ -1884,107 +1891,119 @@ def run_revert():
                     if not trig:
                         continue
                     sgn = 1 if direction == "long" else -1
-                    # ── taker ──
+                    # taker: вход open(D+1), выход close(D+1)
                     net = sgn * nd - RV_COST_TK - RV_FUND_D * sgn
-                    ex = sgn * (nd - dm)
-                    rev_tk.append((dt, net, ex))
-                    # momentum-контроль: та же механика, ПРОТИВОПОЛОЖНЫЙ отбор
-                    mnet = -sgn * nd - RV_COST_TK + RV_FUND_D * sgn
-                    mom_tk.append((dt, mnet, -ex))
-                    # ── maker: лимитка на dv% ГЛУБЖЕ open ──
+                    ex = sgn * (nd - dm)          # над рынком дня (без издержек — диагностика)
+                    row = (dt, net, ex, direction)
+                    rev.append(row)
+                    (rev_l if direction == "long" else rev_s).append(row)
+                    # momentum-контроль: та же механика, противоположный отбор
+                    mom.append((dt, -sgn * nd - RV_COST_TK + RV_FUND_D * sgn, -ex, direction))
+                    # maker: лимитка на dv% глубже open, филл по low/high, выход close
                     for dv in RV_D_GRID:
-                        mk_n[dv][1] += 1
+                        mkn[dv][1] += 1
                         if direction == "long":
                             limit = o1 * (1 - dv / 100)
                             if l1 <= limit:
-                                mk_n[dv][0] += 1
-                                netm = (c1 / limit - 1) * 100 - RV_COST_MK - RV_FUND_D
-                                rev_mk[dv].append((dt, netm))
+                                mkn[dv][0] += 1
+                                mk[dv].append((dt, (c1 / limit - 1) * 100 - RV_COST_MK - RV_FUND_D))
                         else:
                             limit = o1 * (1 + dv / 100)
                             if h1 >= limit:
-                                mk_n[dv][0] += 1
-                                netm = (1 - c1 / limit) * 100 - RV_COST_MK + RV_FUND_D
-                                rev_mk[dv].append((dt, netm))
-        return rev_tk, mom_tk, rev_mk, mk_n
+                                mkn[dv][0] += 1
+                                mk[dv].append((dt, (1 - c1 / limit) * 100 - RV_COST_MK + RV_FUND_D))
+        return rev, mom, rev_l, rev_s, mk, mkn
 
-    def day_stats(tr, field="ex"):
+    def day_stats(tr):
+        """tr: [(dt, val)] -> (сделок, дней, среднее, RV_Z*se) — кластеризация по дням."""
         by_d = {}
-        for row in tr:
-            dt, net, ex = row
-            by_d.setdefault(dt, []).append(ex if field == "ex" else net)
+        for dt, v in tr:
+            by_d.setdefault(dt, []).append(v)
         dm = [sum(v) / len(v) for v in by_d.values()]
         if not dm:
             return None
         m = sum(dm) / len(dm)
-        se = statistics.pstdev(dm) / len(dm) ** 0.5 if len(dm) > 1 else 0
-        return len(tr), len(dm), m, RV_Z * se
+        se = statistics.pstdev(dm) / len(dm) ** 0.5 if len(dm) > 1 else 0.0
+        return sum(len(v) for v in by_d.values()), len(dm), m, RV_Z * se
 
-    def halves(tr, field="ex"):
-        ds = sorted({r[0] for r in tr})
+    def halves(tr):
+        ds = sorted({dt for dt, _ in tr})
         if len(ds) < 10:
             return None, None
         mid = ds[len(ds) // 2]
-        h1 = [r[2] if field == "ex" else r[1] for r in tr if r[0] < mid]
-        h2 = [r[2] if field == "ex" else r[1] for r in tr if r[0] >= mid]
-        return (sum(h1) / len(h1) if h1 else 0), (sum(h2) / len(h2) if h2 else 0)
+        h1 = [v for dt, v in tr if dt < mid]
+        h2 = [v for dt, v in tr if dt >= mid]
+        return (sum(h1) / len(h1) if h1 else 0.0), (sum(h2) / len(h2) if h2 else 0.0)
 
-    L = [f"↩️ <b>REVERT-SCAN</b>: {len(RV_LIQ10)} ликвидных, ~{RV_DAYS} дн"
+    L = [f"↩️ <b>REVERT-SCAN v1.1</b>: {len(RV_LIQ10)} ликвидных, ~{RV_DAYS} дн"
          + (f"\n⏪ СДВИНУТ НА {RV_OFFSET} ДН" if RV_OFFSET else ""),
-         f"<i>реверсия: лонг после дня ≤−k% / шорт после ≥+k%, ход D+1 open→close | "
-         f"excess над рынком дня | taker {RV_COST_TK:.2f}% / maker {RV_COST_MK:.2f}%+фандинг | "
-         f"планка 2.64s (скрининг): excess ≥+0.15%, половины, rev>momentum</i>", ""]
+         "<i>реверсия: лонг после дня ≤−k% / шорт после ≥+k%; ход D+1 open→close.",
+         "NET — торговый результат (издержки+фандинг вычтены); EXCESS — над рынком дня",
+         "(диагностика информации). Планка 2.64σ (скрининг): excess ≥+0.15% значимо,",
+         "NET > 0, половины NET одного знака, реверсия > моментума. Прошедший порог →",
+         "offset → maker-модель → форвард 2-3 недели. НЕ demo сразу</i>", ""]
 
     passed = []
     for k in RV_K_GRID:
-        rev, mom, mk, mkn = collect(k)
-        st, sm = day_stats(rev), day_stats(mom)
-        if not st:
+        rev, mom, rev_l, rev_s, mk, mkn = collect(k)
+        st = day_stats([(dt, net) for dt, net, _, _ in rev])
+        ste = day_stats([(dt, ex) for _, _, ex, _ in rev])
+        sm = day_stats([(dt, net) for dt, net, _, _ in mom])
+        if not st or st[0] < 30:
             continue
-        n, nd, m, ci = st
-        h1, h2 = halves(rev)
-        rev_beats = bool(sm and m > sm[2])
-        ok = (m - ci > 0.15) and h1 is not None and ((h1 > 0) == (h2 > 0)) and rev_beats
+        n, nd_, m, ci = st
+        h1, h2 = halves([(dt, net) for dt, net, _, _ in rev])
+        ex_m = ste[2] if ste else 0.0
+        ex_ci = ste[3] if ste else 0.0
+        mom_m = sm[2] if sm else 0.0
+        rev_beats = m > mom_m
+        ok = (ex_m - ex_ci > 0.15) and (m > 0) and (h1 is not None) and \
+             ((h1 > 0) == (h2 > 0)) and rev_beats
         if ok:
             passed.append(k)
         mark = "✅" if m - ci > 0 else "❌" if m + ci < 0 else "  "
         L.append(f"── k=±{k:.0f}% ──")
-        L.append(f"  {mark} РЕВЕРСИЯ taker: {n} сд / {nd} дн, excess <b>{m:+.3f}%</b> "
-                 f"(±{ci:.3f}), половины {h1:+.3f}|{h2:+.3f}"
-                 + (f" | momentum {sm[2]:+.3f}% → реверсия {'>' if rev_beats else '<'} моментума"
-                    if sm else "")
+        L.append(f"  {mark} NET taker: {n} сд / {nd_} дн, <b>{m:+.3f}%</b> (±{ci:.3f})"
+                 + (f", половины {h1:+.3f}|{h2:+.3f}" if h1 is not None else ""))
+        L.append(f"      EXCESS над рынком: {ex_m:+.3f}% (±{ex_ci:.3f}) | "
+                 f"momentum-контроль: {mom_m:+.3f}% → реверсия "
+                 f"{'>' if rev_beats else '<'} моментума"
                  + ("  ← ПЛАНКА ✅" if ok else ""))
-        # maker-разведка
+        for leg_tr, lbl in ((rev_l, "после падения (лонг-триг)"),
+                            (rev_s, "после роста (шорт-триг)")):
+            stl = day_stats([(dt, net) for dt, net, _, _ in leg_tr])
+            if stl and stl[0] >= 30:
+                L.append(f"      {lbl}: {stl[0]} сд, NET {stl[2]:+.3f}% (±{stl[3]:.3f})")
         for dv in RV_D_GRID:
             tr = mk[dv]
             fills, total = mkn[dv]
             if len(tr) < 30:
                 continue
-            dm_ = [r[1] for r in tr]
-            mm_ = sum(dm_) / len(dm_)
-            se_ = statistics.pstdev(dm_) / len(dm_) ** 0.5 if len(dm_) > 1 else 0
-            L.append(f"      maker d={dv:.1f}%: филл {fills}/{total} ({fills/total*100:.0f}%), "
-                     f"netto {mm_:+.3f}% (±{RV_Z*se_:.3f})")
+            vals = [v for _, v in tr]
+            mm_ = sum(vals) / len(vals)
+            se_ = statistics.pstdev(vals) / len(vals) ** 0.5 if len(vals) > 1 else 0.0
+            L.append(f"      maker d={dv:.1f}%: филл {fills}/{total} "
+                     f"({fills / total * 100:.0f}%), NET {mm_:+.3f}% (±{RV_Z * se_:.3f})")
         L.append("")
 
-    # годы по основному порогу
-    rev, mom, mk, mkn = collect(3.0)
+    rev3, _, _, _, _, _ = collect(3.0)
     by_year = {}
-    for dt, net, ex in rev:
-        y = dt[:4]
-        by_year.setdefault(y, []).append(ex)
-    if by_year:
-        L.append("<b>Excess по годам (k=3%)</b>: " +
-                 " | ".join(f"{y}: {sum(v)/len(v):+.2f}% ({len(v)})" for y, v in sorted(by_year.items())))
-    L.append("")
+    for dt, net, _, _ in rev3:
+        by_year.setdefault(dt[:4], []).append(net)
+    if len(by_year) >= 3:
+        L.append("<b>NET по годам (k=3%)</b>: " +
+                 " | ".join(f"{y}: {sum(v) / len(v):+.2f}% ({len(v)})"
+                            for y, v in sorted(by_year.items())))
+        L.append("")
+
     if passed:
-        L.append(f"<b>ПЛАНКУ ПРОШЛИ пороги</b>: {', '.join(f'±{k:.0f}%' for k in passed)}")
-        L.append("  → следующий шаг: maker-версия отдельным бэктестом + RV_OFFSET, потом форвард")
+        L.append("<b>ПЛАНКУ ПРОШЛИ пороги</b>: " + ", ".join(f"±{k:.0f}%" for k in passed))
+        L.append("  → шаги: RV_OFFSET=365 (знак совпал?) → maker-модель отдельно → форвард")
     else:
-        L.append("<i>Планка не пройдена. Смотрим maker-блок: если netto-maker систематически "
-                 "выше netto-taker и в плюсе — есть смысл в отдельном maker-бэктесте. "
-                 "Если и maker в минусе — реверсия на дневном горизонте не монетизируется "
-                 "ни тейкером, ни лимиткой, и сырых сигналов в наших данных не осталось</i>")
+        L.append("<i>Планка taker не пройдена. Решение по maker-блоку: если NET-maker "
+                 "систематически выше NET-taker и в плюсе при филле >40% — отдельный "
+                 "maker-бэктест оправдан. Если maker тоже в минусе — реверсия на дневном "
+                 "горизонте не монетизируется, сырых сигналов в наших данных не осталось</i>")
 
     msg = "\n".join(L)
     print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
@@ -1992,4 +2011,3 @@ def run_revert():
         B.send_blocks(msg.split("\n"))
     except Exception as e:
         print(f"[RV] отправка: {e}")
-
