@@ -111,7 +111,9 @@ YEAR_LOSS_LIMIT  = -500.0
 BTC_CONTRACT     = "BTC_USDT"
 
 def _default_start():
-    return (dt.datetime.utcnow() - dt.timedelta(days=60)).strftime("%Y-%m-%d")
+    # Нужно минимум DONCHIAN(20) + BTC_SMA(50) + буфер = ~80 дней для прогрева
+    # Берём 90 дней чтобы иметь ~60 торгуемых дней после прогрева индикаторов
+    return (dt.datetime.utcnow() - dt.timedelta(days=90)).strftime("%Y-%m-%d")
 
 BACKTEST_START_ISO = os.environ.get("BT_START", "") or _default_start()
 
