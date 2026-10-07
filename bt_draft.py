@@ -164,7 +164,7 @@ def run():
                 filled = any(c["l"] <= lvl * (1 - qb) for c in after)
                 if not filled: dbg["no_fill"] += 1; continue
                 dbg["ok"] += 1
-                stop = fh * (1 + 0.001)
+                stop = fl * (1 - 0.001)   # лонг: стоп НИЖЕ нижней границы рамки
                 tp = (fh + fl) / 2
                 # ведение по свечам после филла
                 net = None
@@ -202,7 +202,7 @@ def run():
                 filled = any(c["h"] >= lvl * (1 + qb) for c in after)
                 if not filled: dbg["no_fill"] += 1; continue
                 dbg["ok"] += 1
-                stop = fl * (1 - 0.001)
+                stop = fh * (1 + 0.001)   # шорт: стоп ВЫШЕ верхней границы рамки
                 tp = (fh + fl) / 2
                 net = None
                 ent = lvl
