@@ -123,7 +123,7 @@ MAX_DD_LIMIT     = 2_000.0
 YEAR_LOSS_LIMIT  = -500.0
 
 BTC_CONTRACT     = "BTC_USDT"
-BACKTEST_START_ISO = "2026-07-10"   # ~90 дней назад (минимум для расчёта — 75 дней: 20+50+5)
+BACKTEST_START_ISO = "2026-04-26"   # 165 дней назад (~75 дней прогрев индикаторов + ~90 дней оценки, как в v41)
 
 
 # =====================================================================
@@ -781,6 +781,23 @@ def validate(result, z=Z_SCORE):
     for t in result["trades"]:
         reasons[t["reason"]] += 1
 
+    # v4.4: разбивка по парам — сделки / PnL / winrate на каждый инструмент
+    by_pair = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
+    for t in result["trades"]:
+        row = by_pair[t["contract"]]
+        row["n"] += 1
+        row["pnl"] += t["pnl"]
+        if t["pnl"] > 0:
+            row["wins"] += 1
+    pair_stats = sorted(
+        (
+            {"pair": p, "n": r["n"], "pnl": r["pnl"],
+             "winrate": (r["wins"] / r["n"] * 100) if r["n"] else 0.0}
+            for p, r in by_pair.items()
+        ),
+        key=lambda x: x["pnl"], reverse=True,
+    )
+
     return {
         "final_equity": final, "total_pnl": total_pnl, "ci_z": ci,
         "n_trades": result["n_trades"], "n_days": n,
@@ -788,6 +805,7 @@ def validate(result, z=Z_SCORE):
         "worst_day": worst_day, "max_dd": max_dd,
         "yearly_pnl": dict(yearly),
         "reasons": dict(reasons),
+        "pair_stats": pair_stats,
         "btc_blocked": result.get("btc_blocked", 0),
         "dd_brake_days": result.get("dd_brake_days", 0),
         "adx_filtered": result.get("adx_filtered", 0),
@@ -840,6 +858,18 @@ def format_report(result, val, n_pairs=None):
     lines.append("")
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
+
+    # v4.4: разбивка по парам (сделки / PnL / winrate), сортировка по PnL
+    pair_stats = val.get("pair_stats") or []
+    if pair_stats:
+        lines.append("")
+        lines.append("— ПО ПАРАМ —")
+        for ps in pair_stats:
+            mark = "🟢" if ps["pnl"] > 0 else ("🔴" if ps["pnl"] < 0 else "⚪")
+            lines.append(
+                f"{mark} {ps['pair']}: {ps['n']} сделок, "
+                f"PnL ${ps['pnl']:,.2f}, winrate {ps['winrate']:.0f}%"
+            )
     return lines
 
 
