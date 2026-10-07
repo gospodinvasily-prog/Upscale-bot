@@ -110,11 +110,7 @@ YEAR_LOSS_LIMIT  = -500.0
 # --- BTC pair для регимного фильтра ---
 BTC_CONTRACT     = "BTC_USDT"
 
-def _default_start():
-    # Donchian(20) + BTC SMA(50) = 70 дней прогрева + 60 торгуемых = 130 дней назад
-    return (dt.datetime.utcnow() - dt.timedelta(days=130)).strftime("%Y-%m-%d")
-
-BACKTEST_START_ISO = os.environ.get("BT_START", "") or _default_start()
+BACKTEST_START_ISO = os.environ.get("BT_START", "2023-01-01")
 
 
 # =====================================================================
