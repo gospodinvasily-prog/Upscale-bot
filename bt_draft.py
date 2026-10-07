@@ -65,58 +65,38 @@ def fetch_daily(sym):
     return u[:-1]
 
 
-MAX_1H_DAYS = 720   # Gate.io ограничение глубины 1h свечей
-
-
-def _parse_raw(raw):
-    """Gate.io может вернуть список ИЛИ {"data": [...]}."""
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return B.parse_candles(raw)
-    if isinstance(raw, dict):
-        inner = raw.get("data") or raw.get("candlesticks") or []
-        if inner:
-            return B.parse_candles(inner)
-        # первый запрос — диагностика формата
-        print(f"[DR DBG] api ответил dict с ключами: {list(raw.keys())[:8]}")
-    return []
+MAX_1H_DAYS = 400   # Gate.io: max 10000 свечей 1h = ~416 дней
+BATCH = 999         # свечей за запрос
 
 
 def fetch_1h(sym):
+    """Грузим постранично от сейчас назад через параметр 'to' + limit."""
     now = int(time.time()) - OFFSET * DAY
-    days_load = min(DAYS + 10, MAX_1H_DAYS)
-    out, cur = [], now - days_load * DAY
-    empty_streak = 0
-    first = True
-    while cur < now:
-        params = {"contract": f"{sym}_USDT", "interval": "1h",
-                  "from": cur, "to": min(now, cur + 999 * HOUR)}
-        if first and sym == "BTC":
-            import requests as _req
-            _url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
-            _r = _req.get(_url, params=params, timeout=10)
-            print(f"[DR DBG] BTC 1h status={_r.status_code} "
-                  f"from={cur} to={params['to']} "
-                  f"body={_r.text[:200]}")
-            first = False
-        raw = B.api_get("candlesticks", params)
-        part = _parse_raw(raw)
+    limit_ts = now - min(DAYS + 5, MAX_1H_DAYS) * DAY
+    out = []
+    to_ts = now
+    while to_ts > limit_ts:
+        raw = B.api_get("candlesticks", {
+            "contract": f"{sym}_USDT", "interval": "1h",
+            "to": to_ts, "limit": BATCH
+        })
+        part = B.parse_candles(raw) if isinstance(raw, list) and raw else []
         if not part:
-            empty_streak += 1
-            if empty_streak >= 3: break
-            cur += 7 * DAY
-            continue
-        empty_streak = 0
+            break
         out.extend(part)
-        nxt = part[-1].get("t", 0) + HOUR
-        if nxt <= cur: break
-        cur = nxt
+        earliest = part[0].get("t", to_ts)
+        if earliest >= to_ts:
+            break
+        to_ts = earliest - 1  # сдвигаем окно назад
+        if to_ts <= limit_ts:
+            break
     seen, u = set(), []
     for c in sorted(out, key=lambda x: x.get("t", 0)):
         if c.get("t", 0) not in seen:
             seen.add(c["t"]); u.append(c)
-    return u[:-1]
+    # отрезаем то что раньше limit_ts
+    u = [c for c in u if c["t"] >= limit_ts]
+    return u[:-1] if len(u) > 1 else u
 
 
 def run():
