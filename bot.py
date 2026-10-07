@@ -30,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v10.4"
+BOT_VERSION    = "v10.5"
 
 TRADING_START_MSK = 4          # окно УКЛОНА начинается в 4:00,
                                # а вне часов работы скана нет вовсе, значит первый час УКЛОН не работал
@@ -3067,12 +3067,81 @@ def send_logs(caption_prefix: str):
                       (TRADES_CSV, "мои сделки"), (EXEC_CSV, "авто-слой"), (PENDING_FILE, "ОЧЕРЕДЬ ОЦЕНКИ — пришли обратно и набери /restore")):
         send_document(path, f"{caption_prefix} {today} — {cap}")
 
+def _backup_pending_tg():
+    """v10.5: отправляет очередь оценки в Telegram и пинует сообщение —
+    на старте pending_auto_restore() найдёт его через getChat и восстановит
+    без команды /restore. Вызывается при SIGTERM и раз в 30 мин, если очередь непуста."""
+    if not TELEGRAM_TOKEN:
+        return
+    if not PENDING_OUTCOMES and not CHARGE_PENDING:
+        return
+    pending_save()
+    if not os.path.exists(PENDING_FILE) or os.path.getsize(PENDING_FILE) == 0:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    try:
+        n_s = len(PENDING_OUTCOMES)
+        n_c = len(CHARGE_PENDING)
+        with open(PENDING_FILE, "rb") as f:
+            r = requests.post(url,
+                data={"chat_id": CHAT_ID,
+                      "caption": f"♻️ ОЧЕРЕДЬ ОЦЕНКИ — auto-backup v10.5 "
+                                 f"(сигналов {n_s}, зарядов {n_c})"},
+                files={"document": ("pending_v9.json", f)},
+                timeout=30)
+        r.raise_for_status()
+        msg_id = r.json()["result"]["message_id"]
+        # Пинуем — чтобы на старте найти через getChat без поиска по истории.
+        # disable_notification=True чтобы не будить пользователя.
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/pinChatMessage",
+                      json={"chat_id": CHAT_ID, "message_id": msg_id,
+                            "disable_notification": True},
+                      timeout=10)
+        print(f"[PENDING BACKUP] отправил и запинил очередь ({n_s} сигналов, {n_c} зарядов)")
+    except Exception as e:
+        print(f"[PENDING BACKUP ERROR] {e}")
+
+
+def pending_auto_restore() -> int:
+    """v10.5: ищет запинованное сообщение с очередью оценки через getChat
+    и восстанавливает очередь автоматически при старте — без команды /restore.
+    Возвращает число восстановленных записей."""
+    if not TELEGRAM_TOKEN:
+        return 0
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getChat",
+                         params={"chat_id": CHAT_ID}, timeout=10)
+        if not r.ok:
+            return 0
+        pinned = r.json().get("result", {}).get("pinned_message")
+        if not pinned:
+            return 0
+        doc = pinned.get("document")
+        if not doc:
+            return 0
+        fname = doc.get("file_name", "")
+        if "pending" not in fname.lower():
+            return 0
+        # Смотрим, не старше ли файл окна оценки (48ч с запасом)
+        msg_ts = pinned.get("date", 0)
+        if msg_ts and (time.time() - msg_ts) > 50 * 3600:
+            print(f"[PENDING AUTO] запинованный файл слишком старый ({(time.time()-msg_ts)/3600:.1f}ч), пропускаю")
+            return 0
+        n = restore_from_telegram(doc["file_id"])
+        print(f"[PENDING AUTO] восстановил из запинованного сообщения: {n} записей")
+        return n
+    except Exception as e:
+        print(f"[PENDING AUTO ERROR] {e}")
+        return 0
+
 def _on_shutdown(signum, frame):
-    """Render присылает SIGTERM перед перезапуском — успеваем сохранить статистику."""
+    """Render присылает SIGTERM перед перезапуском — успеваем сохранить статистику.
+    v10.5: сначала пинуем очередь оценки, чтобы при следующем старте восстановить автоматически."""
     print(f"[SHUTDOWN] сигнал {signum}: отправляю журналы перед остановкой")
     try:
         send_telegram("♻️ <b>Бот перезапускается</b> — отправляю журналы, "
                       "чтобы статистика не потерялась при деплое.")
+        _backup_pending_tg()   # v10.5: пинуем очередь — на старте найдём автоматически
         send_logs("перед перезапуском")
     except Exception as e:
         print(f"[SHUTDOWN ERROR] {e}")
@@ -3092,8 +3161,15 @@ def main():
     _restored = pending_load_local()
     if _restored:
         print(f"[PENDING] поднял с диска записей: {_restored}")
+    # v10.5: если диск пустой (деплой), пробуем восстановить из Telegram
+    if not _restored:
+        _auto = pending_auto_restore()
+        if _auto:
+            print(f"[PENDING] auto-restore из Telegram: {_auto} записей")
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
           ("сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
+           else "OI-PULSE (bt_pulse.py)" if bt_mode in ("pulse", "19")
+           else "ФАНДИНГ (bt_fund.py)" if bt_mode in ("fund", "18", "pulse", "19")
            else "РАЗБОР ПО ПАРАМ (bt_pairs.py)" if bt_mode in ("pairs", "17")
            else "ФИЛЬТР ПО BTC (bt_btc.py)" if bt_mode in ("btc", "16")
            else "ПРОБОЙ VWAP (bt_vbreak.py)" if bt_mode in ("vbreak", "15")
@@ -3111,7 +3187,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "fund", "18"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -3133,7 +3209,13 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("pairs", "17"):
+                if bt_mode in ("pulse", "19"):
+                    import bt_pulse
+                    bt_pulse.main()        # OI-PULSE: тренд на новых деньгах
+                elif bt_mode in ("fund", "18"):
+                    import bt_fund
+                    bt_fund.main()         # фандинг как источник дохода
+                elif bt_mode in ("pairs", "17"):
                     import bt_pairs
                     bt_pairs.main()        # разбор по парам и группам
                 elif bt_mode in ("btc", "16"):
@@ -3236,6 +3318,7 @@ def main():
     last_fast = 0.0
     last_outcomes = 0.0
     summary_sent_date = None
+    last_pending_backup = 0.0     # v10.5: авто-backup очереди раз в 30 мин
 
     while True:
         try:
@@ -3273,6 +3356,11 @@ def main():
             if time.time() - last_outcomes >= 60:
                 process_outcomes()
                 last_outcomes = time.time()
+
+            # v10.5: backup очереди в Telegram раз в 30 мин (если есть что сохранять)
+            if (PENDING_OUTCOMES or CHARGE_PENDING) and time.time() - last_pending_backup >= 1800:
+                _backup_pending_tg()
+                last_pending_backup = time.time()
 
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
