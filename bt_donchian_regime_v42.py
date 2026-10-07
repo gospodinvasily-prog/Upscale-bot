@@ -89,8 +89,8 @@ BTC_CONTRACT     = "BTC_USDT"
 
 
 def _default_start():
-    """130 дней назад (надёжный прогрев индикаторов)."""
-    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=130)).strftime("%Y-%m-%d")
+    """От 2023-01-01 (полный период)."""
+    return "2023-01-01"
 
 
 BACKTEST_START_ISO = os.environ.get("BT_START", "") or _default_start()
