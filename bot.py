@@ -3112,10 +3112,11 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "новые стратегии (bt_new.py)" if bt_mode == "new"
-           else "dip-harvester (bt_final.py)" if bt_mode == "final"
+           else "dip-harvester v1 (bt_final.py)" if bt_mode == "final"
+           else "dip-harvester v2 денежная (bt_final2.py)" if bt_mode == "final2"
            else "новые сигналы (bt_signals.py)" if bt_mode == "signals"
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "new", "final", "signals"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "new", "final", "final2", "signals"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -3190,7 +3191,10 @@ def main():
                     bt_new.main()          # новые стратегии: funding fade, OI div, weekly
                 elif bt_mode == "final":
                     import bt_final
-                    bt_final.main()        # dip-harvester: maker лимитки −d% ниже open
+                    bt_final.main()        # dip-harvester v1 (старая метрика)
+                elif bt_mode == "final2":
+                    import bt_final2
+                    bt_final2.main()       # dip-harvester v2: денежная метрика, исправлена
                 elif bt_mode == "signals":
                     import bt_signals
                     bt_signals.main()      # новые сигналы: liq cascade, xmom, vol anomaly
