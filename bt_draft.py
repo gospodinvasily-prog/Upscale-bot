@@ -67,19 +67,41 @@ def fetch_daily(sym):
 
 MAX_1H_DAYS = 720   # Gate.io ограничение глубины 1h свечей
 
+
+def _parse_raw(raw):
+    """Gate.io может вернуть список ИЛИ {"data": [...]}."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return B.parse_candles(raw)
+    if isinstance(raw, dict):
+        inner = raw.get("data") or raw.get("candlesticks") or []
+        if inner:
+            return B.parse_candles(inner)
+        # первый запрос — диагностика формата
+        print(f"[DR DBG] api ответил dict с ключами: {list(raw.keys())[:8]}")
+    return []
+
+
 def fetch_1h(sym):
     now = int(time.time()) - OFFSET * DAY
     days_load = min(DAYS + 10, MAX_1H_DAYS)
     out, cur = [], now - days_load * DAY
     empty_streak = 0
+    first = True
     while cur < now:
         raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1h",
                                          "from": cur, "to": min(now, cur + 999 * HOUR)})
-        part = B.parse_candles(raw) if raw else []
+        if first and sym == "BTC":
+            print(f"[DR DBG] BTC 1h raw type={type(raw).__name__} "
+                  f"len={len(raw) if isinstance(raw, (list,dict)) else '?'} "
+                  f"sample={str(raw)[:120] if raw else 'None'}")
+            first = False
+        part = _parse_raw(raw)
         if not part:
             empty_streak += 1
             if empty_streak >= 3: break
-            cur += 7 * DAY   # перепрыгнуть дыру
+            cur += 7 * DAY
             continue
         empty_streak = 0
         out.extend(part)
