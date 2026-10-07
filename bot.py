@@ -3074,7 +3074,8 @@ def main():
     if _restored:
         print(f"[PENDING] поднял с диска записей: {_restored}")
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
-          ("DONCHIAN REGIME v4.1 (bt_donchian_regime_v41.py)" if bt_mode in ("donchian_regime_v41", "24")
+          ("DONCHIAN REGIME v4.2 (bt_donchian_regime_v42.py)" if bt_mode in ("donchian_regime_v42", "25")
+           else "DONCHIAN REGIME v4.1 (bt_donchian_regime_v41.py)" if bt_mode in ("donchian_regime_v41", "24")
            else "DONCHIAN REGIME v4 (bt_donchian_regime.py)" if bt_mode in ("donchian_regime", "23")
            else "DAILY TREND-FOLLOWING ATR (bt_daily_trend.py)" if bt_mode in ("daily_trend", "22")
            else "сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
@@ -3099,7 +3100,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "breakout", "18", "draft", "19", "draft3", "20", "multiregime_all", "21", "daily_trend", "22", "donchian_regime", "23", "donchian_regime_v41", "24"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "breakout", "18", "draft", "19", "draft3", "20", "multiregime_all", "21", "daily_trend", "22", "donchian_regime", "23", "donchian_regime_v41", "24", "donchian_regime_v42", "25"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -3121,7 +3122,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("donchian_regime_v41", "24"):
+                if bt_mode in ("donchian_regime_v42", "25"):
+                    import bt_donchian_regime_v42
+                    bt_donchian_regime_v42.main()  # Donchian(20) + BTC SMA(50) + DMI + DD brake (no ADX)
+                elif bt_mode in ("donchian_regime_v41", "24"):
                     import bt_donchian_regime_v41
                     bt_donchian_regime_v41.main()  # Donchian(20) + BTC SMA(50) + DMI + ADX>20 + DD brake
                 elif bt_mode in ("donchian_regime", "23"):
