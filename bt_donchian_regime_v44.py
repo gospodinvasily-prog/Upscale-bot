@@ -87,9 +87,12 @@ PER_SIDE_BUDGET    = 240.0   # max_per_side = min(3, int($240/risk))
 DAILY_STOP_LOSS    = -400.0  # v4.4: emergency stop дня
 
 # --- v4.4: Exclude + Cooldown (как в v4.3) ---
+# FIX: голые тикеры, БЕЗ _USDT — pairs_active = [p for p in pairs if p not in
+# EXCLUDE_PAIRS] сравнивает с B.UPSCALE_PAIRS (голые тикеры), суффикс здесь
+# ломал сравнение и исключение 8 пар молча не срабатывало вообще.
 EXCLUDE_PAIRS = {
-    "TRX_USDT", "XLM_USDT", "BNB_USDT", "UNI_USDT",
-    "LTC_USDT", "RUNE_USDT", "PENDLE_USDT", "HBAR_USDT",
+    "TRX", "XLM", "BNB", "UNI",
+    "LTC", "RUNE", "PENDLE", "HBAR",
 }
 CONSEC_LOSS_LIMIT = 3
 COOLDOWN_DAYS     = 30
@@ -222,8 +225,15 @@ def fetch_candles(contract, interval="1d", limit=2000):
     key = (contract, interval, limit)
     if key in _CANDLE_CACHE:
         return _CANDLE_CACHE[key]
+    # FIX: Gate.io требует суффикс _USDT в имени контракта, а B.UPSCALE_PAIRS
+    # (и EXCLUDE_PAIRS/BTC_CONTRACT этого файла) оперируют голыми тикерами —
+    # этот же фикс уже был в bt_donchian_regime_v42.py, но выпал здесь, из-за
+    # чего каждый запрос candlesticks уходил с кривым contract (например "ETH"
+    # вместо "ETH_USDT"), Gate.io возвращал пусто по ВСЕМ парам, и run_backtest()
+    # падал с "Нет данных".
+    gate_c = contract if contract.endswith("_USDT") else f"{contract}_USDT"
     raw = B.api_get("candlesticks", {
-        "contract": contract,
+        "contract": gate_c,
         "interval": interval,
         "limit":    limit,
     })
@@ -556,7 +566,11 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
                     if dt.datetime.utcfromtimestamp(cur).hour in FUNDING_TIMES_UTC:
                         n_fund += 1
                     cur += 3600
-                funding_rate = funding_snap.get(pos.contract, 0.0)
+                # FIX: funding_snap ключи — _USDT, pos.contract — голый тикер
+                # (та же правка, что уже была в bt_donchian_regime_v42.py, но
+                # выпала в этом файле — без неё funding costs молча всегда 0).
+                _fc = pos.contract if pos.contract.endswith("_USDT") else f"{pos.contract}_USDT"
+                funding_rate = funding_snap.get(_fc, 0.0)
                 funding_cost = pos.side * funding_rate * pos.size_usd * n_fund
                 net = gross - comm - funding_cost
                 realized_today += net
