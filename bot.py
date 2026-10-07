@@ -3111,8 +3111,11 @@ def main():
            else "СДЕЛКИ (bt_trades.py)" if bt_mode in ("trades", "4", "trade")
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
+           else "новые стратегии (bt_new.py)" if bt_mode == "new"
+           else "dip-harvester (bt_final.py)" if bt_mode == "final"
+           else "новые сигналы (bt_signals.py)" if bt_mode == "signals"
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "new", "final", "signals"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -3182,6 +3185,15 @@ def main():
                 elif bt_mode in ("compare", "2", "cmp"):
                     import bt_compare
                     bt_compare.main()      # сравнение стратегий
+                elif bt_mode == "new":
+                    import bt_new
+                    bt_new.main()          # новые стратегии: funding fade, OI div, weekly
+                elif bt_mode == "final":
+                    import bt_final
+                    bt_final.main()        # dip-harvester: maker лимитки −d% ниже open
+                elif bt_mode == "signals":
+                    import bt_signals
+                    bt_signals.main()      # новые сигналы: liq cascade, xmom, vol anomaly
                 else:
                     import backtest
                     backtest.main()        # перебор настроек нашей стратегии
