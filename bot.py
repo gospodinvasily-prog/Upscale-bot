@@ -2362,8 +2362,10 @@ def main():
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "пары/реверсия (bt_pairs.py)" if bt_mode == "pairs"
            else "новые стратегии (bt_new.py)" if bt_mode == "new"
+           else "dip-harvester (bt_final.py)" if bt_mode == "final"
+           else "новые сигналы (bt_signals.py)" if bt_mode == "signals"
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "pairs", "new"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "pairs", "new", "final", "signals"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -2394,6 +2396,12 @@ def main():
                 elif bt_mode == "new":
                     import bt_new
                     bt_new.main()          # новые стратегии: funding fade, OI div, weekly
+                elif bt_mode == "final":
+                    import bt_final
+                    bt_final.main()        # dip-harvester: maker лимитки −d% ниже open
+                elif bt_mode == "signals":
+                    import bt_signals
+                    bt_signals.main()      # новые сигналы: liq cascade, xmom, vol anomaly
                 else:
                     import backtest
                     backtest.main()        # перебор настроек нашей стратегии
