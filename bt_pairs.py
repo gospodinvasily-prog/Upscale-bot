@@ -2059,7 +2059,7 @@ def _rv2_fetch_daily(sym):
     return u[:-1]
 
 
-def _rv2__rv2_day_ci(pairs_list):
+def _rv2_day_ci(pairs_list):
     """pairs_list: [(date, value)] -> (сделок, дней, mean, RV2_Z*se) — кластер по дням."""
     by_d = {}
     for dt, v in pairs_list:
