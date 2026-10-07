@@ -88,40 +88,47 @@ def _fetch_funding_history(sym, days, offset):
     """
     GET /futures/usdt/funding_rate — история выплат фандинга.
     Возвращает {day_int: avg_funding_rate_%} (среднее по выплатам за день).
-    Gate.io возвращает поля: t (unix), r (rate как строка).
-    Выплаты 3 раза в день (00:00 / 08:00 / 16:00 UTC), агрегируем в дни.
+    Gate.io: поля t (unix), r (rate строка). Данные в убывающем порядке (новые первые).
+    Выплаты 3 раза в день (00:00/08:00/16:00 UTC), агрегируем в дни.
+    Стратегия: один большой запрос limit=1000 без пагинации (покрывает ~330 дней).
+    Если нужно больше — несколько запросов назад по времени.
     """
-    now = int(time.time()) - offset * DAY
+    now   = int(time.time()) - offset * DAY
     start = now - (days + 10) * DAY
-    out = []
-    # Gate.io /funding_rate: limit макс 1000, пагинация по from/to
-    cur = start
-    while cur < now:
+    out   = []
+    to_ts = now
+
+    while to_ts > start:
         raw = B.api_get("funding_rate", {
             "contract": f"{sym}_USDT",
-            "from": cur,
-            "to":   min(now, cur + 200 * DAY),
             "limit": 1000,
+            "to":    to_ts,
         })
         rows = raw if isinstance(raw, list) else []
         if not rows:
             break
         out.extend(rows)
-        nxt = int(float(rows[-1].get("t", 0))) + 1
-        if nxt <= cur:
+        # данные убывают: rows[0] = новейшее, rows[-1] = самое старое
+        oldest_t = int(float(rows[-1].get("t", to_ts)))
+        if oldest_t <= start:
             break
-        cur = nxt
+        if oldest_t >= to_ts:
+            break   # нет прогресса
+        to_ts = oldest_t - 1
 
     by_day = {}
     for r in out:
         ts = int(float(r.get("t", 0)))
-        d  = ts // DAY
+        if ts < start or ts > now:
+            continue
+        d = ts // DAY
         try:
             rate = float(r.get("r", 0)) * 100   # в % за один период
         except (ValueError, TypeError):
             continue
         by_day.setdefault(d, []).append(rate)
 
+    print(f"[FF]     {sym}: funding days={len(by_day)}, records={sum(len(v) for v in by_day.values())}")
     return {d: sum(v) / len(v) for d, v in by_day.items()}
 
 
@@ -132,19 +139,22 @@ def _fetch_oi_daily(sym, days, offset):
     """
     now = int(time.time()) - offset * DAY
     out, cur = [], now - (days + 5) * DAY
+    STEP = 500 * HOUR   # 500 часов за один запрос, лимит 500
     while cur < now:
         raw = B.api_get("contract_stats", {
             "contract": f"{sym}_USDT", "interval": "1h",
-            "from": cur, "to": min(now, cur + 100 * HOUR),
-            "limit": 100
+            "from": cur, "to": min(now, cur + STEP),
+            "limit": 500
         })
         rows = raw if isinstance(raw, list) else []
         if not rows:
-            break
+            cur += STEP
+            continue
         out.extend(rows)
         nxt = int(float(rows[-1].get("time", rows[-1].get("t", 0)))) + HOUR
         if nxt <= cur:
-            break
+            cur += STEP
+            continue
         cur = nxt
 
     by_day = {}
@@ -154,9 +164,11 @@ def _fetch_oi_daily(sym, days, offset):
         oi = r.get("open_interest", r.get("oi"))
         if oi is not None:
             try:
-                by_day[d] = float(oi)   # перезаписываем — берём последнее значение дня
+                by_day[d] = float(oi)   # последнее значение дня
             except (ValueError, TypeError):
                 pass
+
+    print(f"[OI]     {sym}: OI days={len(by_day)}, hourly records={len(out)}")
     return by_day
 
 
