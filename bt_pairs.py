@@ -1771,7 +1771,7 @@ def run_pos():
 
 # ═════════════ запуск ═════════════
 
-PAIRS_RUN = os.environ.get("PAIRS_RUN", "pos").lower()   # pos | flush | pulsed | ignition | sweep | both | all | revert
+PAIRS_RUN = os.environ.get("PAIRS_RUN", "pos").lower()   # pos | flush | pulsed | ignition | sweep | both | all | revert | revert2
 
 
 def run():
@@ -1787,6 +1787,8 @@ def run():
         run_pos()
     if PAIRS_RUN in ("all", "revert"):
         run_revert()
+    if PAIRS_RUN in ("all", "revert2"):
+        run_revert2()
 
 
 def main():
@@ -2011,3 +2013,149 @@ def run_revert():
         B.send_blocks(msg.split("\n"))
     except Exception as e:
         print(f"[RV] отправка: {e}")
+# ══════════════════════════════════════════════════════════════════════════════
+# MAKER DEEP-DIVE (revert2): разложение BETA → UNCOND → COND
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# ЗАПУСК: RUN_BACKTEST=pairs  PAIRS_RUN=revert2
+# Env:    RV2_DAYS=1825 RV2_OFFSET=0 RV2_K_COND=3 RV2_D_GRID=0.5,1.0,1.5
+#         RV2_QUEUE_BPS=5  RV2_SLOT=500
+#
+
+RV2_DAYS   = int(os.environ.get("RV2_DAYS", "1825"))
+RV2_OFFSET = int(os.environ.get("RV2_OFFSET", "0"))
+RV2_K_COND = float(os.environ.get("RV2_K_COND", "3"))
+RV2_D_GRID = [float(x) for x in os.environ.get("RV2_D_GRID", "0.5,1.0,1.5").split(",")]
+RV2_QUEUE_BPS = float(os.environ.get("RV2_QUEUE_BPS", "5"))     # прокол через лимит, б.п.
+RV2_SLOT   = float(os.environ.get("RV2_SLOT", "500"))
+RV2_COST_TK = (0.05 + 0.03) * 2      # 0.16%
+RV2_COST_MK = 0.02 + 0.05            # maker вход + taker выход
+RV2_FUND_D  = 0.03
+RV2_Z = 2.64
+RV2_MSK = timezone(timedelta(hours=3))
+RV2_DAY = 86400
+RV2_LIQ10 = ["BTC", "ETH", "SOL", "XRP", "BNB", "ADA", "DOGE", "LINK", "LTC", "AVAX"]
+
+
+def _rv2_fetch_daily(sym):
+    now = int(time.time()) - RV2_OFFSET * RV2_DAY
+    out, cur = [], now - (RV2_DAYS + 40) * RV2_DAY
+    while cur < now:
+        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1d",
+                                         "from": cur, "to": min(now, cur + 1000 * RV2_DAY)})
+        part = B.parse_candles(raw) if raw else []
+        if not part:
+            break
+        out.extend(part)
+        nxt = part[-1].get("t", 0) + RV2_DAY
+        if nxt <= cur:
+            break
+        cur = nxt
+    seen, u = set(), []
+    for c in sorted(out, key=lambda x: x.get("t", 0)):
+        if c.get("t", 0) not in seen:
+            seen.add(c["t"])
+            u.append(c)
+    return u[:-1]
+
+
+def _rv2__rv2_day_ci(pairs_list):
+    """pairs_list: [(date, value)] -> (сделок, дней, mean, RV2_Z*se) — кластер по дням."""
+    by_d = {}
+    for dt, v in pairs_list:
+        by_d.setdefault(dt, []).append(v)
+    dm = [sum(v) / len(v) for v in by_d.values()]
+    if not dm:
+        return None
+    m = sum(dm) / len(dm)
+    se = statistics.pstdev(dm) / len(dm) ** 0.5 if len(dm) > 1 else 0.0
+    return sum(len(v) for v in by_d.values()), len(dm), m, RV2_Z * se
+
+
+def run_revert2():
+    print(f"[RV2] {len(RV2_LIQ10)} пар × {RV2_DAYS} дн, очередь {RV2_QUEUE_BPS:.0f} б.п., offset {RV2_OFFSET}")
+    rows = []            # (date, sym, retD, o1, h1, l1, c1)
+    for sym in RV2_LIQ10:
+        c = _rv2_fetch_daily(sym)
+        if len(c) < RV2_DAYS - 30:
+            continue
+        for i in range(1, len(c) - 1):
+            if c[i - 1]["c"] <= 0 or c[i + 1]["o"] <= 0:
+                continue
+            dt = datetime.fromtimestamp(c[i]["t"], RV2_MSK).strftime("%Y-%m-%d")
+            rows.append((dt, sym, (c[i]["c"] / c[i - 1]["c"] - 1) * 100,
+                         c[i + 1]["o"], c[i + 1]["h"], c[i + 1]["l"], c[i + 1]["c"]))
+
+    qb = RV2_QUEUE_BPS / 10000
+    res = {"beta": [], "uncond": {d: [] for d in RV2_D_GRID},
+           "cond": {d: [] for d in RV2_D_GRID}}
+    for dt, sym, ret, o1, h1, l1, c1 in rows:
+        if o1 <= 0:
+            continue
+        nd = (c1 / o1 - 1) * 100
+        res["beta"].append((dt, nd - RV2_COST_TK - RV2_FUND_D))          # бета: каждый день тейкером
+        for dv in RV2_D_GRID:
+            limit = o1 * (1 - dv / 100)
+            if l1 <= limit * (1 - qb):                           # прокол сквозь лимит
+                net = (c1 / limit - 1) * 100 - RV2_COST_MK - RV2_FUND_D
+                res["uncond"][dv].append((dt, net))
+                if ret <= -RV2_K_COND:
+                    res["cond"][dv].append((dt, net))
+
+    L = [f"🧪 <b>MAKER DEEP-DIVE</b>: {len(RV2_LIQ10)} пар, ~{RV2_DAYS} дн, лимитка ниже open, "
+         f"выход close | очередь {RV2_QUEUE_BPS:.0f} б.п., издержки maker {RV2_COST_MK:.2f}%",
+         "<i>Разложение: BETA (каждый день тейкером) → UNCOND (+премия за пассивность) → "
+         "COND (+сигнал «вчера был сильный минус»). CI по дням. Лонг-only: шортить "
+         "дневной дрейф лимиткой сверху — структурный минус, не тестируем</i>", ""]
+
+    st = _rv2_day_ci(res["beta"])
+    L.append(f"<b>BETA</b> (buy&sell daily, тейкер): {st[0]} сд / {st[1]} дн, "
+             f"NET {st[2]:+.3f}% (±{st[3]:.3f})" if st else "BETA: нет данных")
+    L.append("")
+
+    for dv in RV2_D_GRID:
+        su = _rv2_day_ci(res["uncond"][dv])
+        sc = _rv2_day_ci(res["cond"][dv])
+        n_days = su[1] if su else 0
+        if not su or su[0] < 200:
+            continue
+        L.append(f"── глубина −{dv:.1f}% ──")
+        L.append(f"  UNCOND: {su[0]} филлов / {su[1]} дн, NET <b>{su[2]:+.3f}%</b> (±{su[3]:.3f})")
+        if sc and sc[0] >= 100:
+            L.append(f"  COND (после ≤−{RV2_K_COND:.0f}%): {sc[0]} филлов, NET {sc[2]:+.3f}% "
+                     f"(±{sc[3]:.3f}) | вклад сигнала {sc[2] - su[2]:+.3f}%")
+        # хвост: 5 худших дней по средней NET дня
+        by_d = {}
+        for dt, v in res["uncond"][dv]:
+            by_d.setdefault(dt, []).append(v)
+        worst = sorted(((sum(v) / len(v), dt, len(v)) for dt, v in by_d.items()))[:5]
+        L.append("  худшие дни: " + " | ".join(
+            f"{dt}: {m:+.2f}% ({n} филлов)" for m, dt, n in worst))
+        usd = worst[0][0] / 100 * RV2_SLOT * min(10, max(1, len(by_d[worst[0][1]])))
+        L.append(f"  худший день в $ (слоты ${RV2_SLOT:.0f}): ~${usd:+.0f} на задействованный капитал")
+        L.append("")
+
+    # годы для UNCOND d=1.0
+    by_year = {}
+    for dt, v in res["uncond"].get(1.0, []):
+        by_year.setdefault(dt[:4], []).append(v)
+    if len(by_year) >= 3:
+        L.append("<b>UNCOND −1.0% по годам</b>: " +
+                 " | ".join(f"{y}: {sum(v) / len(v):+.2f}% ({len(v)})"
+                            for y, v in sorted(by_year.items())))
+        L.append("")
+
+    su = _rv2_day_ci(res["uncond"].get(1.0, []))
+    ok1 = bool(su and su[2] - su[3] > 0.10)
+    L.append("<i>Критерии форварда: ① UNCOND(−1%) ≥ +0.10% значимо ② offset: NET > 0 "
+             "③ хвост ≤ −3% капитала/день ④ вклад сигнала — диагностика. Если сигнал "
+             "~0, а UNCOND жив — это бета-жатва с пассивной премией: deployment возможен, "
+             "но имя ему «умный DCA», и REGIME-фильтр обязателен. Реальные заливки будут "
+             "хуже бэктеста (очередь, частичные филлы) — форвард обязателен перед деньгами</i>")
+
+    msg = "\n".join(L)
+    print(msg.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
+    try:
+        B.send_blocks(msg.split("\n"))
+    except Exception as e:
+        print(f"[RV2] отправка: {e}")
