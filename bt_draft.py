@@ -90,13 +90,17 @@ def fetch_1h(sym):
     empty_streak = 0
     first = True
     while cur < now:
-        raw = B.api_get("candlesticks", {"contract": f"{sym}_USDT", "interval": "1h",
-                                         "from": cur, "to": min(now, cur + 999 * HOUR)})
+        params = {"contract": f"{sym}_USDT", "interval": "1h",
+                  "from": cur, "to": min(now, cur + 999 * HOUR)}
         if first and sym == "BTC":
-            print(f"[DR DBG] BTC 1h raw type={type(raw).__name__} "
-                  f"len={len(raw) if isinstance(raw, (list,dict)) else '?'} "
-                  f"sample={str(raw)[:120] if raw else 'None'}")
+            import requests as _req
+            _url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+            _r = _req.get(_url, params=params, timeout=10)
+            print(f"[DR DBG] BTC 1h status={_r.status_code} "
+                  f"from={cur} to={params['to']} "
+                  f"body={_r.text[:200]}")
             first = False
+        raw = B.api_get("candlesticks", params)
         part = _parse_raw(raw)
         if not part:
             empty_streak += 1
