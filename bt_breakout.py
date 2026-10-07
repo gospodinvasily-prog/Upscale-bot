@@ -385,6 +385,7 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
     trades = []
     pos = None         # текущая позиция
     cooldown = {}      # sym:side -> bar_idx
+    dbg = {"total":0,"breakout_l":0,"breakout_s":0,"vol":0,"trend4h":0,"rsi":0,"adx":0,"atr":0,"trend_d":0,"fund":0,"signal":0}
 
     start_ts = cutoff_ts - DAYS * DAY
 
@@ -392,6 +393,7 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
         bar = candles_4h[i]
         if bar["t"] < start_ts:
             continue
+        dbg["total"] += 1
 
         c   = closes_4h[i]
         ef  = ema_fast[i]; es = ema_slow[i]
@@ -410,7 +412,7 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
         for di in range(len(daily_candles)-1, -1, -1):
             if daily_candles[di]["t"] <= bar["t"]:
                 d_idx = di; break
-        if d_idx is None or d_idx < 100:
+        if d_idx is None or d_idx < 50:
             continue
 
         e50d  = ema50d[d_idx];  e100d = ema100d[d_idx]
@@ -526,10 +528,20 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
         if p["funding_symmetric"]:
             fund_long_ok = funding > -p["funding_max_short"]
 
+        # диагностика: считаем сколько баров прошли каждый фильтр (только лонг)
+        if c > h20:    dbg["breakout_l"] += 1
+        if c < l20:    dbg["breakout_s"] += 1
+        if c > h20 and vol_ok_long:             dbg["vol"]     += 1
+        if c > h20 and ef > es:                 dbg["trend4h"] += 1
+        if c > h20 and rv < p["rsi_long_max"]:  dbg["rsi"]     += 1
+        if c > h20 and ax > p["adx_min"]:       dbg["adx"]     += 1
+        if c > h20 and atr_ok:                  dbg["atr"]     += 1
+        if c > h20 and trend_long:              dbg["trend_d"] += 1
+
         # ЛОНГ
-        if (c > h20                          # пробой вверх
+        if (c > h20
             and vol_ok_long
-            and ef > es                      # бычий тренд 4H
+            and ef > es
             and rv < p["rsi_long_max"]
             and ax > p["adx_min"]
             and atr_ok
@@ -537,6 +549,7 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
             and fund_long_ok
             and (i - cd_long) > p["cooldown_bars"]
         ):
+            dbg["signal"] += 1
             sl_price = candles_4h[i+1]["o"] - p["sl_long_atr"] * at
             tp_price = candles_4h[i+1]["o"] + p["tp_long_atr"] * at
             trail_act_price = p["trail_long_atr"]
@@ -555,11 +568,17 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
             and fund_short_ok
             and (i - cd_short) > p["cooldown_bars"]
         ):
+            dbg["signal"] += 1
             sl_price = candles_4h[i+1]["o"] + p["sl_short_atr"] * at
             tp_price = candles_4h[i+1]["o"] - p["tp_short_atr"] * at
             pos = {"side": "short", "entry": candles_4h[i+1]["o"],
                    "sl": sl_price, "tp": tp_price,
                    "trail_act": p["trail_short_atr"], "trail_sl": None, "bar": i+1}
+
+    if dbg["total"] > 0 and dbg["signal"] == 0:
+        print(f"\n    [{sym} DBG] bars={dbg['total']} brk_l={dbg['breakout_l']} brk_s={dbg['breakout_s']}"
+              f" vol={dbg['vol']} trend4h={dbg['trend4h']} rsi={dbg['rsi']}"
+              f" adx={dbg['adx']} atr={dbg['atr']} trend_d={dbg['trend_d']} signals={dbg['signal']}", flush=True)
 
     return trades
 
@@ -647,19 +666,21 @@ def run():
         print(f"  {sym} [{gname}]...", end="", flush=True)
         try:
             c4h = fetch_candles(sym, TF, DAYS + 30, OFFSET)
-            cd  = fetch_daily(sym, DAYS + 30, OFFSET)
+            cd  = fetch_daily(sym, DAYS + 250, OFFSET)   # +250 дней для прогрева EMA200d
             if len(c4h) < 250 or len(cd) < 110:
                 print(" мало данных"); continue
 
             # фильтр ликвидности (только для patched)
             avg_vol = avg_daily_vol_usd(sym, cd)
             funding = fetch_funding(sym, DAYS)
+            print(f" avgVol=${avg_vol/1e6:.1f}M", end="", flush=True)
 
             for label, p in modes_to_run:
                 params = dict(p)
                 if label == "С правками":
                     params.update(gpatch)
                 if params.get("vol_min_usd") and avg_vol < params["vol_min_usd"]:
+                    print(f" [{label}: неликвид пропуск]", end="", flush=True)
                     continue  # пропускаем неликвид только в patched режиме
                 t = backtest_pair(sym, c4h, cd, funding, params, cutoff_ts, group=gname)
                 all_trades[label].extend(t)
