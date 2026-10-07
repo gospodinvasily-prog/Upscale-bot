@@ -82,7 +82,11 @@ YEAR_LOSS_LIMIT  = -500.0
 
 BTC_CONTRACT     = "BTC_USDT"
 
-BACKTEST_START_ISO = os.environ.get("BT_START", "2023-01-01")
+def _default_start():
+    d = dt.date.today() - dt.timedelta(days=90)
+    return d.isoformat()
+
+BACKTEST_START_ISO = os.environ.get("BT_START", "") or _default_start()
 BACKTEST_END_ISO = os.environ.get("BT_END", "")
 
 
