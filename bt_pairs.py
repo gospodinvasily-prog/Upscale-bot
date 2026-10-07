@@ -1946,13 +1946,13 @@ def run_revert():
     passed = []
     for k in RV_K_GRID:
         rev, mom, rev_l, rev_s, mk, mkn = collect(k)
-        st = day_stats([(dt, net) for dt, net, _, _ in rev])
-        ste = day_stats([(dt, ex) for _, _, ex, _ in rev])
-        sm = day_stats([(dt, net) for dt, net, _, _ in mom])
+        st = day_stats([(r[0], r[1]) for r in rev])
+        ste = day_stats([(r[0], r[2]) for r in rev])
+        sm = day_stats([(r[0], r[1]) for r in mom])
         if not st or st[0] < 30:
             continue
         n, nd_, m, ci = st
-        h1, h2 = halves([(dt, net) for dt, net, _, _ in rev])
+        h1, h2 = halves([(r[0], r[1]) for r in rev])
         ex_m = ste[2] if ste else 0.0
         ex_ci = ste[3] if ste else 0.0
         mom_m = sm[2] if sm else 0.0
@@ -1971,7 +1971,7 @@ def run_revert():
                  + ("  ← ПЛАНКА ✅" if ok else ""))
         for leg_tr, lbl in ((rev_l, "после падения (лонг-триг)"),
                             (rev_s, "после роста (шорт-триг)")):
-            stl = day_stats([(dt, net) for dt, net, _, _ in leg_tr])
+            stl = day_stats([(r[0], r[1]) for r in leg_tr])
             if stl and stl[0] >= 30:
                 L.append(f"      {lbl}: {stl[0]} сд, NET {stl[2]:+.3f}% (±{stl[3]:.3f})")
         for dv in RV_D_GRID:
@@ -1988,7 +1988,7 @@ def run_revert():
 
     rev3, _, _, _, _, _ = collect(3.0)
     by_year = {}
-    for dt, net, _, _ in rev3:
+    for dt, net, _ex3, _leg3 in rev3:
         by_year.setdefault(dt[:4], []).append(net)
     if len(by_year) >= 3:
         L.append("<b>NET по годам (k=3%)</b>: " +
