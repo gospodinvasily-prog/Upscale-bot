@@ -44,7 +44,7 @@ ORIG = dict(
     high_n=20, atr_n=14, adx_n=14, ema_fast=50, ema_slow=200,
     vol_sma_n=50, rsi_n=14, vol_mult=3.0,
     atr_pct_min=1.4,       # жёсткий порог ATR%
-    rsi_long_max=68, rsi_short_min=32, adx_min=22,
+    rsi_long_max=75, rsi_short_min=25, adx_min=20,
     tp_long_atr=3.8, sl_long_atr=1.6,
     tp_short_atr=2.5, sl_short_atr=1.4,
     trail_long_atr=2.2, trail_short_atr=1.4,
@@ -84,7 +84,7 @@ GROUPS = {
         "syms": {"BTC", "ETH", "BNB", "SOL", "XRP"},
         "patch": dict(
             vol_mult=2.0, atr_pct_min=0.8, adx_min=18,
-            rsi_long_max=72, rsi_short_min=28,
+            rsi_long_max=80, rsi_short_min=20,
             tp_long_atr=4.5, sl_long_atr=1.8,
             tp_short_atr=3.0, sl_short_atr=1.6,
             trail_long_atr=2.5, trail_short_atr=1.6,
@@ -101,8 +101,8 @@ GROUPS = {
                  "DYDX", "CRV", "SNX", "MKR", "CAKE", "SKY", "MORPHO", "STRK", "MOVE",
                  "LINEA", "GRAM", "BERA", "IOTA", "KAIA", "DEEP", "0G", "DATA"},
         "patch": dict(
-            vol_mult=2.5, atr_pct_min=1.4, adx_min=22,
-            rsi_long_max=68, rsi_short_min=32,
+            vol_mult=2.5, atr_pct_min=1.4, adx_min=20,
+            rsi_long_max=78, rsi_short_min=22,
             tp_long_atr=3.8, sl_long_atr=1.6,
             tp_short_atr=2.5, sl_short_atr=1.4,
             trail_long_atr=2.2, trail_short_atr=1.4,
@@ -114,8 +114,8 @@ GROUPS = {
         "syms": {"DOGE", "PEPE", "SHIB", "FLOKI", "BONK", "WIF", "BRETT", "FARTCOIN",
                  "TURBO", "PNUT", "POPCAT", "TRUMP", "PENGU", "PUMP"},
         "patch": dict(
-            vol_mult=3.5, atr_pct_min=2.5, adx_min=25,
-            rsi_long_max=62, rsi_short_min=38,
+            vol_mult=3.5, atr_pct_min=2.5, adx_min=22,
+            rsi_long_max=75, rsi_short_min=25,
             tp_long_atr=3.0, sl_long_atr=1.2,
             tp_short_atr=2.0, sl_short_atr=1.0,
             trail_long_atr=1.8, trail_short_atr=1.2,
@@ -127,8 +127,8 @@ GROUPS = {
         # all others (default)
         "syms": set(),
         "patch": dict(
-            vol_mult=3.0, atr_pct_min=2.0, adx_min=22,
-            rsi_long_max=65, rsi_short_min=35,
+            vol_mult=3.0, atr_pct_min=2.0, adx_min=20,
+            rsi_long_max=75, rsi_short_min=25,
             tp_long_atr=3.5, sl_long_atr=1.4,
             tp_short_atr=2.2, sl_short_atr=1.2,
             trail_long_atr=2.0, trail_short_atr=1.3,
@@ -530,15 +530,16 @@ def backtest_pair(sym, candles_4h, daily_candles, funding_map, p, cutoff_ts, gro
         if p["funding_symmetric"]:
             fund_long_ok = funding > -p["funding_max_short"]
 
-        # диагностика: считаем сколько баров прошли каждый фильтр (только лонг)
-        if c > h20:    dbg["breakout_l"] += 1
-        if c < l20:    dbg["breakout_s"] += 1
-        if c > h20 and vol_ok_long:             dbg["vol"]     += 1
-        if c > h20 and ef > es:                 dbg["trend4h"] += 1
-        if c > h20 and rv < p["rsi_long_max"]:  dbg["rsi"]     += 1
-        if c > h20 and ax > p["adx_min"]:       dbg["adx"]     += 1
-        if c > h20 and atr_ok:                  dbg["atr"]     += 1
-        if c > h20 and trend_long:              dbg["trend_d"] += 1
+        # диагностика каскадная — каждый следующий счётчик требует все предыдущие
+        if c > h20:   dbg["breakout_l"] += 1
+        if c < l20:   dbg["breakout_s"] += 1
+        _l = c > h20
+        if _l:                        dbg["vol"]     += (1 if vol_ok_long   else 0); _l = _l and vol_ok_long
+        if _l:                        dbg["trend4h"] += (1 if ef > es        else 0); _l = _l and ef > es
+        if _l:                        dbg["rsi"]     += (1 if rv < p["rsi_long_max"] else 0); _l = _l and rv < p["rsi_long_max"]
+        if _l:                        dbg["adx"]     += (1 if ax > p["adx_min"]      else 0); _l = _l and ax > p["adx_min"]
+        if _l:                        dbg["atr"]     += (1 if atr_ok                 else 0); _l = _l and atr_ok
+        if _l:                        dbg["trend_d"] += (1 if trend_long             else 0)
 
         # ЛОНГ
         if (c > h20
