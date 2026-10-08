@@ -492,7 +492,8 @@ def main():
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
     bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
-          ("DONCHIAN REGIME v4.5 (bt_donchian_regime_v45.py)" if bt_mode in ("donchian_regime_v45", "28")
+          ("DONCHIAN REGIME v4.6 (bt_donchian_regime_v46.py)" if bt_mode in ("donchian_regime_v46", "29")
+           else "DONCHIAN REGIME v4.5 (bt_donchian_regime_v45.py)" if bt_mode in ("donchian_regime_v45", "28")
            else "DONCHIAN REGIME v4.4, 60д (bt_donchian_regime_v44_60d.py)" if bt_mode in ("donchian_regime_v44_60d", "27")
            else "DONCHIAN REGIME v4.4 (bt_donchian_regime_v44.py)" if bt_mode in ("donchian_regime_v44", "26")
            else "DONCHIAN REGIME v4.2 (bt_donchian_regime_v42.py)" if bt_mode in ("donchian_regime_v42", "25")
@@ -521,7 +522,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "breakout", "18", "draft", "19", "draft3", "20", "multiregime_all", "21", "daily_trend", "22", "donchian_regime", "23", "donchian_regime_v41", "24", "donchian_regime_v42", "25", "donchian_regime_v44", "26", "donchian_regime_v44_60d", "27", "donchian_regime_v45", "28"):
+    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "breakout", "18", "draft", "19", "draft3", "20", "multiregime_all", "21", "daily_trend", "22", "donchian_regime", "23", "donchian_regime_v41", "24", "donchian_regime_v42", "25", "donchian_regime_v44", "26", "donchian_regime_v44_60d", "27", "donchian_regime_v45", "28", "donchian_regime_v46", "29"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -543,7 +544,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("donchian_regime_v45", "28"):
+                if bt_mode in ("donchian_regime_v46", "29"):
+                    import bt_donchian_regime_v46
+                    bt_donchian_regime_v46.main()  # v4.5 + sideways-фильтр BTC (20д коридор < 8% -> Long запрещён)
+                elif bt_mode in ("donchian_regime_v45", "28"):
                     import bt_donchian_regime_v45
                     bt_donchian_regime_v45.main()  # v4.4 без PerSide cap (MAX_PER_SIDE_CAP=6, PER_SIDE_BUDGET=999999)
                 elif bt_mode in ("donchian_regime_v44_60d", "27"):
