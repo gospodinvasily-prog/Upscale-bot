@@ -64,10 +64,10 @@ else:
 #  КОНСТАНТЫ
 # =====================================================================
 
-# --- Капитал и риск (v4.7-risk80: compound с floor $80) ---
+# --- Капитал и риск (v4.7-risk100: compound с floor $100) ---
 INIT_CAPITAL     = 10_000.0
-RISK_FRACTION    = 0.008      # 0.8% от equity на сделку
-SLOT_RISK_MIN    = 80.0       # v4.7-risk80: floor $80
+RISK_FRACTION    = 0.010      # 1.0% от equity на сделку
+SLOT_RISK_MIN    = 100.0      # v4.7-risk100: floor $100
 SLOT_RISK_MAX    = 200.0      # ceiling $200
 MAX_POSITION_PCT = 0.20
 
@@ -80,8 +80,8 @@ DD_BRAKE_RECOVERY  = 0.95
 MAX_CONCURRENT     = 6       # максимум одновременных позиций
 MAX_PER_SIDE_CAP   = 6       # v4.5: = MAX_CONCURRENT, per-side cap отключён
 PER_SIDE_BUDGET    = 999999  # v4.5: огромное число, per-side не ограничивает
-DAILY_STOP_LOSS            = -300.0  # v4.7-risk80: базовый порог (1-й минусовой день)
-DAILY_STOP_LOSS_CONSEC     = -100.0  # v4.7-risk80: 2-й минусовой день подряд -> порог -$100
+DAILY_STOP_LOSS            = -300.0  # v4.7-risk100: базовый порог (1-й минусовой день)
+DAILY_STOP_LOSS_CONSEC     = -100.0  # v4.7-risk100: 2-й минусовой день подряд -> порог -$100
 
 # --- v4.4: Exclude + Cooldown (как в v4.3) ---
 # FIX: UPSCALE_PAIRS в bot.py — голые тикеры ("TRX", без _USDT),
