@@ -12,7 +12,7 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+5%) / Breakeven stop
 
   Вместо него — новая структура тейков (PARTIAL TP + BREAKEVEN):
     Если позиция дошла до +5% в свою сторону (favorable move от entry) —
-    закрывается 50% позиции по цене закрытия дня (reason="PTP"),
+    закрывается 30% позиции по цене закрытия дня (reason="PTP"),
     а trail_stop для остатка сразу переносится на entry (breakeven).
     Дальше остаток либо идёт по trailing 2xATR (большая прибыль),
     либо закрывается в ноль по breakeven — минус по сделке после
@@ -20,7 +20,7 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+5%) / Breakeven stop
     уже зафиксирован в плюс).
 
   PARTIAL_TP_PCT      = 0.05  (+5% favorable)
-  PARTIAL_TP_FRACTION = 0.50  (закрывается половина позиции)
+  PARTIAL_TP_FRACTION = 0.30  (закрывается 30% позиции)
 
 Что унаследовано из v4.5 (без изменений):
   - Compound sizing (floor $80, cap $200), DD brake x0.5 > $1,200
@@ -98,7 +98,7 @@ MAX_NEW_PER_DAY  = 2
 
 # --- v4.7: Partial TP + Breakeven stop ---
 PARTIAL_TP_PCT      = 0.05    # +5% favorable -> закрыть часть позиции
-PARTIAL_TP_FRACTION = 0.50    # какую долю закрыть
+PARTIAL_TP_FRACTION = 0.30    # какую долю закрыть
 # После partial TP trail_stop перемещается на entry (breakeven) для остатка
 
 # --- Издержки ---
@@ -980,7 +980,7 @@ def format_report(result, val, n_pairs=None):
     lines = []
     lines.append("📊 *bt_donchian_regime v4.7 — РЕЗУЛЬТАТЫ*")
     lines.append("")
-    lines.append(f"Donchian(20) + BTC SMA(50) + DMI + Trailing 2xATR + Partial TP +5%/50% + Compound + Daily stop + Cooldown (NO PerSide cap, NO sideways-фильтр)")
+    lines.append(f"Donchian(20) + BTC SMA(50) + DMI + Trailing 2xATR + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown (NO PerSide cap, NO sideways-фильтр)")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
     lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR})")
     lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap ОТКЛЮЧЁН) | Daily stop: ${DAILY_STOP_LOSS:.0f}")
