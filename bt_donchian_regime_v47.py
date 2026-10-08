@@ -34,7 +34,7 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+8%) / Breakeven stop
   котировок после закрытия), саму торговую логику она не меняет.
 
 Что унаследовано из v4.5 (без изменений):
-  - Compound sizing (floor $80, cap $200), DD brake x0.5 > $1,200
+  - Compound sizing (floor $100, cap $200), DD brake x0.5 > $1,200
   - PerSide cap ОТКЛЮЧЁН (MAX_PER_SIDE_CAP=6=MAX_CONCURRENT)
   - Daily emergency stop -$400 (блок новых входов до конца дня)
   - Exclude 8 пар системных лузеров, per-pair cooldown 3/30
@@ -64,10 +64,10 @@ else:
 #  КОНСТАНТЫ
 # =====================================================================
 
-# --- Капитал и риск (v4.4: compound с floor $80) ---
+# --- Капитал и риск (v4.7-risk100: compound с floor $100) ---
 INIT_CAPITAL     = 10_000.0
-RISK_FRACTION    = 0.008      # 0.8% от equity на сделку
-SLOT_RISK_MIN    = 80.0       # v4.4: floor $80
+RISK_FRACTION    = 0.010      # 1.0% от equity на сделку
+SLOT_RISK_MIN    = 100.0      # v4.7-risk100: floor $100
 SLOT_RISK_MAX    = 200.0      # ceiling $200
 MAX_POSITION_PCT = 0.20
 
@@ -467,7 +467,7 @@ def live_signal_filters(contract):
 # =====================================================================
 
 def compute_risk_slot(equity, dd_brake_active=False):
-    """v4.4: compound sizing с floor $80, cap $200, brake x0.5."""
+    """v4.7-risk100: compound sizing с floor $100, cap $200, brake x0.5."""
     base = max(SLOT_RISK_MIN, min(SLOT_RISK_MAX, equity * RISK_FRACTION))
     if dd_brake_active:
         base *= DD_BRAKE_FACTOR
