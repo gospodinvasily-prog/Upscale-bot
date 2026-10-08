@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+5%) / Breakeven stop
+bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+8%) / Breakeven stop
 ====================================================================
 
 Запуск через диспетчер:
@@ -11,7 +11,7 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+5%) / Breakeven stop
   пользователя — v4.7 строится от v4.5, не от v4.6.
 
   Вместо него — новая структура тейков (PARTIAL TP + BREAKEVEN):
-    Если позиция дошла до +5% в свою сторону (favorable move от entry) —
+    Если позиция дошла до +8% в свою сторону (favorable move от entry) —
     закрывается 50% позиции по цене закрытия дня (reason="PTP"),
     а trail_stop для остатка сразу переносится на entry (breakeven).
     Дальше остаток либо идёт по trailing 2xATR (большая прибыль),
@@ -19,7 +19,7 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+5%) / Breakeven stop
     partial TP становится невозможен (на остаток; сам partial кусок
     уже зафиксирован в плюс).
 
-  PARTIAL_TP_PCT      = 0.05  (+5% favorable)
+  PARTIAL_TP_PCT      = 0.08  (+8% favorable)
   PARTIAL_TP_FRACTION = 0.50  (закрывается половина позиции)
 
 Новое в отчёте (без изменения логики стратегии):
@@ -104,12 +104,12 @@ ATR_PCT_MAX      = 0.05
 
 # --- Выходы ---
 ATR_STOP_MULT    = 2.5      # v4.7: было 2.0
-MIN_STOP_PCT     = 0.08     # v4.7: минимальный стоп 8% от entry (защита от ложных стопов/MAE)
+MIN_STOP_PCT     = 0.09     # v4.7: минимальный стоп 9% от entry (защита от ложных стопов/MAE)
 MAX_HOLD_DAYS    = 15
 MAX_NEW_PER_DAY  = 2
 
 # --- v4.7: Partial TP + Breakeven stop ---
-PARTIAL_TP_PCT      = 0.05    # +5% favorable -> закрыть часть позиции
+PARTIAL_TP_PCT      = 0.08    # +8% favorable -> закрыть часть позиции
 PARTIAL_TP_FRACTION = 0.50    # какую долю закрыть
 
 # v4.7: отчёт — сколько дней ПОСЛЕ стоп-выхода смотрим вперёд, чтобы
@@ -364,7 +364,7 @@ class Position:
         self.atr_at_entry       = atr_at_entry
         self.size_usd           = size_usd
         self.original_size_usd  = size_usd   # v4.7: для отчёта
-        # v4.7: стоп = max(2.5×ATR, 8% от entry) — защита от ложных стопов
+        # v4.7: стоп = max(2.5×ATR, 9% от entry) — защита от ложных стопов
         _stop_dist = max(ATR_STOP_MULT * atr_at_entry, MIN_STOP_PCT * entry)
         self.initial_stop       = entry - side * _stop_dist
         self.trail_stop         = self.initial_stop
@@ -378,7 +378,7 @@ class Position:
 
     def update_trail(self, candle):
         """Пересчитать max-favorable и trailing stop по новой свече.
-        v4.7: трейл не ближе 8% от max-favorable (защита от ложных стопов)."""
+        v4.7: трейл не ближе 9% от max-favorable (защита от ложных стопов)."""
         _stop_dist = max(ATR_STOP_MULT * self.atr_at_entry, MIN_STOP_PCT * self.entry)
         if self.side == +1:
             self.max_favorable = max(self.max_favorable, candle['h'])
@@ -768,7 +768,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     continue
                 short_count += 1
 
-            # v4.7: стоп не меньше 8% от entry — risk-сайзинг считаем от
+            # v4.7: стоп не меньше 9% от entry — risk-сайзинг считаем от
             # реального расстояния стопа (как и в Position.__init__/update_trail)
             stop_dist = max(ATR_STOP_MULT * sig["atr"], MIN_STOP_PCT * sig["close"])
             stop_pct  = stop_dist / sig["close"]
