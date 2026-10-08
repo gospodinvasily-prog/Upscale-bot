@@ -758,6 +758,25 @@ def validate(result, z=Z_SCORE):
     worst_day = min(daily_vals) if daily_vals else 0.0
     gate2 = worst_day >= WORST_DAY_LIMIT
 
+    # v4.5: худший день — с датой, + статистика минусовых дней (подряд)
+    worst_day_ts = None
+    if result["daily_pnl"]:
+        worst_day_ts = min(result["daily_pnl"], key=lambda p: p[1])[0]
+
+    losing_days_n = sum(1 for _, pnl in result["daily_pnl"] if pnl < 0)
+    loss_streaks, cur_loss_streak = [], []
+    for ts, pnl in sorted(result["daily_pnl"], key=lambda p: p[0]):
+        if pnl < 0:
+            cur_loss_streak.append(ts)
+        else:
+            if cur_loss_streak:
+                loss_streaks.append(cur_loss_streak)
+            cur_loss_streak = []
+    if cur_loss_streak:
+        loss_streaks.append(cur_loss_streak)
+    longest_loss_streak = max((len(s) for s in loss_streaks), default=0)
+    multi_loss_streaks = [s for s in loss_streaks if len(s) >= 2]
+
     eqs = [e for _, e in result["equity_curve"]]
     peak, max_dd = -math.inf, 0.0
     for e in eqs:
@@ -822,6 +841,23 @@ def validate(result, z=Z_SCORE):
         "short_losses": sum(1 for t in shorts if t["pnl"] <= 0),
     }
 
+    # v4.5: для убыточных сделок — на сколько % они доходили в свою сторону
+    # до разворота (MFE, max favorable excursion), т.е. что было бы, если
+    # закрывать тейком на пике движения, а не по trailing/SIG/TIME
+    def _mfe_pct(t):
+        return t["side"] * (t["max_favorable"] - t["entry"]) / t["entry"] * 100
+
+    losing_longs  = [t for t in longs  if t["pnl"] <= 0]
+    losing_shorts = [t for t in shorts if t["pnl"] <= 0]
+    long_short_stats["long_losing_mfe_avg"]  = (
+        sum(_mfe_pct(t) for t in losing_longs) / len(losing_longs) if losing_longs else 0.0)
+    long_short_stats["long_losing_mfe_max"]  = (
+        max((_mfe_pct(t) for t in losing_longs), default=0.0))
+    long_short_stats["short_losing_mfe_avg"] = (
+        sum(_mfe_pct(t) for t in losing_shorts) / len(losing_shorts) if losing_shorts else 0.0)
+    long_short_stats["short_losing_mfe_max"] = (
+        max((_mfe_pct(t) for t in losing_shorts), default=0.0))
+
     # v4.5: daily stop -400 — даты срабатывания, закрытие всех позиций,
     # и сколько раз срабатывало несколько дней ПОДРЯД
     day_stop_events = result.get("day_stop_events", [])
@@ -842,7 +878,13 @@ def validate(result, z=Z_SCORE):
         "final_equity": final, "total_pnl": total_pnl, "ci_z": ci,
         "n_trades": result["n_trades"], "n_days": n,
         "gate1": gate1, "gate2": gate2, "gate3": gate3, "gate4": gate4,
-        "worst_day": worst_day, "max_dd": max_dd,
+        "worst_day": worst_day, "worst_day_ts": worst_day_ts, "max_dd": max_dd,
+        "losing_days_n": losing_days_n,
+        "longest_loss_streak": longest_loss_streak,
+        "multi_loss_streaks_n": len(multi_loss_streaks),
+        "multi_loss_streaks_detail": [
+            {"from": s[0], "to": s[-1], "days": len(s)} for s in multi_loss_streaks
+        ],
         "yearly_pnl": dict(yearly),
         "reasons": dict(reasons),
         "pair_stats": pair_stats,
@@ -895,8 +937,10 @@ def format_report(result, val, n_pairs=None):
     lines.append("— ВАЛИДАЦИЯ —")
     lines.append(f"① Final − CI > 0     : {'✅ PASS' if val['gate1'] else '❌ FAIL'}"
                  f"  (edge = ${val['total_pnl']-val['ci_z']:,.2f})")
+    worst_day_date = (dt.datetime.utcfromtimestamp(val["worst_day_ts"]).strftime("%Y-%m-%d")
+                      if val.get("worst_day_ts") else "—")
     lines.append(f"② Worst day ≥ −$500   : {'✅ PASS' if val['gate2'] else '❌ FAIL'}"
-                 f"  (worst = ${val['worst_day']:,.2f})")
+                 f"  (worst = ${val['worst_day']:,.2f}, {worst_day_date})")
     lines.append(f"③ MaxDD ≤ $2,000      : {'✅ PASS' if val['gate3'] else '❌ FAIL'}"
                  f"  (MaxDD = ${val['max_dd']:,.2f})")
     lines.append(f"④ No year < −$500     : {'✅ PASS' if val['gate4'] else '❌ FAIL'}")
@@ -906,13 +950,23 @@ def format_report(result, val, n_pairs=None):
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
-    # v4.5: Long/Short — сколько всего и сколько из них прибыльных/убыточных
+    # v4.5: Long/Short — сколько всего, прибыльных/убыточных, и сколько %
+    # убыточные сделки доходили в свою сторону до разворота (MFE% — что было
+    # бы, если закрывать тейком на пике, а не по trailing/SIG/TIME)
     ls = val.get("long_short_stats")
     if ls:
         lines.append("")
         lines.append("— LONG / SHORT —")
         lines.append(f"Long : {ls['long_n']} сделок  (🟢 {ls['long_wins']} / 🔴 {ls['long_losses']})")
         lines.append(f"Short: {ls['short_n']} сделок  (🟢 {ls['short_wins']} / 🔴 {ls['short_losses']})")
+        lines.append(
+            f"Убыточные Long  — доходили в свою сторону в среднем на "
+            f"{ls['long_losing_mfe_avg']:.2f}% (макс {ls['long_losing_mfe_max']:.2f}%)"
+        )
+        lines.append(
+            f"Убыточные Short — доходили в свою сторону в среднем на "
+            f"{ls['short_losing_mfe_avg']:.2f}% (макс {ls['short_losing_mfe_max']:.2f}%)"
+        )
 
     # v4.5: Daily stop -400 — даты срабатывания, закрылись ли все позиции,
     # и сколько раз это было несколько дней подряд
@@ -932,6 +986,18 @@ def format_report(result, val, n_pairs=None):
             lines.append(f"   {d}: открыто было {ev['open_before']}, {closed_mark}")
         if len(events) > 30:
             lines.append(f"   ... и ещё {len(events)-30} срабатываний")
+
+    # v4.5: максимальная просадка в день + минусовые дни (подряд или нет)
+    lines.append("")
+    lines.append("— МИНУСОВЫЕ ДНИ —")
+    lines.append(f"Макс. просадка за день: ${val['worst_day']:,.2f} ({worst_day_date})")
+    lines.append(f"Всего дней в минусе: {val.get('losing_days_n', 0)} из {val['n_days']}")
+    lines.append(f"Самая длинная серия подряд: {val.get('longest_loss_streak', 0)} дн.  |  "
+                 f"серий из 2+ дней подряд: {val.get('multi_loss_streaks_n', 0)}")
+    for det in (val.get("multi_loss_streaks_detail") or [])[:15]:
+        d_from = dt.datetime.utcfromtimestamp(det["from"]).strftime("%Y-%m-%d")
+        d_to   = dt.datetime.utcfromtimestamp(det["to"]).strftime("%Y-%m-%d")
+        lines.append(f"   подряд {det['days']}д: {d_from} → {d_to}")
 
     # v4.5: разбивка по парам (сделки / PnL / winrate + long/short), сортировка по PnL
     pair_stats = val.get("pair_stats") or []
