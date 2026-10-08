@@ -103,7 +103,8 @@ ATR_PCT_MIN      = 0.015
 ATR_PCT_MAX      = 0.05
 
 # --- Выходы ---
-ATR_STOP_MULT    = 2.0
+ATR_STOP_MULT    = 2.5      # v4.7: было 2.0
+MIN_STOP_PCT     = 0.08     # v4.7: минимальный стоп 8% от entry (защита от ложных стопов/MAE)
 MAX_HOLD_DAYS    = 15
 MAX_NEW_PER_DAY  = 2
 
@@ -363,7 +364,9 @@ class Position:
         self.atr_at_entry       = atr_at_entry
         self.size_usd           = size_usd
         self.original_size_usd  = size_usd   # v4.7: для отчёта
-        self.initial_stop       = entry - side * ATR_STOP_MULT * atr_at_entry
+        # v4.7: стоп = max(2.5×ATR, 8% от entry) — защита от ложных стопов
+        _stop_dist = max(ATR_STOP_MULT * atr_at_entry, MIN_STOP_PCT * entry)
+        self.initial_stop       = entry - side * _stop_dist
         self.trail_stop         = self.initial_stop
         self.max_favorable      = entry
         self.max_adverse        = entry   # v4.7: для отчёта (MAE%)
@@ -374,16 +377,18 @@ class Position:
         self.partial_taken     = False      # v4.7: partial TP ещё не сработал
 
     def update_trail(self, candle):
-        """Пересчитать max-favorable и trailing stop по новой свече."""
+        """Пересчитать max-favorable и trailing stop по новой свече.
+        v4.7: трейл не ближе 8% от max-favorable (защита от ложных стопов)."""
+        _stop_dist = max(ATR_STOP_MULT * self.atr_at_entry, MIN_STOP_PCT * self.entry)
         if self.side == +1:
             self.max_favorable = max(self.max_favorable, candle['h'])
             self.max_adverse   = min(self.max_adverse, candle['l'])   # v4.7: MAE
-            new_stop = self.max_favorable - ATR_STOP_MULT * self.atr_at_entry
+            new_stop = self.max_favorable - _stop_dist
             self.trail_stop = max(self.trail_stop, new_stop)
         else:
             self.max_favorable = min(self.max_favorable, candle['l'])
             self.max_adverse   = max(self.max_adverse, candle['h'])   # v4.7: MAE
-            new_stop = self.max_favorable + ATR_STOP_MULT * self.atr_at_entry
+            new_stop = self.max_favorable + _stop_dist
             self.trail_stop = min(self.trail_stop, new_stop)
 
     def check_partial_tp(self, candle):
@@ -763,7 +768,9 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     continue
                 short_count += 1
 
-            stop_dist = ATR_STOP_MULT * sig["atr"]
+            # v4.7: стоп не меньше 8% от entry — risk-сайзинг считаем от
+            # реального расстояния стопа (как и в Position.__init__/update_trail)
+            stop_dist = max(ATR_STOP_MULT * sig["atr"], MIN_STOP_PCT * sig["close"])
             stop_pct  = stop_dist / sig["close"]
             if stop_pct <= 0:
                 continue
@@ -877,7 +884,7 @@ def validate(result, z=Z_SCORE):
     loss_streaks, cur_loss_streak = [], []
     for ts, pnl in sorted(result["daily_pnl"], key=lambda p: p[0]):
         if pnl < 0:
-            cur_loss_streak.append(ts)
+            cur_loss_streak.append((ts, pnl))
         else:
             if cur_loss_streak:
                 loss_streaks.append(cur_loss_streak)
@@ -886,6 +893,16 @@ def validate(result, z=Z_SCORE):
         loss_streaks.append(cur_loss_streak)
     longest_loss_streak = max((len(s) for s in loss_streaks), default=0)
     multi_loss_streaks = [s for s in loss_streaks if len(s) >= 2]
+
+    # v4.7: суммарный убыток за серию подряд минусовых дней — максимум
+    # (самая болезненная серия), а не просто длина серии
+    worst_streak_loss = 0.0
+    worst_streak_detail = None
+    for s in loss_streaks:
+        streak_total = sum(p for _, p in s)
+        if streak_total < worst_streak_loss:
+            worst_streak_loss = streak_total
+            worst_streak_detail = {"from": s[0][0], "to": s[-1][0], "days": len(s)}
 
     eqs = [e for _, e in result["equity_curve"]]
     peak, max_dd = -math.inf, 0.0
@@ -1017,8 +1034,12 @@ def validate(result, z=Z_SCORE):
         "longest_loss_streak": longest_loss_streak,
         "multi_loss_streaks_n": len(multi_loss_streaks),
         "multi_loss_streaks_detail": [
-            {"from": s[0], "to": s[-1], "days": len(s)} for s in multi_loss_streaks
+            {"from": s[0][0], "to": s[-1][0], "days": len(s),
+             "total_loss": sum(p for _, p in s)}
+            for s in multi_loss_streaks
         ],
+        "worst_streak_loss": worst_streak_loss,
+        "worst_streak_detail": worst_streak_detail,
         "yearly_pnl": dict(yearly),
         "reasons": dict(reasons),
         "pair_stats": pair_stats,
@@ -1144,10 +1165,17 @@ def format_report(result, val, n_pairs=None):
     lines.append(f"Всего дней в минусе: {val.get('losing_days_n', 0)} из {val['n_days']}")
     lines.append(f"Самая длинная серия подряд: {val.get('longest_loss_streak', 0)} дн.  |  "
                  f"серий из 2+ дней подряд: {val.get('multi_loss_streaks_n', 0)}")
+    wsd = val.get("worst_streak_detail")
+    if wsd:
+        d_from = dt.datetime.utcfromtimestamp(wsd["from"]).strftime("%Y-%m-%d")
+        d_to   = dt.datetime.utcfromtimestamp(wsd["to"]).strftime("%Y-%m-%d")
+        lines.append(f"Макс. суммарный убыток за серию подряд: ${val.get('worst_streak_loss', 0.0):,.2f}  "
+                     f"({wsd['days']}д: {d_from} → {d_to})")
     for det in (val.get("multi_loss_streaks_detail") or [])[:15]:
         d_from = dt.datetime.utcfromtimestamp(det["from"]).strftime("%Y-%m-%d")
         d_to   = dt.datetime.utcfromtimestamp(det["to"]).strftime("%Y-%m-%d")
-        lines.append(f"   подряд {det['days']}д: {d_from} → {d_to}")
+        lines.append(f"   подряд {det['days']}д: {d_from} → {d_to}  (убыток за серию: "
+                     f"${det.get('total_loss', 0.0):,.2f})")
 
     # разбивка по парам (сделки / PnL / winrate + long/short), сортировка по PnL
     pair_stats = val.get("pair_stats") or []
