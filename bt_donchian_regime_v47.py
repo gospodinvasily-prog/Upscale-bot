@@ -1252,7 +1252,7 @@ def format_report(result, val, n_pairs=None):
     events = val.get("day_stop_events") or []
     if events:
         lines.append("")
-        lines.append("— DAILY STOP -$400 —")
+        lines.append(f"— DAILY STOP ${DAILY_STOP_LOSS:.0f} / 2-й день подряд ${DAILY_STOP_LOSS_CONSEC:.0f} —")
         lines.append(f"Сработал: {val['day_stop_triggered']} раз(а)  |  "
                      f"подряд (2+ дня): {val.get('day_stop_streaks_multi', 0)} раз(а)")
         for det in (val.get("day_stop_streaks_multi_detail") or []):
