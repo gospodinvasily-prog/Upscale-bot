@@ -80,7 +80,7 @@ DD_BRAKE_RECOVERY  = 0.95
 MAX_CONCURRENT     = 6       # максимум одновременных позиций
 MAX_PER_SIDE_CAP   = 6       # v4.5: = MAX_CONCURRENT, per-side cap отключён
 PER_SIDE_BUDGET    = 999999  # v4.5: огромное число, per-side не ограничивает
-DAILY_STOP_LOSS    = -400.0  # daily emergency stop
+DAILY_STOP_LOSS    = -300.0  # v4.7-risk100-v3: порог понижен с -$400 до -$300
 
 # --- v4.4: Exclude + Cooldown (как в v4.3) ---
 # FIX: UPSCALE_PAIRS в bot.py — голые тикеры ("TRX", без _USDT),
@@ -703,55 +703,90 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         short_count = sum(1 for p in positions if p.side == -1)
 
         # v4.4: daily emergency stop
-        # v4.7-risk100-v2: теперь не только блокируем новые входы,
-        # но и ПРИНУДИТЕЛЬНО ЗАКРЫВАЕМ все открытые позиции,
-        # чтобы зафиксировать убыток на уровне DAILY_STOP_LOSS
-        # и не дать ему вырасти до -$500+.
-        day_pnl_check = realized_today + unrealized
-        if day_pnl_check < DAILY_STOP_LOSS:
+        # v4.7-risk100-v3: порог -$300 + закрытие ТОЛЬКО убыточных позиций
+        # в ОДНУ сторону (сторона с наибольшим убытком).
+        # v4.7-risk100-v3b: триггер — сумма УБЫТКОВ открытых позиций
+        # (только отрицательные unrealized), БЕЗ учёта прибыльных позиций
+        # и БЕЗ учёта уже закрытых сделок за день.
+        # Логика: если открытые убытки (по позициям в минусе) суммарно
+        # превысили -$300 — пора их закрывать, не ждать усугубления.
+        #   1. Считаем unrealized по сторонам (long/short)
+        #   2. Считаем сумму только отрицательных unrealized (open_losses)
+        #   3. Если open_losses <= -$300 — определяем "плохую" сторону
+        #      (где больше убыток) и закрываем убыточные позиции в эту сторону
+        #   4. Прибыльные позиции и позиции в "хорошую" сторону оставляем
+        #   5. Блокируем новые входы до конца дня
+        long_unrealized  = 0.0
+        short_unrealized = 0.0
+        open_losses = 0.0   # только отрицательные unrealized
+        for pos in positions:
+            c = by_pair_day[pos.contract].get(day_ts)
+            if c is None:
+                continue
+            pos_unrealized = pos.side * (c['c'] - pos.entry) / pos.entry * pos.size_usd
+            if pos.side == +1:
+                long_unrealized += pos_unrealized
+            else:
+                short_unrealized += pos_unrealized
+            if pos_unrealized < 0:   # v4.7-risk100-v3b: только убытки
+                open_losses += pos_unrealized
+        # Триггер: сумма открытых убытков пробила порог
+        if open_losses <= DAILY_STOP_LOSS:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
-                # v4.7-risk100-v2: принудительное закрытие всех позиций
-                # в стиле основного блока закрытия (с _fc, max_adverse)
+                # Определяем "плохую" сторону (с наибольшим убытком)
+                bad_side = +1 if long_unrealized <= short_unrealized else -1
+                # Закрываем только убыточные позиции в "плохую" сторону
+                positions_remaining = []
                 dstop_realized = 0.0
                 for pos in positions:
                     candle_now = by_pair_day[pos.contract].get(day_ts)
                     if candle_now is None:
+                        positions_remaining.append(pos)
                         continue
-                    exit_price_now = candle_now['c']
-                    gross_now = pos.side * (exit_price_now - pos.entry) / pos.entry * pos.size_usd
-                    comm_now  = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
-                    n_fund_now = 0
-                    cur_now = pos.entry_day_ts
-                    while cur_now < day_ts:
-                        if dt.datetime.utcfromtimestamp(cur_now).hour in FUNDING_TIMES_UTC:
-                            n_fund_now += 1
-                        cur_now += 3600
-                    # FIX: funding_snap ключи — _USDT, pos.contract — голый тикер
-                    _fc_now = pos.contract if pos.contract.endswith("_USDT") else f"{pos.contract}_USDT"
-                    funding_rate_now = funding_snap.get(_fc_now, 0.0)
-                    funding_cost_now = pos.side * funding_rate_now * pos.size_usd * n_fund_now
-                    net_now = gross_now - comm_now - funding_cost_now
-                    realized_today += net_now
-                    dstop_realized  += net_now
-                    closed_trades.append({
-                        "contract": pos.contract, "side": pos.side,
-                        "entry": pos.entry, "exit": exit_price_now,
-                        "size_usd": pos.size_usd, "pnl": net_now,
-                        "reason": "DSTOP", "hold_days": pos.hold_days,
-                        "entry_day": pos.entry_day_ts, "exit_day": day_ts,
-                        "max_favorable": pos.max_favorable,
-                        "max_adverse": pos.max_adverse,
-                    })
-                positions = []   # все позиции закрыты
+                    pos_unrealized = pos.side * (candle_now['c'] - pos.entry) / pos.entry * pos.size_usd
+                    # Закрываем только если: сторона совпадает с bad_side И позиция в минусе
+                    if pos.side == bad_side and pos_unrealized < 0:
+                        exit_price_now = candle_now['c']
+                        gross_now = pos.side * (exit_price_now - pos.entry) / pos.entry * pos.size_usd
+                        comm_now  = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
+                        n_fund_now = 0
+                        cur_now = pos.entry_day_ts
+                        while cur_now < day_ts:
+                            if dt.datetime.utcfromtimestamp(cur_now).hour in FUNDING_TIMES_UTC:
+                                n_fund_now += 1
+                            cur_now += 3600
+                        _fc_now = pos.contract if pos.contract.endswith("_USDT") else f"{pos.contract}_USDT"
+                        funding_rate_now = funding_snap.get(_fc_now, 0.0)
+                        funding_cost_now = pos.side * funding_rate_now * pos.size_usd * n_fund_now
+                        net_now = gross_now - comm_now - funding_cost_now
+                        realized_today += net_now
+                        dstop_realized  += net_now
+                        closed_trades.append({
+                            "contract": pos.contract, "side": pos.side,
+                            "entry": pos.entry, "exit": exit_price_now,
+                            "size_usd": pos.size_usd, "pnl": net_now,
+                            "reason": "DSTOP", "hold_days": pos.hold_days,
+                            "entry_day": pos.entry_day_ts, "exit_day": day_ts,
+                            "max_favorable": pos.max_favorable,
+                            "max_adverse": pos.max_adverse,
+                        })
+                    else:
+                        # Оставляем прибыльные позиции и позиции в другую сторону
+                        positions_remaining.append(pos)
+                positions = positions_remaining
                 # Пересчёт cash/equity/daily_pnl с учётом DSTOP-закрытий
                 cash      += dstop_realized
+                # Пересчёт unrealized
                 unrealized = 0.0
-                equity     = cash   # unrealized = 0
-                # Обновляем последнюю запись equity_curve
+                for pos in positions:
+                    c = by_pair_day[pos.contract].get(day_ts)
+                    if c is None:
+                        continue
+                    unrealized += pos.side * (c['c'] - pos.entry) / pos.entry * pos.size_usd
+                equity = cash + unrealized
                 equity_curve[-1] = (day_ts, equity)
-                # Пересчитываем daily_pnl для этого дня
                 prev_eq = INIT_CAPITAL if day_idx == 0 else equity_curve[-2][1]
                 daily_pnl[-1] = (day_ts, equity - prev_eq)
                 day_stop_events.append({
