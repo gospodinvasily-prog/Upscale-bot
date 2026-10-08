@@ -66,13 +66,13 @@ else:
 
 # --- Капитал и риск (v4.7-risk100: compound с floor $100) ---
 INIT_CAPITAL     = 10_000.0
-RISK_FRACTION    = 0.010      # 1.0% от equity на сделку
-SLOT_RISK_MIN    = 100.0      # v4.7-risk100: floor $100
+RISK_FRACTION    = 0.008      # v4.7-prop-safe-risk80: 0.8% от equity на сделку
+SLOT_RISK_MIN    = 80.0       # v4.7-prop-safe-risk80: floor $80
 SLOT_RISK_MAX    = 200.0      # ceiling $200
 MAX_POSITION_PCT = 0.20
 
 # --- DD brake ---
-DD_BRAKE_THRESHOLD = 700.0  # v4.7-prop-safe: 7% для проп-счёта  # v4.7-risk100-v8: повышен с $1,200 для меньших срабатываний
+DD_BRAKE_THRESHOLD = 700.0  # v4.7-prop-safe: 7% для проп-счёта (лимит 10% = $1,000)
 DD_BRAKE_FACTOR    = 0.5
 DD_BRAKE_RECOVERY  = 0.95
 
