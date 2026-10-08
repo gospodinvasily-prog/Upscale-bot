@@ -107,7 +107,7 @@ MAX_DD_LIMIT     = 2_000.0
 YEAR_LOSS_LIMIT  = -500.0
 
 BTC_CONTRACT     = "BTC_USDT"
-BACKTEST_START_ISO = "2026-07-10"   # последние 90 дней до сегодня, без прогрева
+BACKTEST_START_ISO = "2023-01-01"   # весь период (полная история)
 BACKTEST_END_ISO   = ""             # пусто = окно идёт до сегодня
 
 
@@ -490,6 +490,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     day_loss_stop_active = False
     day_stop_triggered = 0
     last_day_idx = -1
+    day_stop_events = []   # v4.5: [{"day": ts, "open_before": n, "open_left": n}, ...]
 
     # --- 6) Главный цикл ---
     for day_idx, day_ts in enumerate(all_days):
@@ -503,6 +504,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             last_day_idx = day_idx
 
         # 6.1) Закрытие по trailing stop / TIME / SIG
+        positions_before = len(positions)   # v4.5: для отчёта "закрылись ли все позиции"
         new_positions = []
         realized_today = 0.0
         for pos in positions:
@@ -625,6 +627,15 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
+                # v4.5: отчёт — дата срабатывания + закрылись ли сами все позиции
+                # (защита НЕ закрывает позиции, только блокирует новые входы;
+                # здесь просто фиксируем факт, логика не меняется)
+                day_stop_events.append({
+                    "day": day_ts,
+                    "open_before": positions_before,
+                    "open_left": len(positions),
+                    "all_closed": positions_before > 0 and len(positions) == 0,
+                })
         if day_loss_stop_active:
             continue
 
@@ -722,6 +733,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         "cooldown_blocked": cooldown_blocked,
         "excluded_count": excluded_count,
         "day_stop_triggered": day_stop_triggered,
+        "day_stop_events": day_stop_events,
     }
 
 
@@ -763,22 +775,68 @@ def validate(result, z=Z_SCORE):
     for t in result["trades"]:
         reasons[t["reason"]] += 1
 
-    # v4.5: разбивка по парам — сделки / PnL / winrate на каждый инструмент
-    by_pair = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
+    # v4.5: разбивка по парам — сделки / PnL / winrate + long/short на каждый инструмент
+    by_pair = defaultdict(lambda: {
+        "n": 0, "wins": 0, "losses": 0, "pnl": 0.0,
+        "long_n": 0, "long_wins": 0, "short_n": 0, "short_wins": 0,
+    })
     for t in result["trades"]:
         row = by_pair[t["contract"]]
         row["n"] += 1
         row["pnl"] += t["pnl"]
-        if t["pnl"] > 0:
+        win = t["pnl"] > 0
+        if win:
             row["wins"] += 1
+        else:
+            row["losses"] += 1
+        if t["side"] == +1:
+            row["long_n"] += 1
+            if win:
+                row["long_wins"] += 1
+        else:
+            row["short_n"] += 1
+            if win:
+                row["short_wins"] += 1
     pair_stats = sorted(
         (
             {"pair": p, "n": r["n"], "pnl": r["pnl"],
-             "winrate": (r["wins"] / r["n"] * 100) if r["n"] else 0.0}
+             "winrate": (r["wins"] / r["n"] * 100) if r["n"] else 0.0,
+             "wins": r["wins"], "losses": r["losses"],
+             "long_n": r["long_n"], "long_wins": r["long_wins"],
+             "short_n": r["short_n"], "short_wins": r["short_wins"]}
             for p, r in by_pair.items()
         ),
         key=lambda x: x["pnl"], reverse=True,
     )
+
+    # v4.5: общая статистика long/short (прибыльные/убыточные)
+    all_trades = result["trades"]
+    longs  = [t for t in all_trades if t["side"] == +1]
+    shorts = [t for t in all_trades if t["side"] == -1]
+    long_short_stats = {
+        "long_n": len(longs),
+        "long_wins": sum(1 for t in longs if t["pnl"] > 0),
+        "long_losses": sum(1 for t in longs if t["pnl"] <= 0),
+        "short_n": len(shorts),
+        "short_wins": sum(1 for t in shorts if t["pnl"] > 0),
+        "short_losses": sum(1 for t in shorts if t["pnl"] <= 0),
+    }
+
+    # v4.5: daily stop -400 — даты срабатывания, закрытие всех позиций,
+    # и сколько раз срабатывало несколько дней ПОДРЯД
+    day_stop_events = result.get("day_stop_events", [])
+    streaks = []
+    cur_streak = []
+    for ev in sorted(day_stop_events, key=lambda e: e["day"]):
+        if cur_streak and ev["day"] - cur_streak[-1]["day"] == 86400:
+            cur_streak.append(ev)
+        else:
+            if cur_streak:
+                streaks.append(cur_streak)
+            cur_streak = [ev]
+    if cur_streak:
+        streaks.append(cur_streak)
+    multi_day_streaks = [s for s in streaks if len(s) >= 2]
 
     return {
         "final_equity": final, "total_pnl": total_pnl, "ci_z": ci,
@@ -788,6 +846,13 @@ def validate(result, z=Z_SCORE):
         "yearly_pnl": dict(yearly),
         "reasons": dict(reasons),
         "pair_stats": pair_stats,
+        "long_short_stats": long_short_stats,
+        "day_stop_events": day_stop_events,
+        "day_stop_streaks_multi": len(multi_day_streaks),
+        "day_stop_streaks_multi_detail": [
+            {"from": s[0]["day"], "to": s[-1]["day"], "days": len(s)}
+            for s in multi_day_streaks
+        ],
         "btc_blocked": result.get("btc_blocked", 0),
         "dd_brake_days": result.get("dd_brake_days", 0),
         "adx_filtered": result.get("adx_filtered", 0),
@@ -841,7 +906,34 @@ def format_report(result, val, n_pairs=None):
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
-    # v4.5: разбивка по парам (сделки / PnL / winrate), сортировка по PnL
+    # v4.5: Long/Short — сколько всего и сколько из них прибыльных/убыточных
+    ls = val.get("long_short_stats")
+    if ls:
+        lines.append("")
+        lines.append("— LONG / SHORT —")
+        lines.append(f"Long : {ls['long_n']} сделок  (🟢 {ls['long_wins']} / 🔴 {ls['long_losses']})")
+        lines.append(f"Short: {ls['short_n']} сделок  (🟢 {ls['short_wins']} / 🔴 {ls['short_losses']})")
+
+    # v4.5: Daily stop -400 — даты срабатывания, закрылись ли все позиции,
+    # и сколько раз это было несколько дней подряд
+    events = val.get("day_stop_events") or []
+    if events:
+        lines.append("")
+        lines.append("— DAILY STOP -$400 —")
+        lines.append(f"Сработал: {val['day_stop_triggered']} раз(а)  |  "
+                     f"подряд (2+ дня): {val.get('day_stop_streaks_multi', 0)} раз(а)")
+        for det in (val.get("day_stop_streaks_multi_detail") or []):
+            d_from = dt.datetime.utcfromtimestamp(det["from"]).strftime("%Y-%m-%d")
+            d_to   = dt.datetime.utcfromtimestamp(det["to"]).strftime("%Y-%m-%d")
+            lines.append(f"   подряд {det['days']}д: {d_from} → {d_to}")
+        for ev in events[:30]:
+            d = dt.datetime.utcfromtimestamp(ev["day"]).strftime("%Y-%m-%d")
+            closed_mark = "все позиции закрылись" if ev["all_closed"] else f"осталось открыто {ev['open_left']}"
+            lines.append(f"   {d}: открыто было {ev['open_before']}, {closed_mark}")
+        if len(events) > 30:
+            lines.append(f"   ... и ещё {len(events)-30} срабатываний")
+
+    # v4.5: разбивка по парам (сделки / PnL / winrate + long/short), сортировка по PnL
     pair_stats = val.get("pair_stats") or []
     if pair_stats:
         lines.append("")
@@ -849,8 +941,9 @@ def format_report(result, val, n_pairs=None):
         for ps in pair_stats:
             mark = "🟢" if ps["pnl"] > 0 else ("🔴" if ps["pnl"] < 0 else "⚪")
             lines.append(
-                f"{mark} {ps['pair']}: {ps['n']} сделок, "
-                f"PnL ${ps['pnl']:,.2f}, winrate {ps['winrate']:.0f}%"
+                f"{mark} {ps['pair']}: {ps['n']} сделок (🟢{ps['wins']}/🔴{ps['losses']}), "
+                f"PnL ${ps['pnl']:,.2f}, winrate {ps['winrate']:.0f}%, "
+                f"L={ps['long_n']}(🟢{ps['long_wins']}) S={ps['short_n']}(🟢{ps['short_wins']})"
             )
     return lines
 
