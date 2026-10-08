@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+5%) / Breakeven stop
+bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+4%) / Breakeven stop
 ====================================================================
 
 Запуск через диспетчер:
@@ -11,16 +11,16 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+5%) / Breakeven stop
   пользователя — v4.7 строится от v4.5, не от v4.6.
 
   Вместо него — новая структура тейков (PARTIAL TP + BREAKEVEN):
-    Если позиция дошла до +5% в свою сторону (favorable move от entry) —
-    закрывается 30% позиции по цене закрытия дня (reason="PTP"),
+    Если позиция дошла до +4% в свою сторону (favorable move от entry) —
+    закрывается 50% позиции по цене закрытия дня (reason="PTP"),
     а trail_stop для остатка сразу переносится на entry (breakeven).
     Дальше остаток либо идёт по trailing 2xATR (большая прибыль),
     либо закрывается в ноль по breakeven — минус по сделке после
     partial TP становится невозможен (на остаток; сам partial кусок
     уже зафиксирован в плюс).
 
-  PARTIAL_TP_PCT      = 0.05  (+5% favorable)
-  PARTIAL_TP_FRACTION = 0.30  (закрывается 30% позиции)
+  PARTIAL_TP_PCT      = 0.04  (+4% favorable)
+  PARTIAL_TP_FRACTION = 0.50  (закрывается половина позиции)
 
 Что унаследовано из v4.5 (без изменений):
   - Compound sizing (floor $80, cap $200), DD brake x0.5 > $1,200
@@ -97,8 +97,8 @@ MAX_HOLD_DAYS    = 15
 MAX_NEW_PER_DAY  = 2
 
 # --- v4.7: Partial TP + Breakeven stop ---
-PARTIAL_TP_PCT      = 0.05    # +5% favorable -> закрыть часть позиции
-PARTIAL_TP_FRACTION = 0.30    # какую долю закрыть
+PARTIAL_TP_PCT      = 0.04    # +4% favorable -> закрыть часть позиции
+PARTIAL_TP_FRACTION = 0.50    # какую долю закрыть
 # После partial TP trail_stop перемещается на entry (breakeven) для остатка
 
 # --- Издержки ---
