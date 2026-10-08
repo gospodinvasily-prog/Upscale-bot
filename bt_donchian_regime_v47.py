@@ -80,8 +80,8 @@ DD_BRAKE_RECOVERY  = 0.95
 MAX_CONCURRENT     = 6       # максимум одновременных позиций
 MAX_PER_SIDE_CAP   = 6       # v4.5: = MAX_CONCURRENT, per-side cap отключён
 PER_SIDE_BUDGET    = 999999  # v4.5: огромное число, per-side не ограничивает
-DAILY_STOP_LOSS            = -400.0  # v4.7-risk100-v6: базовый порог (1-й минусовой день)
-DAILY_STOP_LOSS_CONSEC     = -100.0  # v4.7-risk100-v6: 2-й минусовой день подряд -> порог -$100
+DAILY_STOP_LOSS            = -400.0  # v4.7-risk100-v7: единый порог для всех дней
+DAILY_STOP_LOSS_CONSEC     = -400.0  # v4.7-risk100-v7: тот же порог (consecutive logic отключена)
 
 # --- v4.4: Exclude + Cooldown (как в v4.3) ---
 # FIX: UPSCALE_PAIRS в bot.py — голые тикеры ("TRX", без _USDT),
