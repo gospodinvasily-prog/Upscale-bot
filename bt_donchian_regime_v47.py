@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+4%) / Breakeven stop
+bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+8%) / Breakeven stop
 ====================================================================
 
 Запуск через диспетчер:
@@ -11,7 +11,7 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+4%) / Breakeven stop
   пользователя — v4.7 строится от v4.5, не от v4.6.
 
   Вместо него — новая структура тейков (PARTIAL TP + BREAKEVEN):
-    Если позиция дошла до +4% в свою сторону (favorable move от entry) —
+    Если позиция дошла до +8% в свою сторону (favorable move от entry) —
     закрывается 50% позиции по цене закрытия дня (reason="PTP"),
     а trail_stop для остатка сразу переносится на entry (breakeven).
     Дальше остаток либо идёт по trailing 2xATR (большая прибыль),
@@ -19,8 +19,19 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+4%) / Breakeven stop
     partial TP становится невозможен (на остаток; сам partial кусок
     уже зафиксирован в плюс).
 
-  PARTIAL_TP_PCT      = 0.04  (+4% favorable)
+  PARTIAL_TP_PCT      = 0.08  (+8% favorable)
   PARTIAL_TP_FRACTION = 0.50  (закрывается половина позиции)
+
+Новое в отчёте (без изменения логики стратегии):
+  Для убыточных сделок, закрытых по стопу (SL/TRAIL), считаем:
+    - MAE% (max adverse excursion) — максимальная просадка от entry
+      в % за время удержания позиции (независимо от итоговой цены
+      выхода — это худшая точка, которая была пройдена).
+    - % таких сделок, где цена в течение 15 дней ПОСЛЕ закрытия по
+      стопу всё же вернулась в сторону сделки (выше entry для Long,
+      ниже entry для Short) — т.е. стоп вынес раньше времени.
+  Это чисто информационная статистика (считается постфактум по факту
+  котировок после закрытия), саму торговую логику она не меняет.
 
 Что унаследовано из v4.5 (без изменений):
   - Compound sizing (floor $80, cap $200), DD brake x0.5 > $1,200
@@ -97,8 +108,13 @@ MAX_HOLD_DAYS    = 15
 MAX_NEW_PER_DAY  = 2
 
 # --- v4.7: Partial TP + Breakeven stop ---
-PARTIAL_TP_PCT      = 0.04    # +4% favorable -> закрыть часть позиции
+PARTIAL_TP_PCT      = 0.08    # +8% favorable -> закрыть часть позиции
 PARTIAL_TP_FRACTION = 0.50    # какую долю закрыть
+
+# v4.7: отчёт — сколько дней ПОСЛЕ стоп-выхода смотрим вперёд, чтобы
+# проверить, вернулась ли цена в сторону сделки (чисто для статистики,
+# на саму торговую логику не влияет)
+STOP_REVERSAL_LOOKFORWARD_DAYS = 15
 # После partial TP trail_stop перемещается на entry (breakeven) для остатка
 
 # --- Издержки ---
@@ -336,7 +352,7 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
 class Position:
     __slots__ = ("contract", "side", "entry", "atr_at_entry",
                  "size_usd", "original_size_usd", "initial_stop", "trail_stop",
-                 "max_favorable", "entry_idx", "entry_day_ts",
+                 "max_favorable", "max_adverse", "entry_idx", "entry_day_ts",
                  "hold_days", "donchian_at_entry", "partial_taken")
 
     def __init__(self, contract, side, entry, atr_at_entry,
@@ -350,6 +366,7 @@ class Position:
         self.initial_stop       = entry - side * ATR_STOP_MULT * atr_at_entry
         self.trail_stop         = self.initial_stop
         self.max_favorable      = entry
+        self.max_adverse        = entry   # v4.7: для отчёта (MAE%)
         self.entry_idx         = entry_idx
         self.entry_day_ts      = entry_day_ts
         self.hold_days         = 0
@@ -360,10 +377,12 @@ class Position:
         """Пересчитать max-favorable и trailing stop по новой свече."""
         if self.side == +1:
             self.max_favorable = max(self.max_favorable, candle['h'])
+            self.max_adverse   = min(self.max_adverse, candle['l'])   # v4.7: MAE
             new_stop = self.max_favorable - ATR_STOP_MULT * self.atr_at_entry
             self.trail_stop = max(self.trail_stop, new_stop)
         else:
             self.max_favorable = min(self.max_favorable, candle['l'])
+            self.max_adverse   = max(self.max_adverse, candle['h'])   # v4.7: MAE
             new_stop = self.max_favorable + ATR_STOP_MULT * self.atr_at_entry
             self.trail_stop = min(self.trail_stop, new_stop)
 
@@ -576,6 +595,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     "reason": "PTP", "hold_days": pos.hold_days,
                     "entry_day": pos.entry_day_ts, "exit_day": day_ts,
                     "max_favorable": pos.max_favorable,
+                    "max_adverse": pos.max_adverse,
                 })
 
             exit_price, exit_reason = None, None
@@ -625,6 +645,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     "reason": exit_reason, "hold_days": pos.hold_days,
                     "entry_day": pos.entry_day_ts, "exit_day": day_ts,
                     "max_favorable": pos.max_favorable,
+                    "max_adverse": pos.max_adverse,
                 })
                 # v4.4: обновляем pair_stats для cooldown
                 ps = pair_stats[pos.contract]
@@ -774,8 +795,38 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             "reason": "END", "hold_days": pos.hold_days,
             "entry_day": pos.entry_day_ts, "exit_day": last_day_ts,
             "max_favorable": pos.max_favorable,
+            "max_adverse": pos.max_adverse,
         })
         cash += net
+
+    # 8) v4.7: для убыточных стоп-выходов (SL/TRAIL) — проверяем постфактум,
+    #    вернулась ли цена в течение STOP_REVERSAL_LOOKFORWARD_DAYS дней
+    #    ПОСЛЕ закрытия обратно в сторону сделки (выше entry для Long,
+    #    ниже entry для Short). Чисто отчётная статистика, саму торговлю
+    #    не меняет и не влияет ни на один вход/выход выше.
+    for t in closed_trades:
+        if t["reason"] not in ("SL", "TRAIL") or t["pnl"] > 0:
+            continue
+        cds = data.get(t["contract"])
+        idx_map = idx_by_pair_day.get(t["contract"])
+        if not cds or not idx_map:
+            t["reversed_after_stop"] = None
+            continue
+        idx = idx_map.get(t["exit_day"])
+        if idx is None:
+            t["reversed_after_stop"] = None
+            continue
+        reversed_flag = False
+        hi = min(idx + 1 + STOP_REVERSAL_LOOKFORWARD_DAYS, len(cds))
+        for j in range(idx + 1, hi):
+            c2 = cds[j]
+            if t["side"] == +1 and c2['h'] >= t["entry"]:
+                reversed_flag = True
+                break
+            if t["side"] == -1 and c2['l'] <= t["entry"]:
+                reversed_flag = True
+                break
+        t["reversed_after_stop"] = reversed_flag
 
     return {
         "final_equity": cash,
@@ -918,6 +969,29 @@ def validate(result, z=Z_SCORE):
     long_short_stats["short_losing_mfe_max"] = (
         max((_mfe_pct(t) for t in losing_shorts), default=0.0))
 
+    # v4.7: убыточные стоп-выходы (SL/TRAIL) — максимальная просадка от
+    # входа (MAE%) за время удержания + % случаев, когда цена всё же
+    # вернулась в сторону сделки в течение STOP_REVERSAL_LOOKFORWARD_DAYS
+    # дней ПОСЛЕ закрытия (стоп вынес раньше времени). Отчётная статистика,
+    # не влияет на торговую логику.
+    def _mae_pct(t):
+        return t["side"] * (t["entry"] - t["max_adverse"]) / t["entry"] * 100
+
+    stop_losing = [
+        t for t in result["trades"]
+        if t["reason"] in ("SL", "TRAIL") and t["pnl"] <= 0
+        and t.get("reversed_after_stop") is not None
+    ]
+    stop_reversed_n = sum(1 for t in stop_losing if t["reversed_after_stop"])
+    stop_stats = {
+        "n": len(stop_losing),
+        "reversed_n": stop_reversed_n,
+        "reversed_pct": (stop_reversed_n / len(stop_losing) * 100) if stop_losing else 0.0,
+        "mae_avg": (sum(_mae_pct(t) for t in stop_losing) / len(stop_losing)) if stop_losing else 0.0,
+        "mae_max": max((_mae_pct(t) for t in stop_losing), default=0.0),
+        "lookforward_days": STOP_REVERSAL_LOOKFORWARD_DAYS,
+    }
+
     # daily stop -400 — даты срабатывания, закрытие всех позиций,
     # и сколько раз срабатывало несколько дней ПОДРЯД
     day_stop_events = result.get("day_stop_events", [])
@@ -949,6 +1023,7 @@ def validate(result, z=Z_SCORE):
         "reasons": dict(reasons),
         "pair_stats": pair_stats,
         "long_short_stats": long_short_stats,
+        "stop_reversal_stats": stop_stats,
         "day_stop_events": day_stop_events,
         "day_stop_streaks_multi": len(multi_day_streaks),
         "day_stop_streaks_multi_detail": [
@@ -1030,6 +1105,18 @@ def format_report(result, val, n_pairs=None):
             f"Убыточные Short — доходили в свою сторону в среднем на "
             f"{ls['short_losing_mfe_avg']:.2f}% (макс {ls['short_losing_mfe_max']:.2f}%)"
         )
+
+    # v4.7: убыточные стоп-выходы (SL/TRAIL) — просадка от входа (MAE%)
+    # + % случаев, когда цена вернулась в сторону сделки после стопа
+    ss = val.get("stop_reversal_stats")
+    if ss and ss["n"]:
+        lines.append("")
+        lines.append("— СТОП-ВЫХОДЫ (SL/TRAIL), убыточные —")
+        lines.append(f"Всего: {ss['n']}  |  вернулись в сторону сделки "
+                     f"в течение {ss['lookforward_days']}д после стопа: "
+                     f"{ss['reversed_n']} ({ss['reversed_pct']:.0f}%)")
+        lines.append(f"Просадка от входа (MAE%): в среднем {ss['mae_avg']:.2f}%  "
+                     f"(макс {ss['mae_max']:.2f}%)")
 
     # Daily stop -400 — даты срабатывания, закрылись ли все позиции,
     # и сколько раз это было несколько дней подряд
