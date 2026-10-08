@@ -107,7 +107,8 @@ MAX_DD_LIMIT     = 2_000.0
 YEAR_LOSS_LIMIT  = -500.0
 
 BTC_CONTRACT     = "BTC_USDT"
-BACKTEST_START_ISO = "2023-01-01"
+BACKTEST_START_ISO = "2026-01-26"   # второй контрольный период — 90 дней, НЕ пересекается с первым
+BACKTEST_END_ISO   = "2026-04-26"   # (первый период начинается здесь же, окна идут подряд, без прогрева)
 
 
 # =====================================================================
@@ -417,7 +418,7 @@ def compute_max_per_side(current_risk):
     return min(MAX_PER_SIDE_CAP, int(PER_SIDE_BUDGET / current_risk))
 
 
-def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
+def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, verbose=True):
     if B is None:
         raise RuntimeError("bot module not available")
 
@@ -448,9 +449,14 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, verbose=True):
     funding_snap = get_funding_snapshot()
 
     # --- 4) Общий таймлайн ---
+    # end_iso ограничивает окно СВЕРХУ (нужно для непересекающегося "второго
+    # периода" — без этого all_days всегда шёл до сегодня, и любой сдвиг
+    # start_iso просто вкладывал одно окно в другое, а не давал независимый тест).
     start_ts = int(dt.datetime.fromisoformat(start_iso).timestamp())
+    end_ts = int(dt.datetime.fromisoformat(end_iso).timestamp()) if end_iso else None
     all_days = sorted(set(
-        c['t'] for p in data for c in data[p] if c['t'] >= start_ts
+        c['t'] for p in data for c in data[p]
+        if c['t'] >= start_ts and (end_ts is None or c['t'] < end_ts)
     ))
     if len(all_days) < DONCHIAN_PERIOD + BTC_REGIME_SMA + 5:
         raise RuntimeError(f"Слишком мало дней: {len(all_days)}")
@@ -864,11 +870,13 @@ def main():
     _PAIRS_USED = pairs
 
     start = os.environ.get("BT_START", BACKTEST_START_ISO)
+    end   = os.environ.get("BT_END", BACKTEST_END_ISO)
     B.send_telegram(
-        f"🚀 *bt_donchian_regime v4.5* старт: {len(pairs)} пар, начало {start}"
+        f"🚀 *bt_donchian_regime v4.5* старт: {len(pairs)} пар, "
+        f"окно {start} → {end or 'сегодня'}"
     )
 
-    result = run_backtest(pairs, start_iso=start, verbose=True)
+    result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
     val    = validate(result)
 
     lines = format_report(result, val, n_pairs=len(pairs))
