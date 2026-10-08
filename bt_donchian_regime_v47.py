@@ -72,7 +72,7 @@ SLOT_RISK_MAX    = 200.0      # ceiling $200
 MAX_POSITION_PCT = 0.20
 
 # --- DD brake ---
-DD_BRAKE_THRESHOLD = 1_500.0  # v4.7-risk100-v8: повышен с $1,200 для меньших срабатываний
+DD_BRAKE_THRESHOLD = 700.0  # v4.7-prop-safe: 7% для проп-счёта  # v4.7-risk100-v8: повышен с $1,200 для меньших срабатываний
 DD_BRAKE_FACTOR    = 0.5
 DD_BRAKE_RECOVERY  = 0.95
 
