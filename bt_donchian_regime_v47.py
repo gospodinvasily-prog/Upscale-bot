@@ -709,14 +709,14 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         short_count = sum(1 for p in positions if p.side == -1)
 
         # v4.4: daily emergency stop
-        # v4.7-risk100-v4: динамический порог в зависимости от предыдущего дня.
-        #   - Если вчера был минусовой день (prev_day_pnl < 0) -> порог -$100
-        #     (2-й день подряд в минусе, не ждём больших убытков, закрываем раньше)
-        #   - Иначе -> порог -$300 (базовый)
-        # Триггер: сумма убытков открытых позиций (open_losses, только отрицательные
-        # unrealized) <= порога.
-        # Закрытие: только убыточные позиции в "плохую" сторону (где больше убыток).
-        # Прибыльные позиции и позиции в "хорошую" сторону оставляем.
+        # v4.7-risk100-v5: триггер — суммарный дневной убыток:
+        #   - realized_today (только отрицательные закрытые сделки за день)
+        #   + unrealized (только отрицательные, открытые позиции)
+        # Если суммарный дневной убыток <= порога — закрываем убыточные позиции
+        # в "плохую" сторону (где больше убыток). Прибыльные оставляем.
+        # Порог динамический:
+        #   - Вчера был минус → -$100 (2-й день подряд, агрессивнее)
+        #   - Иначе → -$300 (базовый)
         if prev_day_pnl < 0:
             current_threshold = DAILY_STOP_LOSS_CONSEC   # -$100 (2-й день подряд в минусе)
         else:
@@ -736,8 +736,15 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 short_unrealized += pos_unrealized
             if pos_unrealized < 0:   # только убытки
                 open_losses += pos_unrealized
-        # Триггер: сумма открытых убытков пробила порог
-        if open_losses <= current_threshold:
+        # v4.7-risk100-v5: считаем также УБЫТОЧНЫЕ closed trades за сегодня
+        realized_losses_today = 0.0
+        for t in closed_trades:
+            if t["exit_day"] == day_ts and t["pnl"] < 0:
+                realized_losses_today += t["pnl"]
+        # СУММАРНЫЙ дневной убыток: закрытые минусы + открытые минусы
+        total_daily_losses = realized_losses_today + open_losses
+        # Триггер: суммарный дневной убыток пробил порог
+        if total_daily_losses <= current_threshold:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
