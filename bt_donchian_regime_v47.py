@@ -109,7 +109,7 @@ MAX_HOLD_DAYS    = 15
 MAX_NEW_PER_DAY  = 2
 
 # --- v4.7: Partial TP + Breakeven stop ---
-PARTIAL_TP_PCT      = 0.10    # +10% favorable -> закрыть часть позиции (было 0.08)
+PARTIAL_TP_PCT      = 0.08    # +8% favorable -> закрыть часть позиции (возвращено с 0.10)
 PARTIAL_TP_FRACTION = 0.50    # какую долю закрыть
 
 # v4.7: отчёт — сколько дней ПОСЛЕ стоп-выхода смотрим вперёд, чтобы
