@@ -1,35 +1,39 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_4h_v12.py - Donchian Breakout на 4H (v1.2: trailing по close + правки)
-=================================================================================
-ЗАПУСК: RUN_BACKTEST=donchian_4h_v12 python bot.py
+bt_donchian_4h_v13.py - Donchian Breakout на 4H (v1.3: exclude 6 пар)
+====================================================================
+ЗАПУСК: RUN_BACKTEST=donchian_4h_v13 python bot.py
 
-=== TEST BUILD v1.2 (4H Donchian) ===
-Основа: v1.1 (4H Donchian, 1336 сделок, +$5,405, 3 гейта FAIL)
+=== TEST BUILD v1.3 (4H Donchian) ===
+Основа: v1.2 (4H Donchian, 779 сделок, +$10,577, 3/4 PASS, 1 FAIL на Worst day)
 
-ИЗМЕНЕНИЯ vs v1.1 (7 правок + 3 новые метрики):
-  ① TRAILING ПО CLOSE (не по wick) — убить 83% ложных стопов
-     Было: trail по candle['l']/candle['h'] (intraday wicks выносят)
-     Стало: trail по candle['c'] (цена закрытия — реальное движение)
-  ② ATR_STOP_MULT = 4.5 (было 3.5) — шире initial stop
-  ③ MAX_CONCURRENT = 4 (было 6) — меньше параллельного риска
-  ④ DD_BRAKE_THRESHOLD = 900 (было 1200) — раньше включать brake
-  ⑤ DD_BRAKE_FACTOR = 0.4 (было 0.5) — сильнее резать риск
-  ⑥ MAX_NEW_PER_DAY = 6 (было 8) — меньше входов
-  ⑦ MAX_HOLD_DAYS = 35 (было 40) — чуть быстрее закрывать зависшие
+ИЗМЕНЕНИЯ vs v1.2 (только exclude 6 пар):
+  ① KAIA добавлен в EXCLUDE — все 5 худших сделок были KAIA Short
+     (сумма -$781, winrate 56%, но убытки огромные)
+  ② STX  добавлен — 6/6 loss, winrate 0%, -$390
+  ③ IOTA добавлен — winrate 14%, -$326
+  ④ ARB  добавлен — 3/3 loss, winrate 0%, -$149
+  ⑤ GRT  добавлен — 2/2 loss, winrate 0%, -$157
+  ⑥ CRV  добавлен — 2/2 loss, winrate 0%, -$161
+  Суммарно убираем убытка: ~$1,965
 
-  НОВЫЕ МЕТРИКИ В ОТЧЁТЕ:
-  ⑧ MaxDD dates (peak date → trough date)
-  ⑨ Profit Factor (gross profit / gross loss) + avg win / avg loss
-  ⑩ Worst 5 trades (пара/дата/PnL/причина)
-
-ЧТО ОСТАЛОСЬ КАК В v1.1:
-  - Donchian(20) на 4H, BTC SMA(50) на 1D, DMI, ATR(14)
+ЧТО ОСТАЛОСЬ КАК В v1.2 (без изменений):
+  - Donchian(20) на 4H, BTC SMA(50) 1D, DMI, ATR(14)
+  - Trailing по close (не по wick)
+  - ATR_STOP_MULT = 4.5, MAX_HOLD_DAYS = 35
+  - MAX_CONCURRENT = 4, MAX_NEW_PER_DAY = 6
+  - DD_BRAKE_THRESHOLD = $900, DD_BRAKE_FACTOR = 0.4
   - Пагинация 3 страницы × 2000 свечей = 6000
-  - Compound sizing $80-$200, brake ×0.4 при DD>$900
-  - Daily stop -$300/-$100 (consecutive day)
-  - Exclude 8 пар, cooldown 3/30
+  - Compound sizing $80-$200
+  - Daily stop -$300/-$100
   - Partial TP +8%/50% + breakeven
+  - 3 новые метрики: MaxDD dates, Profit Factor, Worst 5 trades
+
+ОЖИДАНИЕ:
+  - Сделок: ~730 (vs v1.2: 779) — минимальная потеря
+  - P&L: ~+$12,500 (vs v1.2: +$10,577) — убрали -$1,965 убытка
+  - Worst day: -$300/-$400 (vs v1.2: -$547) — PASS!
+  - Все 4 гейта — ALL PASS
 """
 
 import os
@@ -50,8 +54,8 @@ else:
 
 # ===== КОНСТАНТЫ =====
 STRATEGY_NAME    = "Donchian 4H"
-STRATEGY_VERSION = "v1.2-TEST"
-STRATEGY_FILE    = "bt_donchian_4h_v12"
+STRATEGY_VERSION = "v1.3-TEST"
+STRATEGY_FILE    = "bt_donchian_4h_v13"
 
 INIT_CAPITAL     = 10_000.0
 RISK_FRACTION    = 0.008
@@ -59,21 +63,26 @@ SLOT_RISK_MIN    = 80.0
 SLOT_RISK_MAX    = 200.0
 MAX_POSITION_PCT = 0.20
 
-# v1.2 правки ④⑤: DD brake — ниже порог, сильнее фактор
-DD_BRAKE_THRESHOLD = 900.0    # было 1200 → стало 900
-DD_BRAKE_FACTOR    = 0.4       # было 0.5 → стало 0.4
+DD_BRAKE_THRESHOLD = 900.0
+DD_BRAKE_FACTOR    = 0.4
 DD_BRAKE_RECOVERY  = 0.85
 
-# v1.2 правка ③: меньше параллельных позиций
-MAX_CONCURRENT     = 4         # было 6 → стало 4
+MAX_CONCURRENT     = 4
 MAX_PER_SIDE_CAP   = 4
 PER_SIDE_BUDGET    = 999999
 DAILY_STOP_LOSS            = -300.0
 DAILY_STOP_LOSS_CONSEC     = -100.0
 
+# v1.3: добавлены KAIA, STX, IOTA, ARB, GRT, CRV
 EXCLUDE_PAIRS = {
     "TRX", "XLM", "BNB", "UNI",
     "LTC", "RUNE", "PENDLE", "HBAR",
+    "KAIA",   # v1.3: 5 worst trades все KAIA S
+    "STX",    # v1.3: 6/6 loss, winrate 0%, -$390
+    "IOTA",   # v1.3: winrate 14%, -$326
+    "ARB",    # v1.3: 3/3 loss, winrate 0%, -$149
+    "GRT",    # v1.3: 2/2 loss, winrate 0%, -$157
+    "CRV",    # v1.3: 2/2 loss, winrate 0%, -$161
 }
 CONSEC_LOSS_LIMIT = 3
 COOLDOWN_DAYS     = 30
@@ -88,11 +97,9 @@ ATR_PERIOD       = 14
 ATR_PCT_MIN      = 0.006
 ATR_PCT_MAX      = 0.020
 
-# v1.2 правки ②⑦: шире стоп + чуть быстрее hold
-ATR_STOP_MULT    = 4.5         # было 3.5 → стало 4.5
-MAX_HOLD_DAYS    = 35          # было 40 → стало 35
-# v1.2 правка ⑥: меньше входов в день
-MAX_NEW_PER_DAY  = 6           # было 8 → стало 6
+ATR_STOP_MULT    = 4.5
+MAX_HOLD_DAYS    = 35
+MAX_NEW_PER_DAY  = 6
 
 PARTIAL_TP_PCT      = 0.08
 PARTIAL_TP_FRACTION = 0.50
@@ -185,13 +192,13 @@ def dmi(candles, period=DMI_PERIOD):
     return plus_di, minus_di, adx
 
 
-# ===== DATA FETCH (с пагинацией, как в v1.1) =====
+# ===== DATA FETCH (с пагинацией) =====
 
 _CANDLE_CACHE = {}
 
 
 def fetch_candles(contract, interval="1d", limit=2000):
-    """v1.1: Пагинация. 3 страницы по 2000 = 6000 свечей для 4H."""
+    """v1.1+: Пагинация. 3 страницы по 2000 = 6000 свечей для 4H."""
     key = (contract, interval, limit)
     if key in _CANDLE_CACHE:
         return _CANDLE_CACHE[key]
@@ -323,7 +330,7 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
             "plus_di": plus_di, "minus_di": minus_di, "adx": adx}
 
 
-# ===== POSITION (v1.2: trailing по CLOSE) =====
+# ===== POSITION (trailing по close, как в v1.2) =====
 
 class Position:
     __slots__ = ("contract", "side", "entry", "atr_at_entry",
@@ -339,7 +346,6 @@ class Position:
         self.atr_at_entry       = atr_at_entry
         self.size_usd           = size_usd
         self.original_size_usd  = size_usd
-        # v1.2: SL = 4.5×ATR
         self.initial_stop       = entry - side * ATR_STOP_MULT * atr_at_entry
         self.trail_stop         = self.initial_stop
         self.max_favorable      = entry
@@ -355,12 +361,8 @@ class Position:
         Только candle['c'] — убирает ложные стопы от intraday wicks.
         max_favorable/max_adverse по-прежнему по high/low (для отчёта MFE/MAE)."""
         if self.side == +1:
-            # max_favorable по high (для отчёта MFE — насколько доходила в нашу сторону)
             self.max_favorable = max(self.max_favorable, candle['h'])
             self.max_adverse   = min(self.max_adverse, candle['l'])
-            # v1.2: trail_stop по CLOSE (не по high)
-            # если close ниже текущего trail - не обновляем (не выносит)
-            # если close выше - двигаем trail вверх
             new_stop = candle['c'] - ATR_STOP_MULT * self.atr_at_entry
             self.trail_stop = max(self.trail_stop, new_stop)
         else:
@@ -510,7 +512,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     partial_tp_count = 0
     partial_tp_total_pnl = 0.0
 
-    # v1.2: tracking MaxDD dates (peak_ts, trough_ts)
     max_dd_peak_ts = None
     max_dd_trough_ts = None
     max_dd_value = 0.0
@@ -569,12 +570,10 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 })
 
             exit_price, exit_reason = None, None
-            # v1.2: TRAILING ПО CLOSE (candle['c']), не по low/high
             if pos.side == +1 and candle['c'] <= pos.trail_stop:
                 exit_price, exit_reason = pos.trail_stop, "TRAIL"
             elif pos.side == -1 and candle['c'] >= pos.trail_stop:
                 exit_price, exit_reason = pos.trail_stop, "TRAIL"
-            # v1.2: initial SL тоже по CLOSE (чтобы не выносило wick в 1-й день)
             elif pos.side == +1 and candle['c'] <= pos.initial_stop and pos.hold_days == 1:
                 exit_price, exit_reason = pos.initial_stop, "SL"
             elif pos.side == -1 and candle['c'] >= pos.initial_stop and pos.hold_days == 1:
@@ -640,7 +639,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         if equity > peak_equity:
             peak_equity = equity
             current_peak_ts = candle_ts
-        # v1.2: track MaxDD dates
         current_dd = peak_equity - equity
         if current_dd > max_dd_value:
             max_dd_value = current_dd
@@ -870,7 +868,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         "partial_tp_count": partial_tp_count,
         "partial_tp_total_pnl": partial_tp_total_pnl,
         "consec_loss_days_max": consec_loss_days_max,
-        # v1.2: новые метрики
         "max_dd_peak_ts": max_dd_peak_ts,
         "max_dd_trough_ts": max_dd_trough_ts,
         "max_dd_value": max_dd_value,
@@ -1011,7 +1008,6 @@ def validate(result, z=Z_SCORE):
         streaks.append(cur_streak)
     multi_day_streaks = [s for s in streaks if len(s) >= 2]
 
-    # v1.2 метрика ⑨: Profit Factor + Avg win/loss
     winning_trades = [t for t in all_trades if t["pnl"] > 0]
     losing_trades  = [t for t in all_trades if t["pnl"] < 0]
     gross_profit = sum(t["pnl"] for t in winning_trades)
@@ -1021,7 +1017,6 @@ def validate(result, z=Z_SCORE):
     avg_loss = (-gross_loss / len(losing_trades)) if losing_trades else 0.0
     expectancy = (avg_win * len(winning_trades) + avg_loss * len(losing_trades)) / len(all_trades) if all_trades else 0.0
 
-    # v1.2 метрика ⑩: Worst 5 trades
     worst_5 = sorted(all_trades, key=lambda t: t["pnl"])[:5]
 
     return {
@@ -1060,7 +1055,6 @@ def validate(result, z=Z_SCORE):
         "excluded_count": result.get("excluded_count", 0),
         "day_stop_triggered": result.get("day_stop_triggered", 0),
         "consec_loss_days_max": result.get("consec_loss_days_max", 0),
-        # v1.2 новые метрики
         "max_dd_peak_ts": result.get("max_dd_peak_ts"),
         "max_dd_trough_ts": result.get("max_dd_trough_ts"),
         "profit_factor": profit_factor,
@@ -1113,7 +1107,6 @@ def format_report(result, val, n_pairs=None):
     lines.append(f"CI(Z={Z_SCORE}): ${val['ci_z']:,.2f}")
     lines.append("")
 
-    # v1.2 метрика ⑨: Profit Factor + RR
     pf = val.get("profit_factor", 0)
     pf_str = f"{pf:.2f}" if pf != float("inf") else "∞"
     lines.append(f"Profit Factor: {pf_str}  (gross profit ${val.get('gross_profit',0):,.0f} / gross loss ${val.get('gross_loss',0):,.0f})")
@@ -1129,7 +1122,6 @@ def format_report(result, val, n_pairs=None):
                       if val.get("worst_day_ts") else "-")
     lines.append(f"② Worst day ≥ -$500   : {'✅ PASS' if val['gate2'] else '❌ FAIL'}"
                  f"  (worst = ${val['worst_day']:,.2f}, {worst_day_date})")
-    # v1.2 метрика ⑧: MaxDD dates
     max_dd_peak_ts = val.get("max_dd_peak_ts")
     max_dd_trough_ts = val.get("max_dd_trough_ts")
     dd_dates = ""
@@ -1146,7 +1138,6 @@ def format_report(result, val, n_pairs=None):
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
-    # v1.2 метрика ⑩: Worst 5 trades
     worst_5 = val.get("worst_5_trades", [])
     if worst_5:
         lines.append("")
@@ -1228,7 +1219,7 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v12 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v13 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
@@ -1237,7 +1228,8 @@ def main():
     end   = os.environ.get("BT_END", BACKTEST_END_ISO)
     B.send_telegram(
         f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: "
-        f"{len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing по close, окно {start} -> {end or 'сегодня'}"
+        f"{len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing по close, "
+        f"excluded {len(EXCLUDE_PAIRS)} пар, окно {start} -> {end or 'сегодня'}"
     )
     result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
     val    = validate(result)
