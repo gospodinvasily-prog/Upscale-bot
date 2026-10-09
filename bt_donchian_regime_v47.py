@@ -1,10 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-bt_meanrev_rsi_bb_v11.py - Mean Reversion v1.1 (RSI + Bollinger Bands)
-ЗАПУСК: RUN_BACKTEST=meanrev_rsi_bb_v11 python bot.py
-ВЕРСИЯ: MeanReversion RSI+BB v1.1
-Правки v1.1 vs v1.0: BTC regime ВЫКЛ, ADX<25 sideways filter ВКЛ, SL=3*ATR,
-TP1 на 50% retracement от BB band к mid, TP1 fraction=60%, max_hold=5д, new/day=4.
+bt_meanrev_rsi_bb_v12.py - Mean Reversion v1.2 (Лёгкий MR, максимум сделок)
+=========================================================================
+ЗАПУСК: RUN_BACKTEST=meanrev_rsi_bb_v12 python bot.py
+
+=== ТЕСТОВАЯ ВЕРСИЯ v1.2 (TEST BUILD) ===
+Цель: больше сделок чем v4.7 (718), проверка гипотезы что MR на 1D может
+дать 700-1000 сделок с контролируемым риском.
+
+ЧТО ИЗМЕНИЛОСЬ vs v1.1 (10 правок):
+  ① USE_ADX_FILTER = False (было True)  — ADX отрезал 10585 сигналов, вернём их
+  ② BB_STD = 1.5 (было 2.0)             — полосы ближе = чаще касания
+  ③ RSI_OVERSOLD = 35 (было 30)         — мягче для лонгов
+  ④ RSI_OVERBOUGHT = 65 (было 70)       — мягче для шортов
+  ⑤ MAX_CONCURRENT = 10 (было 6)        — больше позиций параллельно
+  ⑥ MAX_NEW_PER_DAY = 6 (было 4)        — больше входов в день
+  ⑦ MAX_HOLD_DAYS = 3 (было 5)           — быстрая ротация
+  ⑧ DD_BRAKE_THRESHOLD = 1200 (было 700) — не застревать в пониженном риске
+  ⑨ DD_BRAKE_RECOVERY = 0.85 (было 0.95) — быстрее выходить из brake
+  ⑩ ATR_STOP_MULT = 4.0 (было 3.0)       — шире стоп (75% ложных в v1.1!)
+
+ЧТО ОСТАЛОСЬ КАК В v1.1:
+  - RSI(14), BB(20)
+  - BTC regime ВЫКЛ (USE_BTC_REGIME = False)
+  - TP1 на 50% retracement от BB band к mid, 60% позиции
+  - Compound sizing (floor $80, cap $200)
+  - Daily emergency stop -$300 / -$100
+  - Exclude 8 пар, per-pair cooldown 3/30
+  - Весь расширенный отчёт v4.7
 """
 
 import os
@@ -23,9 +46,9 @@ else:
     _BOT_IMPORT_ERR = None
 
 # ===== КОНСТАНТЫ =====
-STRATEGY_NAME    = "MeanReversion RSI+BB"
-STRATEGY_VERSION = "v1.1"
-STRATEGY_FILE    = "bt_meanrev_rsi_bb_v11"
+STRATEGY_NAME    = "MeanReversion RSI+BB (Light)"
+STRATEGY_VERSION = "v1.2-TEST"   # ТЕСТОВАЯ ВЕРСИЯ
+STRATEGY_FILE    = "bt_meanrev_rsi_bb_v12"
 
 INIT_CAPITAL     = 10_000.0
 RISK_FRACTION    = 0.008
@@ -33,12 +56,14 @@ SLOT_RISK_MIN    = 80.0
 SLOT_RISK_MAX    = 200.0
 MAX_POSITION_PCT = 0.20
 
-DD_BRAKE_THRESHOLD = 700.0
+# v1.2 правка ⑧⑨: DD brake — выше порог, быстрее восстановление
+DD_BRAKE_THRESHOLD = 1200.0   # было 700 → стало 1200
 DD_BRAKE_FACTOR    = 0.5
-DD_BRAKE_RECOVERY  = 0.95
+DD_BRAKE_RECOVERY  = 0.85      # было 0.95 → стало 0.85
 
-MAX_CONCURRENT     = 6
-MAX_PER_SIDE_CAP   = 6
+# v1.2 правка ⑤⑥: больше параллельных позиций и входов в день
+MAX_CONCURRENT     = 10        # было 6 → стало 10
+MAX_PER_SIDE_CAP   = 10        # = MAX_CONCURRENT, per-side cap отключён
 PER_SIDE_BUDGET    = 999999
 DAILY_STOP_LOSS            = -300.0
 DAILY_STOP_LOSS_CONSEC     = -100.0
@@ -50,27 +75,29 @@ EXCLUDE_PAIRS = {
 CONSEC_LOSS_LIMIT = 3
 COOLDOWN_DAYS     = 30
 
+# v1.2 правки ②③④: мягче сигналы
 BB_PERIOD        = 20
-BB_STD           = 2.0
+BB_STD           = 1.5          # было 2.0 → стало 1.5
 RSI_PERIOD       = 14
-RSI_OVERSOLD     = 30
-RSI_OVERBOUGHT   = 70
+RSI_OVERSOLD     = 35          # было 30 → стало 35
+RSI_OVERBOUGHT   = 65          # было 70 → стало 65
 
 DMI_PERIOD       = 14
 ADX_THRESHOLD    = 25.0
-USE_ADX_FILTER   = True
+USE_ADX_FILTER   = False       # v1.2 правка ①: ADX ВЫКЛ (отрезал 10585 сигналов в v1.1)
 
-USE_BTC_REGIME   = False
+USE_BTC_REGIME   = False       # BTC regime ВЫКЛ (как в v1.1)
 BTC_REGIME_SMA   = 50
 
 ATR_PERIOD       = 14
 ATR_PCT_MIN      = 0.015
 ATR_PCT_MAX      = 0.05
 
-ATR_STOP_MULT    = 3.0
+# v1.2 правки ⑦⑩: быстрее выход + шире стоп
+ATR_STOP_MULT    = 4.0          # было 3.0 → стало 4.0 (75% ложных стопов в v1.1)
 TRAIL_ATR_MULT   = 2.0
-MAX_HOLD_DAYS    = 5
-MAX_NEW_PER_DAY  = 4
+MAX_HOLD_DAYS    = 3            # было 5 → стало 3 (быстрая ротация)
+MAX_NEW_PER_DAY  = 6            # было 4 → стало 6
 
 TP1_FRACTION     = 0.60
 TP1_RETRACE_PCT  = 0.50
@@ -191,7 +218,7 @@ def fetch_candles(contract, interval="1d", limit=2000):
     return parsed
 
 
-# ===== BTC REGIME (ВЫКЛ в v1.1) =====
+# ===== BTC REGIME (ВЫКЛ) =====
 
 _BTC_REGIME_CACHE = None
 
@@ -234,7 +261,7 @@ def get_funding_snapshot():
     return _FUNDING_CACHE
 
 
-# ===== СИГНАЛ (v1.1: RSI + BB + ADX, без BTC regime) =====
+# ===== СИГНАЛ =====
 
 def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
     cds = candles_up_to_today
@@ -263,7 +290,8 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
 
     plus_di, minus_di, adx_val = dmi(cds[:-1])
     if adx_val is None:
-        return None
+        adx_val = 0.0
+    # v1.2: ADX filter ВЫКЛ — не отрезаем сигналы по тренду
     if USE_ADX_FILTER and adx_val >= ADX_THRESHOLD:
         return {"side": 0, "atr": a, "close": last['c'], "atr_pct": atr_pct,
                 "bb_mid": bb_mid, "bb_upper": bb_upper, "bb_lower": bb_lower,
@@ -280,7 +308,7 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
             "rsi": rsi_val, "adx": adx_val}
 
 
-# ===== POSITION (v1.1: TP1 50% retracement, 60% позиции) =====
+# ===== POSITION =====
 
 class Position:
     __slots__ = ("contract", "side", "entry", "atr_at_entry",
@@ -426,11 +454,9 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     if not data:
         raise RuntimeError("Нет данных")
 
-    if verbose and USE_BTC_REGIME:
-        B.send_telegram(f"📡 {STRATEGY_NAME} {STRATEGY_VERSION}: вычисляю BTC regime...")
-    elif verbose:
-        B.send_telegram(f"📡 {STRATEGY_NAME} {STRATEGY_VERSION}: BTC regime ВЫКЛЮЧЁН, "
-                        f"использую ADX<{ADX_THRESHOLD} per-pair sideways filter")
+    if verbose:
+        B.send_telegram(f"📡 {STRATEGY_NAME} {STRATEGY_VERSION}: BTC regime ВЫКЛ, ADX filter ВЫКЛ, "
+                        f"BB({BB_PERIOD},{BB_STD}σ) RSI<{RSI_OVERSOLD}/{RSI_OVERBOUGHT}")
     btc_regime = get_btc_regime()
     funding_snap = get_funding_snapshot()
 
@@ -998,12 +1024,13 @@ def format_report(result, val, n_pairs=None):
     lines = []
     lines.append(f"📊 *{STRATEGY_NAME} {STRATEGY_VERSION} - РЕЗУЛЬТАТЫ*  [{STRATEGY_FILE}]")
     lines.append("")
-    btc_label = f"BTC regime SMA({BTC_REGIME_SMA}) + " if USE_BTC_REGIME else f"ADX<{ADX_THRESHOLD:.0f} (sideways) + "
-    lines.append(f"RSI({RSI_PERIOD})+BB({BB_PERIOD}, {BB_STD}σ) + {btc_label}Trailing {TRAIL_ATR_MULT}xATR + "
+    btc_label = f"BTC regime SMA({BTC_REGIME_SMA}) + " if USE_BTC_REGIME else ""
+    adx_label = f"ADX<{ADX_THRESHOLD:.0f} + " if USE_ADX_FILTER else ""
+    lines.append(f"RSI({RSI_PERIOD})+BB({BB_PERIOD}, {BB_STD}σ) + {btc_label}{adx_label}Trailing {TRAIL_ATR_MULT}xATR + "
                  f"TP1 {TP1_FRACTION*100:.0f}%@{TP1_RETRACE_PCT*100:.0f}%retrace+breakeven + "
                  f"SL {ATR_STOP_MULT}xATR + Compound + Daily stop + Cooldown")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
-    lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR})")
+    lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR} при DD>${DD_BRAKE_THRESHOLD:.0f})")
     lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap ОТКЛЮЧЁН) | Daily stop: ${DAILY_STOP_LOSS:.0f} / 2-й день подряд ${DAILY_STOP_LOSS_CONSEC:.0f}")
     lines.append(f"TP1: цена дошла до {TP1_RETRACE_PCT*100:.0f}% от BB band к mid → закрыть {TP1_FRACTION*100:.0f}%, остаток -> breakeven | Max hold: {MAX_HOLD_DAYS}д | New/day: {MAX_NEW_PER_DAY}")
     lines.append(f"Long: close≤BB_lower AND RSI≤{RSI_OVERSOLD} | Short: close≥BB_upper AND RSI≥{RSI_OVERBOUGHT} | SL: {ATR_STOP_MULT}×ATR")
@@ -1110,7 +1137,7 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=meanrev_rsi_bb_v11 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=meanrev_rsi_bb_v12 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
