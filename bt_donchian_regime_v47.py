@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""bt_donchian_4h_v18.py - Donchian 4H v1.8 (cap=4). RUN_BACKTEST=donchian_4h_v18"""
+"""bt_donchian_4h_v19.py - Donchian 4H v1.9 (Daily Stop -400). RUN_BACKTEST=donchian_4h_v19"""
 import os, sys, math, statistics, datetime as dt
 from collections import defaultdict
 try:
@@ -11,8 +11,8 @@ else:
     _BOT_IMPORT_ERR = None
 
 STRATEGY_NAME = "Donchian 4H"
-STRATEGY_VERSION = "v1.8-TEST"
-STRATEGY_FILE = "bt_donchian_4h_v18"
+STRATEGY_VERSION = "v1.9-TEST"
+STRATEGY_FILE = "bt_donchian_4h_v19"
 INIT_CAPITAL = 10_000.0
 RISK_FRACTION = 0.008
 SLOT_RISK_MIN = 80.0
@@ -25,8 +25,8 @@ MAX_CONCURRENT = 7
 MAX_PER_SIDE_CAP = 4
 PER_SIDE_BUDGET = 1200
 MAX_NEW_PER_DAY = 8
-DAILY_STOP_LOSS = -450.0
-DAILY_STOP_LOSS_CONSEC = -300.0
+DAILY_STOP_LOSS = -400.0
+DAILY_STOP_LOSS_CONSEC = -250.0
 EXCLUDE_PAIRS = {"TRX","XLM","BNB","UNI","LTC","RUNE","PENDLE","HBAR","KAIA","STX","IOTA","ARB","GRT","CRV"}
 CONSEC_LOSS_LIMIT = 4
 COOLDOWN_DAYS = 14
@@ -866,7 +866,7 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v18 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v19 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
