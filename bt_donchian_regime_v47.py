@@ -19,7 +19,7 @@ bt_donchian_regime_v47.py - v4.7: v4.5 + Partial TP (+8%) / Breakeven stop
     partial TP становится невозможен (на остаток; сам partial кусок
     уже зафиксирован в плюс).
 
-  PARTIAL_TP_PCT      = 0.08  (+8% favorable)
+    PARTIAL_TP_PCT      = 0.05  (+5% favorable) # v5.1
   PARTIAL_TP_FRACTION = 0.50  (закрывается половина позиции)
 
 Новое в отчёте (без изменения логики стратегии):
@@ -109,7 +109,7 @@ MAX_HOLD_DAYS    = 15
 MAX_NEW_PER_DAY  = 3         # v5.0: увеличено до 3
 
 # --- v4.7: Partial TP + Breakeven stop ---
-PARTIAL_TP_PCT      = 0.08    # +8% favorable -> закрыть часть позиции (возвращено с 0.10)
+PARTIAL_TP_PCT      = 0.05    # v5.1: +5% favorable -> закрыть часть позиции
 PARTIAL_TP_FRACTION = 0.50    # какую долю закрыть
 
 # v4.7: отчёт - сколько дней ПОСЛЕ стоп-выхода смотрим вперёд, чтобы
@@ -1164,8 +1164,8 @@ def format_report(result, val, n_pairs=None):
     if n_pairs is None:
         n_pairs = len(_PAIRS_USED)
     lines = []
-    lines.append("📊 *bt_donchian_regime v5.0 logic - РЕЗУЛЬТАТЫ*")
-    lines.append("⚙️ 4% breakout filter + Pure Trailing 2xATR + 8 Concurrent + 3 New/Day")
+    lines.append("📊 *bt_donchian_regime v5.1 logic - РЕЗУЛЬТАТЫ*")
+    lines.append("⚙️ 4% breakout filter + Partial TP 5%/50% + Trailing 2xATR + 8 Concurrent + 3 New/Day")
     lines.append("")
     lines.append(f"Donchian(20) + BTC SMA(50) + DMI + Trailing 2xATR + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown (NO PerSide cap, NO sideways-фильтр)")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
