@@ -1,765 +1,8 @@
-# -*- coding: utf-8 -*-
-"""
-bt_donchian_regime_v47.py - Mean Reversion v1.0 (RSI + Bollinger)
-=================================================================
-Файл-заглушка: имя оставлено v47 для совместимости с bot.py на Render.
-Стратегия внутри: Mean Reversion v1.0
-
-Запуск через диспетчер:
-    RUN_BACKTEST=donchian_regime_v47 python bot.py
-
-КОНЦЕПЦИЯ СТРАТЕГИИ (Mean Reversion):
-  Логика: Покупаем перепроданность, продаём перекупленность.
-  В отличие от trend-following, мы входим против движения, ожидая откат к средней.
-
-ВХОД LONG:
-  1. RSI(14) < 30 (перепроданность)
-  2. Close < Lower Bollinger Band (цена вышла за пределы волатильности)
-  3. BTC regime == +1 (входим только на бычьем фоне, чтобы не ловить падающие ножи)
-  4. ATR_pct ∈ [1.5%, 5%]
-
-ВХОД SHORT:
-  1. RSI(14) > 70 (перекупленность)
-  2. Close > Upper Bollinger Band
-  3. BTC regime == -1 (входим только на медвежьем фоне)
-  4. ATR_pct ∈ [1.5%, 5%]
-
-ВЫХОДЫ:
-  - Stop Loss: 1.5 × ATR (фиксированный, от entry)
-  - Trailing Stop: 2.0 × ATR (от max-favorable, даём прибыли расти если откат сильный)
-  - Time Exit: 5 дней (сделки mean reversion короткие, не держим долго)
-
-УПРАВЛЕНИЕ РИСКОМ (Prop-Safe):
-  - Risk $80 (0.8%)
-  - DD brake $700
-  - Daily stop -$300 / -$100 (consecutive)
-  - Max concurrent: 6
-  - Max new per day: 3 (увеличено для частоты сделок)
-"""
-
-import os
-import sys
-import math
-import statistics
-import datetime as dt
-from collections import defaultdict
-
-try:
-    import bot as B
-except Exception as e:
-    B = None
-    _BOT_IMPORT_ERR = e
-else:
-    _BOT_IMPORT_ERR = None
-
-
 # =====================================================================
-#  КОНСТАНТЫ
+#  ВАЛИДАЦИЯ (4 гейта, как в v1.0 / v4.7)
 # =====================================================================
 
-# --- Капитал и риск ---
-INIT_CAPITAL     = 10_000.0
-RISK_FRACTION    = 0.008      # 0.8% от equity на сделку
-SLOT_RISK_MIN    = 80.0       # floor $80
-SLOT_RISK_MAX    = 200.0      # ceiling $200
-MAX_POSITION_PCT = 0.20
-
-# --- DD brake ---
-DD_BRAKE_THRESHOLD = 700.0
-DD_BRAKE_FACTOR    = 0.5
-DD_BRAKE_RECOVERY  = 0.95
-
-# --- Лимиты ---
-MAX_CONCURRENT     = 6
-MAX_PER_SIDE_CAP   = 6
-PER_SIDE_BUDGET    = 999999
-DAILY_STOP_LOSS            = -300.0
-DAILY_STOP_LOSS_CONSEC     = -100.0
-
-# --- Стратегия: Mean Reversion ---
-RSI_PERIOD        = 14
-RSI_OVERSOLD     = 30.0
-RSI_OVERBOUGHT   = 70.0
-BB_PERIOD        = 20
-BB_STDDEV        = 2.0
-ATR_PERIOD       = 14
-ATR_PCT_MIN      = 0.015
-ATR_PCT_MAX      = 0.05
-
-BTC_REGIME_SMA   = 50
-
-# --- Выходы ---
-ATR_STOP_MULT    = 1.5       # Стоп уже, так как вход против тренда
-ATR_TRAIL_MULT   = 2.0       # Трейлинг для захвата разворота
-MAX_HOLD_DAYS    = 5         # Короткий срок (mean reversion играет быстро)
-MAX_NEW_PER_DAY  = 3         # Больше входов
-
-# --- Exclude + Cooldown ---
-EXCLUDE_PAIRS = {
-    "TRX", "XLM", "BNB", "UNI",
-    "LTC", "RUNE", "PENDLE", "HBAR",
-}
-CONSEC_LOSS_LIMIT = 3
-COOLDOWN_DAYS     = 30
-
-STOP_REVERSAL_LOOKFORWARD_DAYS = 15
-
-# --- Издержки ---
-COMM_TAKER       = 0.0005
-SLIPPAGE         = 0.0002
-FUNDING_TIMES_UTC = (0, 8, 16)
-
-# --- Валидация ---
-Z_SCORE          = 2.64
-WORST_DAY_LIMIT  = -500.0
-MAX_DD_LIMIT     = 2_000.0
-YEAR_LOSS_LIMIT  = -500.0
-
-BTC_CONTRACT     = "BTC_USDT"
-BACKTEST_START_ISO = "2023-01-01"
-BACKTEST_END_ISO   = ""
-
-
-# =====================================================================
-#  ИНДИКАТОРЫ
-# =====================================================================
-
-def sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
-def atr_daily(candles, period=ATR_PERIOD):
-    if len(candles) < period + 1:
-        return None
-    trs = []
-    for i in range(-period, 0):
-        c, prev = candles[i], candles[i - 1]
-        tr = max(c['h'] - c['l'],
-                 abs(c['h'] - prev['c']),
-                 abs(c['l'] - prev['c']))
-        trs.append(tr)
-    return sum(trs) / period
-
-def rsi(candles, period=RSI_PERIOD):
-    """Упрощенный RSI (SMA based)."""
-    if len(candles) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(-period, 0):
-        change = candles[i]['c'] - candles[i-1]['c']
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def bollinger_bands(candles, period=BB_PERIOD, num_std=BB_STDDEV):
-    """Возвращает (middle, upper, lower) за период."""
-    if len(candles) < period:
-        return None, None, None
-    window = candles[-period:]
-    closes = [c['c'] for c in window]
-    sma_val = sum(closes) / period
-    variance = sum((c - sma_val) ** 2 for c in closes) / period
-    std = math.sqrt(variance)
-    upper = sma_val + (std * num_std)
-    lower = sma_val - (std * num_std)
-    return sma_val, upper, lower
-
-
-# =====================================================================
-#  DATA FETCH
-# =====================================================================
-
-_CANDLE_CACHE = {}
-
-def fetch_candles(contract, interval="1d", limit=2000):
-    key = (contract, interval, limit)
-    if key in _CANDLE_CACHE:
-        return _CANDLE_CACHE[key]
-    gate_c = contract if contract.endswith("_USDT") else f"{contract}_USDT"
-    raw = B.api_get("candlesticks", {
-        "contract": gate_c,
-        "interval": interval,
-        "limit":    limit,
-    })
-    parsed = B.parse_candles(raw)
-    _CANDLE_CACHE[key] = parsed
-    return parsed
-
-# =====================================================================
-#  BTC REGIME
-# =====================================================================
-
-_BTC_REGIME_CACHE = None
-
-def compute_btc_regime(btc_candles):
-    regime = {}
-    closes = [c['c'] for c in btc_candles]
-    for i, c in enumerate(btc_candles):
-        if i < BTC_REGIME_SMA:
-            regime[c['t']] = 0
-            continue
-        s = sum(closes[i - BTC_REGIME_SMA:i]) / BTC_REGIME_SMA
-        regime[c['t']] = +1 if c['c'] > s else -1
-    return regime
-
-def get_btc_regime():
-    global _BTC_REGIME_CACHE
-    if _BTC_REGIME_CACHE is None:
-        cds = fetch_candles(BTC_CONTRACT, "1d", 2000)
-        _BTC_REGIME_CACHE = compute_btc_regime(cds)
-    return _BTC_REGIME_CACHE
-
-# =====================================================================
-#  FUNDING SNAPSHOT
-# =====================================================================
-
-_FUNDING_CACHE = None
-
-def get_funding_snapshot():
-    global _FUNDING_CACHE
-    if _FUNDING_CACHE is None:
-        try:
-            _FUNDING_CACHE = {
-                t["contract"]: float(t.get("funding_rate", 0))
-                for t in B.api_get("tickers", {})
-                if t.get("contract")
-            }
-        except Exception:
-            _FUNDING_CACHE = {}
-    return _FUNDING_CACHE
-
-# =====================================================================
-#  ОЦЕНКА СИГНАЛА (Mean Reversion)
-# =====================================================================
-
-def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
-    cds = candles_up_to_today
-    if len(cds) < max(RSI_PERIOD, BB_PERIOD, ATR_PERIOD) + 2:
-        return None
-
-    last = cds[-1]
-    
-    # Индикаторы (исключаем последнюю свечу от look-ahead, кроме цены входа)
-    rsi_val = rsi(cds[:-1])
-    bb_mid, bb_upper, bb_lower = bollinger_bands(cds[:-1])
-    a = atr_daily(cds[:-1])
-
-    if rsi_val is None or bb_mid is None or a is None or a <= 0:
-        return None
-
-    atr_pct = a / last['c']
-    if not (ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX):
-        return {"side": 0, "atr": a, "close": last['c'], "atr_pct": atr_pct,
-                "plus_di": 0, "minus_di": 0, "adx": 0}
-
-    funding = funding_snap.get(last.get('contract', ''), 0)
-
-    # LONG: RSI < 30, Close < Lower Band, BTC бычий
-    long_ok = (rsi_val < RSI_OVERSOLD
-               and last['c'] < bb_lower
-               and btc_regime_today == +1
-               and abs(funding) <= 0.0005)
-               
-    # SHORT: RSI > 70, Close > Upper Band, BTC медвежий
-    short_ok = (rsi_val > RSI_OVERBOUGHT
-                and last['c'] > bb_upper
-                and btc_regime_today == -1
-                and abs(funding) <= 0.0005)
-
-    side = +1 if long_ok else (-1 if short_ok else 0)
-    
-    # Возвращаем в том же формате, что и старый бот, для совместимости
-    return {"side": side, "atr": a, "close": last['c'], "atr_pct": atr_pct,
-            "dc_high": bb_upper, "dc_low": bb_lower, # Подменяем Donchian на Bollinger
-            "plus_di": rsi_val, "minus_di": rsi_val, "adx": 0}
-
-
-# =====================================================================
-#  POSITION (Trailing stop)
-# =====================================================================
-
-class Position:
-    __slots__ = ("contract", "side", "entry", "atr_at_entry",
-                 "size_usd", "original_size_usd", "initial_stop", "trail_stop",
-                 "max_favorable", "max_adverse", "entry_idx", "entry_day_ts",
-                 "hold_days", "donchian_at_entry", "partial_taken")
-
-    def __init__(self, contract, side, entry, atr_at_entry,
-                 size_usd, entry_idx, entry_day_ts, donchian_at_entry):
-        self.contract           = contract
-        self.side               = side
-        self.entry              = entry
-        self.atr_at_entry       = atr_at_entry
-        self.size_usd           = size_usd
-        self.original_size_usd  = size_usd
-        self.initial_stop       = entry - side * ATR_STOP_MULT * atr_at_entry
-        self.trail_stop         = self.initial_stop
-        self.max_favorable      = entry
-        self.max_adverse        = entry
-        self.entry_idx         = entry_idx
-        self.entry_day_ts      = entry_day_ts
-        self.hold_days         = 0
-        self.donchian_at_entry = donchian_at_entry
-        self.partial_taken     = False
-
-    def update_trail(self, candle):
-        if self.side == +1:
-            self.max_favorable = max(self.max_favorable, candle['h'])
-            self.max_adverse   = min(self.max_adverse, candle['l'])
-            new_stop = self.max_favorable - ATR_TRAIL_MULT * self.atr_at_entry
-            self.trail_stop = max(self.trail_stop, new_stop)
-        else:
-            self.max_favorable = min(self.max_favorable, candle['l'])
-            self.max_adverse   = max(self.max_adverse, candle['h'])
-            new_stop = self.max_favorable + ATR_TRAIL_MULT * self.atr_at_entry
-            self.trail_stop = min(self.trail_stop, new_stop)
-
-    def check_partial_tp(self, candle):
-        # Partial TP отключен в этой версии
-        return None
-
-
-# =====================================================================
-#  ДВИЖОК БЭКТЕСТА
-# =====================================================================
-
-def compute_risk_slot(equity, dd_brake_active=False):
-    base = max(SLOT_RISK_MIN, min(SLOT_RISK_MAX, equity * RISK_FRACTION))
-    if dd_brake_active:
-        base *= DD_BRAKE_FACTOR
-    return base
-
-def compute_max_per_side(current_risk):
-    if current_risk <= 0: return 0
-    return min(MAX_PER_SIDE_CAP, int(PER_SIDE_BUDGET / current_risk))
-
-def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, verbose=True):
-    if B is None:
-        raise RuntimeError("bot module not available")
-
-    pairs_active = [p for p in pairs if p not in EXCLUDE_PAIRS]
-    excluded = len(pairs) - len(pairs_active)
-    if verbose:
-        B.send_telegram(f"📡 MeanRev v1.0: загружаю 1d свечи для {len(pairs_active)} пар "
-                        f"(excluded {excluded})")
-    data = {}
-    for i, p in enumerate(pairs_active):
-        try:
-            cds = fetch_candles(p, "1d", 2000)
-            if cds:
-                data[p] = cds
-        except Exception as e:
-            print(f"[warn] {p}: {e}")
-        if verbose and (i + 1) % 20 == 0:
-            B.send_telegram(f"  загружено {i+1}/{len(pairs_active)}")
-
-    if not data:
-        raise RuntimeError("Нет данных")
-
-    if verbose:
-        B.send_telegram("📡 MeanRev v1.0: вычисляю BTC weekly regime...")
-    btc_regime = get_btc_regime()
-    funding_snap = get_funding_snapshot()
-
-    start_ts = int(dt.datetime.fromisoformat(start_iso).timestamp())
-    end_ts = int(dt.datetime.fromisoformat(end_iso).timestamp()) if end_iso else None
-    all_days = sorted(set(
-        c['t'] for p in data for c in data[p]
-        if c['t'] >= start_ts and (end_ts is None or c['t'] < end_ts)
-    ))
-    if len(all_days) < BTC_REGIME_SMA + 5:
-        raise RuntimeError(f"Слишком мало дней: {len(all_days)}")
-
-    by_pair_day = {p: {c['t']: c for c in cds} for p, cds in data.items()}
-    idx_by_pair_day = {
-        p: {c['t']: i for i, c in enumerate(cds)}
-        for p, cds in data.items()
-    }
-
-    cash = INIT_CAPITAL
-    positions = []
-    closed_trades = []
-    equity_curve = []
-    daily_pnl = []
-
-    peak_equity = INIT_CAPITAL
-    dd_brake_active = False
-    dd_brake_days   = 0
-
-    btc_blocked = 0
-    adx_filtered = 0
-
-    pair_stats = defaultdict(lambda: {"consec_losses": 0, "cooldown_until": 0})
-    cooldown_blocked = 0
-    excluded_count = excluded
-
-    day_loss_stop_active = False
-    day_stop_triggered = 0
-    last_day_idx = -1
-    day_stop_events = []
-
-    prev_day_pnl = 0.0
-    consec_loss_days_count = 0
-    consec_loss_days_max = 0
-
-    partial_tp_count = 0
-    partial_tp_total_pnl = 0.0
-
-    for day_idx, day_ts in enumerate(all_days):
-        btc_r = btc_regime.get(day_ts, 0)
-        if btc_r == 0:
-            btc_blocked += 1
-
-        if day_idx != last_day_idx:
-            day_loss_stop_active = False
-            last_day_idx = day_idx
-
-        positions_before = len(positions)
-        new_positions = []
-        realized_today = 0.0
-        for pos in positions:
-            candle = by_pair_day[pos.contract].get(day_ts)
-            if candle is None:
-                new_positions.append(pos)
-                continue
-
-            pos.hold_days += 1
-            pos.update_trail(candle)
-
-            ptp = pos.check_partial_tp(candle)
-            if ptp is not None:
-                partial_tp_count += 1
-                partial_tp_total_pnl += ptp["partial_pnl"]
-                realized_today += ptp["partial_pnl"]
-                closed_trades.append({
-                    "contract": pos.contract, "side": pos.side,
-                    "entry": pos.entry, "exit": ptp["partial_price"],
-                    "size_usd": ptp["partial_size"], "pnl": ptp["partial_pnl"],
-                    "reason": "PTP", "hold_days": pos.hold_days,
-                    "entry_day": pos.entry_day_ts, "exit_day": day_ts,
-                    "max_favorable": pos.max_favorable,
-                    "max_adverse": pos.max_adverse,
-                })
-
-            exit_price, exit_reason = None, None
-
-            if pos.side == +1 and candle['l'] <= pos.trail_stop:
-                exit_price, exit_reason = pos.trail_stop, "TRAIL"
-            elif pos.side == -1 and candle['h'] >= pos.trail_stop:
-                exit_price, exit_reason = pos.trail_stop, "TRAIL"
-            elif pos.side == +1 and candle['l'] <= pos.initial_stop and pos.hold_days == 1:
-                exit_price, exit_reason = pos.initial_stop, "SL"
-            elif pos.side == -1 and candle['h'] >= pos.initial_stop and pos.hold_days == 1:
-                exit_price, exit_reason = pos.initial_stop, "SL"
-
-            if exit_price is None and pos.hold_days >= MAX_HOLD_DAYS:
-                exit_price, exit_reason = candle['c'], "TIME"
-
-            # SIG exit: цена вернулась к средней Bollinger Band
-            if exit_price is None:
-                idx = idx_by_pair_day[pos.contract].get(day_ts)
-                cds = data[pos.contract]
-                if idx is not None and idx >= BB_PERIOD:
-                    bb_mid, _, _ = bollinger_bands(cds[:idx], BB_PERIOD, BB_STDDEV)
-                    if bb_mid is not None:
-                        if pos.side == +1 and candle['c'] >= bb_mid:
-                            exit_price, exit_reason = candle['c'], "SIG"
-                        elif pos.side == -1 and candle['c'] <= bb_mid:
-                            exit_price, exit_reason = candle['c'], "SIG"
-
-            if exit_price is not None:
-                gross = pos.side * (exit_price - pos.entry) / pos.entry * pos.size_usd
-                comm  = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
-                n_fund = 0
-                cur = pos.entry_day_ts
-                while cur < day_ts:
-                    if dt.datetime.utcfromtimestamp(cur).hour in FUNDING_TIMES_UTC:
-                        n_fund += 1
-                    cur += 3600
-                _fc = pos.contract if pos.contract.endswith("_USDT") else f"{pos.contract}_USDT"
-                funding_rate = funding_snap.get(_fc, 0.0)
-                funding_cost = pos.side * funding_rate * pos.size_usd * n_fund
-                net = gross - comm - funding_cost
-                realized_today += net
-                closed_trades.append({
-                    "contract": pos.contract, "side": pos.side,
-                    "entry": pos.entry, "exit": exit_price,
-                    "size_usd": pos.size_usd, "pnl": net,
-                    "reason": exit_reason, "hold_days": pos.hold_days,
-                    "entry_day": pos.entry_day_ts, "exit_day": day_ts,
-                    "max_favorable": pos.max_favorable,
-                    "max_adverse": pos.max_adverse,
-                })
-                ps = pair_stats[pos.contract]
-                if net < 0:
-                    ps["consec_losses"] += 1
-                    if ps["consec_losses"] >= CONSEC_LOSS_LIMIT:
-                        ps["cooldown_until"] = day_ts + COOLDOWN_DAYS * 86400
-                else:
-                    ps["consec_losses"] = 0
-            else:
-                new_positions.append(pos)
-
-        positions = new_positions
-
-        unrealized = 0.0
-        for pos in positions:
-            c = by_pair_day[pos.contract].get(day_ts)
-            if c is None: continue
-            unrealized += pos.side * (c['c'] - pos.entry) / pos.entry * pos.size_usd
-
-        equity = cash + realized_today + unrealized
-        cash  += realized_today
-        equity_curve.append((day_ts, equity))
-
-        if equity > peak_equity:
-            peak_equity = equity
-        if dd_brake_active and equity >= peak_equity * DD_BRAKE_RECOVERY:
-            dd_brake_active = False
-        elif (not dd_brake_active) and (peak_equity - equity) > DD_BRAKE_THRESHOLD:
-            dd_brake_active = True
-            dd_brake_days += 1
-        elif dd_brake_active:
-            dd_brake_days += 1
-
-        if day_idx == 0:
-            day_pnl = equity - INIT_CAPITAL
-        else:
-            day_pnl = equity - equity_curve[-2][1]
-        daily_pnl.append((day_ts, day_pnl))
-
-        if btc_r == 0: continue
-        if len(positions) >= MAX_CONCURRENT: continue
-
-        current_risk = compute_risk_slot(equity, dd_brake_active)
-        max_per_side = compute_max_per_side(current_risk)
-        long_count  = sum(1 for p in positions if p.side == +1)
-        short_count = sum(1 for p in positions if p.side == -1)
-
-        if prev_day_pnl < 0:
-            current_threshold = DAILY_STOP_LOSS_CONSEC
-        else:
-            current_threshold = DAILY_STOP_LOSS
-
-        long_unrealized  = 0.0
-        short_unrealized = 0.0
-        open_losses = 0.0
-        for pos in positions:
-            c = by_pair_day[pos.contract].get(day_ts)
-            if c is None: continue
-            pos_unrealized = pos.side * (c['c'] - pos.entry) / pos.entry * pos.size_usd
-            if pos.side == +1: long_unrealized += pos_unrealized
-            else: short_unrealized += pos_unrealized
-            if pos_unrealized < 0: open_losses += pos_unrealized
-
-        if open_losses <= current_threshold:
-            if not day_loss_stop_active:
-                day_loss_stop_active = True
-                day_stop_triggered += 1
-                bad_side = +1 if long_unrealized <= short_unrealized else -1
-                positions_remaining = []
-                dstop_realized = 0.0
-                for pos in positions:
-                    candle_now = by_pair_day[pos.contract].get(day_ts)
-                    if candle_now is None:
-                        positions_remaining.append(pos)
-                        continue
-                    pos_unrealized = pos.side * (candle_now['c'] - pos.entry) / pos.entry * pos.size_usd
-                    if pos.side == bad_side and pos_unrealized < 0:
-                        exit_price_now = candle_now['c']
-                        gross_now = pos.side * (exit_price_now - pos.entry) / pos.entry * pos.size_usd
-                        comm_now  = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
-                        n_fund_now = 0
-                        cur_now = pos.entry_day_ts
-                        while cur_now < day_ts:
-                            if dt.datetime.utcfromtimestamp(cur_now).hour in FUNDING_TIMES_UTC:
-                                n_fund_now += 1
-                            cur_now += 3600
-                        _fc_now = pos.contract if pos.contract.endswith("_USDT") else f"{pos.contract}_USDT"
-                        funding_rate_now = funding_snap.get(_fc_now, 0.0)
-                        funding_cost_now = pos.side * funding_rate_now * pos.size_usd * n_fund_now
-                        net_now = gross_now - comm_now - funding_cost_now
-                        realized_today += net_now
-                        dstop_realized  += net_now
-                        closed_trades.append({
-                            "contract": pos.contract, "side": pos.side,
-                            "entry": pos.entry, "exit": exit_price_now,
-                            "size_usd": pos.size_usd, "pnl": net_now,
-                            "reason": "DSTOP", "hold_days": pos.hold_days,
-                            "entry_day": pos.entry_day_ts, "exit_day": day_ts,
-                            "max_favorable": pos.max_favorable,
-                            "max_adverse": pos.max_adverse,
-                        })
-                    else:
-                        positions_remaining.append(pos)
-                positions = positions_remaining
-                cash      += dstop_realized
-                unrealized = 0.0
-                for pos in positions:
-                    c = by_pair_day[pos.contract].get(day_ts)
-                    if c is None: continue
-                    unrealized += pos.side * (c['c'] - pos.entry) / pos.entry * pos.size_usd
-                equity = cash + unrealized
-                equity_curve[-1] = (day_ts, equity)
-                prev_eq = INIT_CAPITAL if day_idx == 0 else equity_curve[-2][1]
-                daily_pnl[-1] = (day_ts, equity - prev_eq)
-                day_stop_events.append({
-                    "day": day_ts,
-                    "open_before": positions_before,
-                    "open_left": len(positions),
-                    "all_closed": positions_before > 0 and len(positions) == 0,
-                    "threshold_used": current_threshold,
-                    "consec_day": prev_day_pnl < 0,
-                })
-
-        if day_loss_stop_active:
-            prev_day_pnl = daily_pnl[-1][1]
-            if prev_day_pnl < 0:
-                consec_loss_days_count += 1
-                if consec_loss_days_count > consec_loss_days_max:
-                    consec_loss_days_max = consec_loss_days_count
-            else:
-                consec_loss_days_count = 0
-            continue
-
-        prev_day_pnl = daily_pnl[-1][1]
-        if prev_day_pnl < 0:
-            consec_loss_days_count += 1
-            if consec_loss_days_count > consec_loss_days_max:
-                consec_loss_days_max = consec_loss_days_count
-        else:
-            consec_loss_days_count = 0
-
-        can_long  = long_count  < max_per_side and btc_r == +1
-        can_short = short_count < max_per_side and btc_r == -1
-
-        candidates = []
-        for p, cds in data.items():
-            idx = idx_by_pair_day[p].get(day_ts)
-            if idx is None or idx < max(RSI_PERIOD, BB_PERIOD, ATR_PERIOD) + 2:
-                continue
-            if any(pos.contract == p for pos in positions):
-                continue
-            ps = pair_stats[p]
-            if day_ts < ps["cooldown_until"]:
-                cooldown_blocked += 1
-                continue
-            sig = evaluate_signal(cds[:idx + 1], btc_r, funding_snap)
-            if sig is None or sig["side"] == 0:
-                if sig and sig.get("adx", 100) < 20: # ADX не считается, но оставим для совместимости
-                    adx_filtered += 1
-                continue
-            if sig["side"] == +1 and not can_long: continue
-            if sig["side"] == -1 and not can_short: continue
-            candidates.append((p, sig, idx))
-
-        # Ранжирование: для mean reversion можно ранжировать по степени перепроданности/перекупленности
-        candidates.sort(
-            key=lambda x: abs(50 - x[1]["plus_di"]), # plus_di тут RSI
-            reverse=True)
-
-        new_today = 0
-        for p, sig, idx in candidates:
-            if new_today >= MAX_NEW_PER_DAY: break
-            if len(positions) >= MAX_CONCURRENT: break
-            if sig["side"] == +1:
-                if long_count >= max_per_side: continue
-                long_count += 1
-            else:
-                if short_count >= max_per_side: continue
-                short_count += 1
-
-            stop_dist = ATR_STOP_MULT * sig["atr"]
-            stop_pct  = stop_dist / sig["close"]
-            if stop_pct <= 0: continue
-            raw_size  = current_risk / stop_pct
-            size_usd  = min(raw_size, MAX_POSITION_PCT * equity)
-            if size_usd < 50: continue
-
-            entry_price = sig["close"]
-            pos = Position(p, sig["side"], entry_price, sig["atr"],
-                           size_usd, idx, day_ts, sig["dc_high"])
-            positions.append(pos)
-            cash -= COMM_TAKER * size_usd
-            new_today += 1
-
-    # 7) Закрытие остатков
-    last_day_ts = all_days[-1]
-    for pos in positions:
-        c = by_pair_day[pos.contract].get(last_day_ts)
-        if c is None: continue
-        gross = pos.side * (c['c'] - pos.entry) / pos.entry * pos.size_usd
-        comm  = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
-        net   = gross - comm
-        closed_trades.append({
-            "contract": pos.contract, "side": pos.side,
-            "entry": pos.entry, "exit": c['c'],
-            "size_usd": pos.size_usd, "pnl": net,
-            "reason": "END", "hold_days": pos.hold_days,
-            "entry_day": pos.entry_day_ts, "exit_day": last_day_ts,
-            "max_favorable": pos.max_favorable,
-            "max_adverse": pos.max_adverse,
-        })
-        cash += net
-
-    # 8) Stop reversal stats
-    for t in closed_trades:
-        if t["reason"] not in ("SL", "TRAIL") or t["pnl"] > 0: continue
-        cds = data.get(t["contract"])
-        idx_map = idx_by_pair_day.get(t["contract"])
-        if not cds or not idx_map:
-            t["reversed_after_stop"] = None
-            continue
-        idx = idx_map.get(t["exit_day"])
-        if idx is None:
-            t["reversed_after_stop"] = None
-            continue
-        reversed_flag = False
-        hi = min(idx + 1 + STOP_REVERSAL_LOOKFORWARD_DAYS, len(cds))
-        for j in range(idx + 1, hi):
-            c2 = cds[j]
-            if t["side"] == +1 and c2['h'] >= t["entry"]:
-                reversed_flag = True
-                break
-            if t["side"] == -1 and c2['l'] <= t["entry"]:
-                reversed_flag = True
-                break
-        t["reversed_after_stop"] = reversed_flag
-
-    return {
-        "final_equity": cash,
-        "trades": closed_trades,
-        "equity_curve": equity_curve,
-        "daily_pnl": daily_pnl,
-        "n_trades": len(closed_trades),
-        "n_days": len(all_days),
-        "btc_blocked": btc_blocked,
-        "dd_brake_days": dd_brake_days,
-        "adx_filtered": adx_filtered,
-        "cooldown_blocked": cooldown_blocked,
-        "excluded_count": excluded_count,
-        "day_stop_triggered": day_stop_triggered,
-        "day_stop_events": day_stop_events,
-        "partial_tp_count": partial_tp_count,
-        "partial_tp_total_pnl": partial_tp_total_pnl,
-        "consec_loss_days_max": consec_loss_days_max,
-    }
-
-# =====================================================================
-#  ВАЛИДАЦИЯ
-# =====================================================================
 def validate(result, z=Z_SCORE):
-    # (Оставлено без изменений для совместимости отчёта)
     final     = result["final_equity"]
     total_pnl = final - INIT_CAPITAL
 
@@ -819,6 +62,7 @@ def validate(result, z=Z_SCORE):
     for t in result["trades"]:
         reasons[t["reason"]] += 1
 
+    # Разбивка по парам (как в v1.0)
     by_pair = defaultdict(lambda: {
         "n": 0, "wins": 0, "losses": 0, "pnl": 0.0,
         "long_n": 0, "long_wins": 0, "short_n": 0, "short_wins": 0,
@@ -828,14 +72,18 @@ def validate(result, z=Z_SCORE):
         row["n"] += 1
         row["pnl"] += t["pnl"]
         win = t["pnl"] > 0
-        if win: row["wins"] += 1
-        else: row["losses"] += 1
+        if win:
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
         if t["side"] == +1:
             row["long_n"] += 1
-            if win: row["long_wins"] += 1
+            if win:
+                row["long_wins"] += 1
         else:
             row["short_n"] += 1
-            if win: row["short_wins"] += 1
+            if win:
+                row["short_wins"] += 1
     pair_stats = sorted(
         (
             {"pair": p, "n": r["n"], "pnl": r["pnl"],
@@ -848,6 +96,7 @@ def validate(result, z=Z_SCORE):
         key=lambda x: x["pnl"], reverse=True,
     )
 
+    # Long/Short общая статистика (как в v1.0)
     all_trades = result["trades"]
     longs  = [t for t in all_trades if t["side"] == +1]
     shorts = [t for t in all_trades if t["side"] == -1]
@@ -874,6 +123,7 @@ def validate(result, z=Z_SCORE):
     long_short_stats["short_losing_mfe_max"] = (
         max((_mfe_pct(t) for t in losing_shorts), default=0.0))
 
+    # Стоп-выходы (SL/TRAIL) — MAE + reversal (как в v1.0)
     def _mae_pct(t):
         return t["side"] * (t["entry"] - t["max_adverse"]) / t["entry"] * 100
 
@@ -892,6 +142,7 @@ def validate(result, z=Z_SCORE):
         "lookforward_days": STOP_REVERSAL_LOOKFORWARD_DAYS,
     }
 
+    # Daily stop events (как в v1.0)
     day_stop_events = result.get("day_stop_events", [])
     streaks = []
     cur_streak = []
@@ -899,9 +150,11 @@ def validate(result, z=Z_SCORE):
         if cur_streak and ev["day"] - cur_streak[-1]["day"] == 86400:
             cur_streak.append(ev)
         else:
-            if cur_streak: streaks.append(cur_streak)
+            if cur_streak:
+                streaks.append(cur_streak)
             cur_streak = [ev]
-    if cur_streak: streaks.append(cur_streak)
+    if cur_streak:
+        streaks.append(cur_streak)
     multi_day_streaks = [s for s in streaks if len(s) >= 2]
 
     return {
@@ -930,8 +183,8 @@ def validate(result, z=Z_SCORE):
             {"from": s[0]["day"], "to": s[-1]["day"], "days": len(s)}
             for s in multi_day_streaks
         ],
-        "partial_tp_count": result.get("partial_tp_count", 0),
-        "partial_tp_total_pnl": result.get("partial_tp_total_pnl", 0.0),
+        "tp1_count": result.get("tp1_count", 0),
+        "tp1_total_pnl": result.get("tp1_total_pnl", 0.0),
         "btc_blocked": result.get("btc_blocked", 0),
         "dd_brake_days": result.get("dd_brake_days", 0),
         "adx_filtered": result.get("adx_filtered", 0),
@@ -942,28 +195,41 @@ def validate(result, z=Z_SCORE):
         "all_pass": gate1 and gate2 and gate3 and gate4,
     }
 
+
 # =====================================================================
 #  ОТЧЁТ
 # =====================================================================
+
 _PAIRS_USED = []
 
+
 def format_report(result, val, n_pairs=None):
-    if n_pairs is None: n_pairs = len(_PAIRS_USED)
+    if n_pairs is None:
+        n_pairs = len(_PAIRS_USED)
     lines = []
-    lines.append("📊 *Mean Reversion v1.0 - РЕЗУЛЬТАТЫ*")
-    lines.append("⚙️ RSI(14) + Bollinger(20,2) + BTC Regime + ATR Trailing")
+    lines.append(f"📊 *{STRATEGY_NAME} {STRATEGY_VERSION} - РЕЗУЛЬТАТЫ*  [{STRATEGY_FILE}]")
     lines.append("")
+    btc_label = f"BTC regime SMA({BTC_REGIME_SMA}) + " if USE_BTC_REGIME else f"ADX<{ADX_THRESHOLD:.0f} (sideways) + "
+    lines.append(f"RSI({RSI_PERIOD})+BB({BB_PERIOD}, {BB_STD}σ) + {btc_label}Trailing {TRAIL_ATR_MULT}xATR + "
+                 f"TP1 {TP1_FRACTION*100:.0f}%@{TP1_RETRACE_PCT*100:.0f}%retrace+breakeven + "
+                 f"SL {ATR_STOP_MULT}xATR + Compound + Daily stop + Cooldown")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
     lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR})")
-    lines.append(f"Max concurrent: {MAX_CONCURRENT} | Daily stop: ${DAILY_STOP_LOSS:.0f} / 2-й день подряд ${DAILY_STOP_LOSS_CONSEC:.0f}")
+    lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap ОТКЛЮЧЁН) | Daily stop: ${DAILY_STOP_LOSS:.0f} / 2-й день подряд ${DAILY_STOP_LOSS_CONSEC:.0f}")
+    lines.append(f"TP1: цена дошла до {TP1_RETRACE_PCT*100:.0f}% от BB band к mid → закрыть {TP1_FRACTION*100:.0f}%, остаток -> breakeven | Max hold: {MAX_HOLD_DAYS}д | New/day: {MAX_NEW_PER_DAY}")
+    lines.append(f"Long: close≤BB_lower AND RSI≤{RSI_OVERSOLD} | Short: close≥BB_upper AND RSI≥{RSI_OVERBOUGHT} | SL: {ATR_STOP_MULT}×ATR")
     lines.append(f"Сделок: {val['n_trades']}  |  Дней: {val['n_days']}")
-    lines.append(f"BTC blocked: {val['btc_blocked']}  |  ADX filtered: {val['adx_filtered']}  |  DD brake days: {val['dd_brake_days']}")
+    if USE_BTC_REGIME:
+        lines.append(f"BTC blocked: {val['btc_blocked']}  |  ADX filtered: {val['adx_filtered']}  |  DD brake days: {val['dd_brake_days']}")
+    else:
+        lines.append(f"ADX filtered (trend): {val['adx_filtered']}  |  DD brake days: {val['dd_brake_days']}")
     lines.append(f"Cooldown: {val['cooldown_blocked']}  |  Daily stop: {val['day_stop_triggered']}  |  "
+                 f"TP1: {val['tp1_count']} (${val['tp1_total_pnl']:+,.0f})  |  "
                  f"Max consec loss days: {val.get('consec_loss_days_max', 0)}")
     if val.get("reasons"):
         r = val["reasons"]
         lines.append(f"Исходы: SL/TRAIL={r.get('TRAIL',0)+r.get('SL',0)} "
-                     f"TIME={r.get('TIME',0)} SIG={r.get('SIG',0)} END={r.get('END',0)}")
+                     f"TP1={r.get('TP1',0)} TIME={r.get('TIME',0)} SIG={r.get('SIG',0)} DSTOP={r.get('DSTOP',0)} END={r.get('END',0)}")
     lines.append("")
     lines.append(f"Final equity : ${val['final_equity']:,.2f}")
     lines.append(f"Total P&L    : ${val['total_pnl']:,.2f}")
@@ -985,59 +251,93 @@ def format_report(result, val, n_pairs=None):
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
+    # Long/Short (как в v1.0)
     ls = val.get("long_short_stats")
     if ls:
         lines.append("")
         lines.append("- LONG / SHORT -")
         lines.append(f"Long : {ls['long_n']} сделок  (🟢 {ls['long_wins']} / 🔴 {ls['long_losses']})")
         lines.append(f"Short: {ls['short_n']} сделок  (🟢 {ls['short_wins']} / 🔴 {ls['short_losses']})")
-        lines.append(f"Убыточные Long  - доходили в свою сторону в среднем на {ls['long_losing_mfe_avg']:.2f}% (макс {ls['long_losing_mfe_max']:.2f}%)")
-        lines.append(f"Убыточные Short - доходили в свою сторону в среднем на {ls['short_losing_mfe_avg']:.2f}% (макс {ls['short_losing_mfe_max']:.2f}%)")
+        lines.append(
+            f"Убыточные Long  - доходили в свою сторону в среднем на "
+            f"{ls['long_losing_mfe_avg']:.2f}% (макс {ls['long_losing_mfe_max']:.2f}%)"
+        )
+        lines.append(
+            f"Убыточные Short - доходили в свою сторону в среднем на "
+            f"{ls['short_losing_mfe_avg']:.2f}% (макс {ls['short_losing_mfe_max']:.2f}%)"
+        )
 
+    # Стоп-выходы (как в v1.0)
     ss = val.get("stop_reversal_stats")
     if ss and ss["n"]:
         lines.append("")
         lines.append("- СТОП-ВЫХОДЫ (SL/TRAIL), убыточные -")
-        lines.append(f"Всего: {ss['n']}  |  вернулись в сторону сделки в течение {ss['lookforward_days']}д после стопа: {ss['reversed_n']} ({ss['reversed_pct']:.0f}%)")
-        lines.append(f"Просадка от входа (MAE%): в среднем {ss['mae_avg']:.2f}%  (макс {ss['mae_max']:.2f}%)")
+        lines.append(f"Всего: {ss['n']}  |  вернулись в сторону сделки "
+                     f"в течение {ss['lookforward_days']}д после стопа: "
+                     f"{ss['reversed_n']} ({ss['reversed_pct']:.0f}%)")
+        lines.append(f"Просадка от входа (MAE%): в среднем {ss['mae_avg']:.2f}%  "
+                     f"(макс {ss['mae_max']:.2f}%)")
 
+    # Daily stop events (как в v1.0)
     events = val.get("day_stop_events") or []
     if events:
         lines.append("")
         lines.append(f"- DAILY STOP ${DAILY_STOP_LOSS:.0f} / 2-й день подряд ${DAILY_STOP_LOSS_CONSEC:.0f} -")
-        lines.append(f"Сработал: {val['day_stop_triggered']} раз(а)  |  подряд (2+ дня): {val.get('day_stop_streaks_multi', 0)} раз(а)")
+        lines.append(f"Сработал: {val['day_stop_triggered']} раз(а)  |  "
+                     f"подряд (2+ дня): {val.get('day_stop_streaks_multi', 0)} раз(а)")
+        for det in (val.get("day_stop_streaks_multi_detail") or []):
+            d_from = dt.datetime.utcfromtimestamp(det["from"]).strftime("%Y-%m-%d")
+            d_to   = dt.datetime.utcfromtimestamp(det["to"]).strftime("%Y-%m-%d")
+            lines.append(f"   подряд {det['days']}д: {d_from} -> {d_to}")
         for ev in events[:30]:
             d = dt.datetime.utcfromtimestamp(ev["day"]).strftime("%Y-%m-%d")
             closed_mark = "все позиции закрылись" if ev["all_closed"] else f"осталось открыто {ev['open_left']}"
             lines.append(f"   {d}: открыто было {ev['open_before']}, {closed_mark}")
+        if len(events) > 30:
+            lines.append(f"   ... и ещё {len(events)-30} срабатываний")
 
+    # Минусовые дни (как в v1.0)
     lines.append("")
     lines.append("- МИНУСОВЫЕ ДНИ -")
     lines.append(f"Макс. просадка за день: ${val['worst_day']:,.2f} ({worst_day_date})")
     lines.append(f"Всего дней в минусе: {val.get('losing_days_n', 0)} из {val['n_days']}")
-    lines.append(f"Самая длинная серия подряд: {val.get('longest_loss_streak', 0)} дн.  |  серий из 2+ дней подряд: {val.get('multi_loss_streaks_n', 0)}")
+    lines.append(f"Самая длинная серия подряд: {val.get('longest_loss_streak', 0)} дн.  |  "
+                 f"серий из 2+ дней подряд: {val.get('multi_loss_streaks_n', 0)}")
     wsd = val.get("worst_streak_detail")
     if wsd:
         d_from = dt.datetime.utcfromtimestamp(wsd["from"]).strftime("%Y-%m-%d")
         d_to   = dt.datetime.utcfromtimestamp(wsd["to"]).strftime("%Y-%m-%d")
-        lines.append(f"Макс. суммарный убыток за серию подряд: ${val.get('worst_streak_loss', 0.0):,.2f}  ({wsd['days']}д: {d_from} -> {d_to})")
+        lines.append(f"Макс. суммарный убыток за серию подряд: ${val.get('worst_streak_loss', 0.0):,.2f}  "
+                     f"({wsd['days']}д: {d_from} -> {d_to})")
+    for det in (val.get("multi_loss_streaks_detail") or [])[:15]:
+        d_from = dt.datetime.utcfromtimestamp(det["from"]).strftime("%Y-%m-%d")
+        d_to   = dt.datetime.utcfromtimestamp(det["to"]).strftime("%Y-%m-%d")
+        lines.append(f"   подряд {det['days']}д: {d_from} -> {d_to}  (убыток за серию: "
+                     f"${det.get('total_loss', 0.0):,.2f})")
 
+    # Разбивка по парам (как в v1.0)
     pair_stats = val.get("pair_stats") or []
     if pair_stats:
         lines.append("")
         lines.append("- ПО ПАРАМ -")
         for ps in pair_stats:
             mark = "🟢" if ps["pnl"] > 0 else ("🔴" if ps["pnl"] < 0 else "⚪")
-            lines.append(f"{mark} {ps['pair']}: {ps['n']} сделок (🟢{ps['wins']}/🔴{ps['losses']}), PnL ${ps['pnl']:,.2f}, winrate {ps['winrate']:.0f}%, L={ps['long_n']}(🟢{ps['long_wins']}) S={ps['short_n']}(🟢{ps['short_wins']})")
+            lines.append(
+                f"{mark} {ps['pair']}: {ps['n']} сделок (🟢{ps['wins']}/🔴{ps['losses']}), "
+                f"PnL ${ps['pnl']:,.2f}, winrate {ps['winrate']:.0f}%, "
+                f"L={ps['long_n']}(🟢{ps['long_wins']}) S={ps['short_n']}(🟢{ps['short_wins']})"
+            )
     return lines
+
 
 # =====================================================================
 #  ТОЧКА ВХОДА
 # =====================================================================
+
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print("Запускайте через диспетчер: RUN_BACKTEST=donchian_regime_v47 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=meanrev_rsi_bb_v11 python bot.py")
         sys.exit(1)
 
     global _PAIRS_USED
@@ -1047,8 +347,8 @@ def main():
     start = os.environ.get("BT_START", BACKTEST_START_ISO)
     end   = os.environ.get("BT_END", BACKTEST_END_ISO)
     B.send_telegram(
-        f"🚀 *Mean Reversion v1.0* старт: {len(pairs)} пар, "
-        f"окно {start} -> {end or 'сегодня'}"
+        f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: "
+        f"{len(pairs)} пар, окно {start} -> {end or 'сегодня'}"
     )
 
     result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
@@ -1061,9 +361,13 @@ def main():
         import json
         out_dir = "/home/z/my-project/download"
         os.makedirs(out_dir, exist_ok=True)
-        with open(f"{out_dir}/bt_donchian_regime_v47_result.json", "w") as f:
+        with open(f"{out_dir}/{STRATEGY_FILE}_result.json", "w") as f:
             json.dump({
-                "validation": {k: (v if not isinstance(v, bool) else int(v)) for k, v in val.items()},
+                "strategy": STRATEGY_NAME,
+                "version": STRATEGY_VERSION,
+                "file": STRATEGY_FILE,
+                "validation": {k: (v if not isinstance(v, bool) else int(v))
+                               for k, v in val.items()},
                 "trades": result["trades"][:200],
                 "equity_curve_tail": result["equity_curve"][-60:],
             }, f, indent=2, default=str)
@@ -1071,6 +375,7 @@ def main():
         print(f"[warn] не удалось сохранить результат: {e}")
 
     return 0 if val["all_pass"] else 2
+
 
 if __name__ == "__main__":
     sys.exit(main())
