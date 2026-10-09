@@ -478,7 +478,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             if pos.side == +1: long_unrealized += pos_unrealized
             else: short_unrealized += pos_unrealized
             if pos_unrealized < 0: open_losses += pos_unrealized
-            if open_losses <= current_threshold:
+        if open_losses <= current_threshold:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
