@@ -486,7 +486,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 bad_side = +1 if long_unrealized <= short_unrealized else -1
                 positions_remaining = []
                 dstop_realized = 0.0
-                for pos in positions:
+                if pos_unrealized < 0:
                     candle_now = by_pair_candle[pos.contract].get(candle_ts)
                     if candle_now is None:
                         positions_remaining.append(pos)
