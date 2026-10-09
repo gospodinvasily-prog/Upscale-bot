@@ -77,8 +77,8 @@ DD_BRAKE_FACTOR    = 0.5
 DD_BRAKE_RECOVERY  = 0.95
 
 # --- v4.5: total limits (PerSide cap УБРАН) ---
-MAX_CONCURRENT     = 6       # максимум одновременных позиций
-MAX_PER_SIDE_CAP   = 6       # v4.5: = MAX_CONCURRENT, per-side cap отключён
+MAX_CONCURRENT     = 8       # v5.0: увеличено до 8 (входы качественнее, риск ниже)
+MAX_PER_SIDE_CAP   = 8       # v5.0: синхрон с MAX_CONCURRENT
 PER_SIDE_BUDGET    = 999999  # v4.5: огромное число, per-side не ограничивает
 DAILY_STOP_LOSS            = -300.0  # v4.7-risk100-v4: базовый порог (1-й минусовой день)
 DAILY_STOP_LOSS_CONSEC     = -100.0  # v4.7-risk100-v4: 2-й минусовой день подряд -> порог -$100
@@ -106,7 +106,7 @@ ATR_PCT_MAX      = 0.05
 # --- Выходы ---
 ATR_STOP_MULT    = 2.0
 MAX_HOLD_DAYS    = 15
-MAX_NEW_PER_DAY  = 2
+MAX_NEW_PER_DAY  = 3         # v5.0: увеличено до 3
 
 # --- v4.7: Partial TP + Breakeven stop ---
 PARTIAL_TP_PCT      = 0.08    # +8% favorable -> закрыть часть позиции (возвращено с 0.10)
@@ -331,11 +331,11 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
 
     funding = funding_snap.get(last.get('contract', ''), 0)
 
-    long_ok = (last['c'] > dc_high
+    long_ok = (last['c'] > dc_high * 1.04
                and btc_regime_today == +1
                and plus_di > minus_di
                and abs(funding) <= 0.0005)
-    short_ok = (last['c'] < dc_low
+    short_ok = (last['c'] < dc_low * 0.96
                 and btc_regime_today == -1
                 and minus_di > plus_di
                 and abs(funding) <= 0.0005)
@@ -588,21 +588,13 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             pos.hold_days += 1
             pos.update_trail(candle)   # пересчёт трейла по intraday high/low
 
-            # v4.7: проверка partial TP (до основных exit-ов)
-            ptp = pos.check_partial_tp(candle)
-            if ptp is not None:
-                partial_tp_count += 1
-                partial_tp_total_pnl += ptp["partial_pnl"]
-                realized_today += ptp["partial_pnl"]
-                closed_trades.append({
-                    "contract": pos.contract, "side": pos.side,
-                    "entry": pos.entry, "exit": ptp["partial_price"],
-                    "size_usd": ptp["partial_size"], "pnl": ptp["partial_pnl"],
-                    "reason": "PTP", "hold_days": pos.hold_days,
-                    "entry_day": pos.entry_day_ts, "exit_day": day_ts,
-                    "max_favorable": pos.max_favorable,
-                    "max_adverse": pos.max_adverse,
-                })
+            # v5.0: Partial TP убран, чистый трейлинг
+            # ptp = pos.check_partial_tp(candle)
+            # if ptp is not None:
+            #     partial_tp_count += 1
+            #     partial_tp_total_pnl += ptp["partial_pnl"]
+            #     realized_today += ptp["partial_pnl"]
+            #     closed_trades.append({...})
 
             exit_price, exit_reason = None, None
 
@@ -1172,7 +1164,8 @@ def format_report(result, val, n_pairs=None):
     if n_pairs is None:
         n_pairs = len(_PAIRS_USED)
     lines = []
-    lines.append("📊 *bt_donchian_regime v4.7 - РЕЗУЛЬТАТЫ*")
+    lines.append("📊 *bt_donchian_regime v5.0 logic - РЕЗУЛЬТАТЫ*")
+    lines.append("⚙️ 4% breakout filter + Pure Trailing 2xATR + 8 Concurrent + 3 New/Day")
     lines.append("")
     lines.append(f"Donchian(20) + BTC SMA(50) + DMI + Trailing 2xATR + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown (NO PerSide cap, NO sideways-фильтр)")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
