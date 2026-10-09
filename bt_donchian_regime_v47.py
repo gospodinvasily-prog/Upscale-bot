@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_4h_v10.py - Donchian Breakout на 4H таймфрейме
-==========================================================
-ЗАПУСК: RUN_BACKTEST=donchian_4h_v10 python bot.py
+bt_donchian_4h_v11.py - Donchian Breakout на 4H (v1.1: пагинация + правки)
+=========================================================================
+ЗАПУСК: RUN_BACKTEST=donchian_4h_v11 python bot.py
 
-=== TEST BUILD v1.0 (4H Donchian) ===
-Основа: v4.7 (ALL PASS на 1D, 718 сделок, P&L +$4,900)
-Изменения vs v4.7:
-  - Таймфрейм: 4H вместо 1D (6× больше свечей)
-  - DONCHIAN_PERIOD = 20 свечей (80h = 3.3 дня, было 20 дней)
-  - DMI_PERIOD = 14 свечей (56h = 2.3 дня, было 14 дней)
-  - ATR_PERIOD = 14 свечей (было 14 дней)
-  - ATR_PCT_MIN/MAX: 0.006/0.020 (для 4H, было 0.015/0.05 для 1D)
-  - MAX_HOLD_DAYS = 30 свечей (120h = 5 дней, было 15 дней)
-  - MAX_NEW_PER_DAY = 8 (было 2 — больше входов в день на 4H)
-  - BTC regime: SMA(50) на 1D BTC (без изменений)
-  - Все risk management, TP/SL, daily stop — без изменений
-Цель: 2000-4000 сделок, сохранение ALL PASS.
+=== TEST BUILD v1.1 (4H Donchian) ===
+Основа: v1.0 (4H Donchian)
+Изменения vs v1.0:
+  ① Пагинация свечей: 3 страницы по 2000 = 6000 свечей (~1000 дней)
+     Было: 2000 свечей = 333 дня (мало истории → FAIL)
+     Стало: ~1000 дней (покрывает 2023-2026 полностью)
+  ② ATR_STOP_MULT = 3.5 (было 2.0) — 91% ложных стопов в v1.0!
+  ③ DD_BRAKE_THRESHOLD = 1200 (было 700) — не застревать в brake
+  ④ DD_BRAKE_RECOVERY = 0.85 (было 0.95) — быстрее выходить из brake
+  ⑤ MAX_HOLD_DAYS = 40 свечей (было 30) = ~6.6 дней
+
+Ожидание: ~2500-3000 сделок за 3 года, winrate ~45-55%, ALL PASS возможно.
 """
 
 import os
@@ -37,8 +36,8 @@ else:
 
 # ===== КОНСТАНТЫ =====
 STRATEGY_NAME    = "Donchian 4H"
-STRATEGY_VERSION = "v1.0-TEST"
-STRATEGY_FILE    = "bt_donchian_4h_v10"
+STRATEGY_VERSION = "v1.1-TEST"
+STRATEGY_FILE    = "bt_donchian_4h_v11"
 
 INIT_CAPITAL     = 10_000.0
 RISK_FRACTION    = 0.008
@@ -46,9 +45,10 @@ SLOT_RISK_MIN    = 80.0
 SLOT_RISK_MAX    = 200.0
 MAX_POSITION_PCT = 0.20
 
-DD_BRAKE_THRESHOLD = 700.0
+# v1.1 правки ③④: DD brake — выше порог, быстрее восстановление
+DD_BRAKE_THRESHOLD = 1200.0   # было 700 → стало 1200
 DD_BRAKE_FACTOR    = 0.5
-DD_BRAKE_RECOVERY  = 0.95
+DD_BRAKE_RECOVERY  = 0.85     # было 0.95 → стало 0.85
 
 MAX_CONCURRENT     = 6
 MAX_PER_SIDE_CAP   = 6
@@ -73,8 +73,9 @@ ATR_PERIOD       = 14
 ATR_PCT_MIN      = 0.006
 ATR_PCT_MAX      = 0.020
 
-ATR_STOP_MULT    = 2.0
-MAX_HOLD_DAYS    = 30
+# v1.1 правки ②⑤: шире стоп + дольше hold
+ATR_STOP_MULT    = 3.5         # было 2.0 → стало 3.5 (91% ложных стопов!)
+MAX_HOLD_DAYS    = 40          # было 30 → стало 40 (~6.6 дней)
 MAX_NEW_PER_DAY  = 8
 
 PARTIAL_TP_PCT      = 0.08
@@ -168,21 +169,78 @@ def dmi(candles, period=DMI_PERIOD):
     return plus_di, minus_di, adx
 
 
-# ===== DATA FETCH =====
+# ===== DATA FETCH (v1.1: с пагинацией!) =====
 
 _CANDLE_CACHE = {}
 
+
 def fetch_candles(contract, interval="1d", limit=2000):
+    """v1.1: Пагинация. Gate.io отдаёт максимум 2000 свечей за запрос.
+    Для 4H нужно ~6000 свечей (3 года). Делаем 3 запроса и склеиваем."""
     key = (contract, interval, limit)
     if key in _CANDLE_CACHE:
         return _CANDLE_CACHE[key]
     gate_c = contract if contract.endswith("_USDT") else f"{contract}_USDT"
-    raw = B.api_get("candlesticks", {
-        "contract": gate_c, "interval": interval, "limit": limit,
-    })
-    parsed = B.parse_candles(raw)
-    _CANDLE_CACHE[key] = parsed
-    return parsed
+
+    # v1.1: для 4H делаем 3 страницы по 2000 = 6000 свечей
+    # Gate.io API: параметр `to` = last candle timestamp (exclusive)
+    # Страница 1: самые свежие 2000 свечей (без `to`)
+    # Страница 2: 2000 свечей ДО первой свечи страницы 1 (to = t[0] страницы 1)
+    # Страница 3: 2000 свечей ДО первой свечи страницы 2
+    pages_needed = 3 if interval == "4h" else 1
+
+    all_candles = []
+    to_ts = None  # None = самые свежие
+
+    for page in range(pages_needed):
+        params = {
+            "contract": gate_c,
+            "interval": interval,
+            "limit":    limit,
+        }
+        if to_ts is not None:
+            params["to"] = to_ts
+
+        try:
+            raw = B.api_get("candlesticks", params)
+            page_candles = B.parse_candles(raw)
+        except Exception as e:
+            print(f"[warn] {contract} page {page+1}: {e}")
+            break
+
+        if not page_candles:
+            break
+
+        # Gate.io возвращает свечи в порядке убывания (новые первыми)
+        # или возрастания — зависит от API. Сортируем по t.
+        page_candles.sort(key=lambda c: c['t'])
+
+        if to_ts is not None:
+            # Оставляем только свечи ДО to_ts (на случай пересечения)
+            page_candles = [c for c in page_candles if c['t'] < to_ts]
+
+        if not page_candles:
+            break
+
+        all_candles = page_candles + all_candles if all_candles else page_candles
+        # Следующая страница: всё, что ПЕРЕД самой ранней свечой текущей
+        to_ts = page_candles[0]['t']
+
+        # Если получили меньше 2000 — истории больше нет
+        if len(page_candles) < limit:
+            break
+
+    # Дедупликация по timestamp (на случай пересечений)
+    seen = set()
+    unique = []
+    for c in all_candles:
+        if c['t'] not in seen:
+            seen.add(c['t'])
+            unique.append(c)
+    unique.sort(key=lambda c: c['t'])
+
+    _CANDLE_CACHE[key] = unique
+    return unique
 
 
 # ===== BTC REGIME (на 1D, без изменений) =====
@@ -226,7 +284,7 @@ def get_funding_snapshot():
     return _FUNDING_CACHE
 
 
-# ===== СИГНАЛ (как в v4.7) =====
+# ===== СИГНАЛ =====
 
 def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
     cds = candles_up_to_today
@@ -261,7 +319,7 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
             "plus_di": plus_di, "minus_di": minus_di, "adx": adx}
 
 
-# ===== POSITION (как в v4.7) =====
+# ===== POSITION =====
 
 class Position:
     __slots__ = ("contract", "side", "entry", "atr_at_entry",
@@ -277,6 +335,7 @@ class Position:
         self.atr_at_entry       = atr_at_entry
         self.size_usd           = size_usd
         self.original_size_usd  = size_usd
+        # v1.1: SL = 3.5×ATR (было 2.0)
         self.initial_stop       = entry - side * ATR_STOP_MULT * atr_at_entry
         self.trail_stop         = self.initial_stop
         self.max_favorable      = entry
@@ -288,6 +347,7 @@ class Position:
         self.partial_taken      = False
 
     def update_trail(self, candle):
+        # v1.1: trail = 3.5×ATR (использует ATR_STOP_MULT, как и initial_stop)
         if self.side == +1:
             self.max_favorable = max(self.max_favorable, candle['h'])
             self.max_adverse   = min(self.max_adverse, candle['l'])
@@ -356,7 +416,7 @@ def live_signal_filters(contract):
         return False, f"err: {e}"
 
 
-# ===== ДВИЖОК БЭКТЕСТА (4H) =====
+# ===== ДВИЖОК БЭКТЕСТА =====
 
 def compute_risk_slot(equity, dd_brake_active=False):
     base = max(SLOT_RISK_MIN, min(SLOT_RISK_MAX, equity * RISK_FRACTION))
@@ -377,7 +437,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     pairs_active = [p for p in pairs if p not in EXCLUDE_PAIRS]
     excluded = len(pairs) - len(pairs_active)
     if verbose:
-        B.send_telegram(f"📡 {STRATEGY_NAME} {STRATEGY_VERSION}: загружаю {CANDLE_INTERVAL} свечи для "
+        B.send_telegram(f"📡 {STRATEGY_NAME} {STRATEGY_VERSION}: загружаю {CANDLE_INTERVAL} свечи (3 стр x 2000) для "
                         f"{len(pairs_active)} пар (excluded {excluded})")
     data = {}
     for i, p in enumerate(pairs_active):
@@ -385,6 +445,10 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             cds = fetch_candles(p, CANDLE_INTERVAL, 2000)
             if cds:
                 data[p] = cds
+                if verbose and i == 0:
+                    B.send_telegram(f"  пример {p}: {len(cds)} свечей (от "
+                                    f"{dt.datetime.utcfromtimestamp(cds[0]['t']).strftime('%Y-%m-%d')} до "
+                                    f"{dt.datetime.utcfromtimestamp(cds[-1]['t']).strftime('%Y-%m-%d')})")
         except Exception as e:
             print(f"[warn] {p}: {e}")
         if verbose and (i + 1) % 20 == 0:
@@ -967,13 +1031,13 @@ def format_report(result, val, n_pairs=None):
     lines = []
     lines.append(f"📊 *{STRATEGY_NAME} {STRATEGY_VERSION} - РЕЗУЛЬТАТЫ*  [{STRATEGY_FILE}]")
     lines.append("")
-    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing 2xATR + "
+    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing {ATR_STOP_MULT}xATR + "
                  f"Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
-    lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR})")
+    lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR} при DD>${DD_BRAKE_THRESHOLD:.0f})")
     lines.append(f"Max concurrent: {MAX_CONCURRENT} | Daily stop: ${DAILY_STOP_LOSS:.0f} / 2-й день подряд ${DAILY_STOP_LOSS_CONSEC:.0f} | New/day: {MAX_NEW_PER_DAY}")
     lines.append(f"Partial TP: +{PARTIAL_TP_PCT*100:.0f}% favorable -> закрыть {PARTIAL_TP_FRACTION*100:.0f}% позиции, остаток -> breakeven")
-    lines.append(f"ATR фильтр: {ATR_PCT_MIN*100:.1f}%-{ATR_PCT_MAX*100:.1f}% (на 4H) | Max hold: {MAX_HOLD_DAYS} свечей ({MAX_HOLD_DAYS*4}h)")
+    lines.append(f"ATR фильтр: {ATR_PCT_MIN*100:.1f}%-{ATR_PCT_MAX*100:.1f}% (на 4H) | Max hold: {MAX_HOLD_DAYS} свечей ({MAX_HOLD_DAYS*4}h = {MAX_HOLD_DAYS*4/24:.1f}д)")
     lines.append(f"Сделок: {val['n_trades']}  |  Дней: {val['n_days']}  |  Свечей 4H: {val.get('n_candles', 0)}")
     lines.append(f"BTC blocked: {val['btc_blocked']}д  |  ADX filtered: {val['adx_filtered']}  |  DD brake days: {val['dd_brake_days']}д")
     lines.append(f"Cooldown: {val['cooldown_blocked']}  |  Daily stop: {val['day_stop_triggered']}  |  "
@@ -1074,7 +1138,7 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v10 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v11 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
@@ -1083,7 +1147,7 @@ def main():
     end   = os.environ.get("BT_END", BACKTEST_END_ISO)
     B.send_telegram(
         f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: "
-        f"{len(pairs)} пар, интервал {CANDLE_INTERVAL}, окно {start} -> {end or 'сегодня'}"
+        f"{len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), окно {start} -> {end or 'сегодня'}"
     )
     result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
     val    = validate(result)
