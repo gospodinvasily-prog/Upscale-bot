@@ -623,7 +623,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         "day_stop_triggered": day_stop_triggered, "day_stop_events": day_stop_events,
         "partial_tp_count": partial_tp_count, "partial_tp_total_pnl": partial_tp_total_pnl,
         "consec_loss_days_max": consec_loss_days_max, "max_dd_peak_ts": max_dd_peak_ts,
-        "max_dd_trough_ts": max_dd_trough_ts, "max_dd_value": max_dd_value})
+        "max_dd_trough_ts": max_dd_trough_ts, "max_dd_value": max_dd_value}
 
 
 def validate(result, z=Z_SCORE):
