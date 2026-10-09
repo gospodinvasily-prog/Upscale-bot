@@ -1,49 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_4h_v14.py - Donchian Breakout на 4H (v1.4: правки risk management)
+bt_donchian_4h_v15.py - Donchian Breakout на 4H (v1.5: исправлен per-side budget)
 =================================================================================
-ЗАПУСК: RUN_BACKTEST=donchian_4h_v14 python bot.py
+ЗАПУСК: RUN_BACKTEST=donchian_4h_v15 python bot.py
 
-=== TEST BUILD v1.4 (4H Donchian) ===
-Основа: v1.3 (4H Donchian, 781 сделок, +$16,871, 3/4 PASS, FAIL на Worst day -$525)
+=== TEST BUILD v1.5 (4H Donchian) ===
+Основа: v1.4 (4H Donchian, 4/4 ALL PASS, но сделок всего 400, P&L $6,693)
 
-КОРНЕВАЯ ПРОБЛЕМА v1.3: DAILY_STOP_LOSS_CONSEC = -$100 (подряд убытки)
-  - 5 раз подряд 2+ дня — порог падал с -$300 до -$100
-  - -$100 на $20K equity = 0.5% — это шум, не просадка
-  - 72% стоп-выходов возвращались в сторону сделки
-  - Система закрывала позиции на дне, цена шла обратно
+КОРНЕВАЯ ПРОБЛЕМА v1.4: PER_SIDE_BUDGET=250
+  - При росте equity до $15-20K, per side падал до 1-2 позиций
+  - Это убило количество сделок (781→400, -49%)
+  - И убило P&L ($16,871→$6,693, -$10K)
 
-ИЗМЕНЕНИЯ vs v1.3 (6 правок):
-  ① DAILY_STOP_LOSS_CONSEC = -300 (было -100) — ГЛАВНАЯ ПРАВКА
-     Убрать занижение порога. -$100 = 0.5% = шум.
-  ② DAILY_STOP_LOSS = -450 (было -300) — дать больше пространства для колебаний
-  ③ COOLDOWN_DAYS = 14 (было 30) — быстрее возвращаться к торговле
-  ④ CONSEC_LOSS_LIMIT = 4 (было 3) — мягче триггер cooldown
-  ⑤ MAX_CONCURRENT = 5 (было 4) — больше параллельности
-  ⑥ PerSide cap ВКЛЮЧЁН: MAX_PER_SIDE_CAP = 3, PER_SIDE_BUDGET = 250
-     Не больше 3 позиций в одну сторону (диверсификация по сторонам)
-     Если BTC развернётся, не все 5 позиций пострадают
-  ⑦ Сортировка по ATR% (вместо DMI) — лучшая селекция кандидатов
+ИЗМЕНЕНИЯ vs v1.4 (1 ПРАВКА):
+  ① PER_SIDE_BUDGET = 1000 (было 250)
+     - При equity $10K: 1000/80=12 → cap 3 (как и хотели)
+     - При equity $20K: 1000/160=6 → cap 3
+     - При equity $25K+: 1000/200=5 → cap 3
+     - Cap 3 в сторону сохраняется (диверсификация), но не падает до 1
 
-ЧТО ОСТАЛОСЬ КАК В v1.3 (без изменений):
-  - Donchian(20) на 4H, BTC SMA(50) 1D, DMI, ATR(14)
-  - Trailing по close (не по wick)
-  - ATR_STOP_MULT = 4.5, MAX_HOLD_DAYS = 35
-  - MAX_NEW_PER_DAY = 6
-  - DD_BRAKE_THRESHOLD = $900, DD_BRAKE_FACTOR = 0.4
-  - Пагинация 3 страницы × 2000 свечей = 6000
-  - Compound sizing $80-$200 (БЕЗ ИЗМЕНЕНИЙ — даёт P&L)
+ЧТО ОСТАЛОСЬ КАК В v1.4 (БЕЗ ИЗМЕНЕНИЙ):
+  - MAX_CONCURRENT = 5, MAX_PER_SIDE_CAP = 3
+  - DAILY_STOP_LOSS = -450, DAILY_STOP_LOSS_CONSEC = -300 (главная правка v1.4)
+  - COOLDOWN_DAYS = 14, CONSEC_LOSS_LIMIT = 4
+  - Trailing по close, ATR_STOP_MULT = 4.5
+  - Пагинация 3 страницы × 2000 свечей
+  - Compound sizing $80-$200
   - Partial TP +8%/50% + breakeven
-  - EXCLUDE_PAIRS 14 пар (включая KAIA, STX, IOTA, ARB, GRT, CRV)
+  - EXCLUDE_PAIRS 14 пар
+  - Сортировка по ATR%
   - 3 метрики: MaxDD dates, Profit Factor, Worst 5 trades
 
 ОЖИДАНИЕ:
-  - Сделок: ~750-850
-  - Daily stop срабатываний: ~20-25 (vs 48 в v1.3)
-  - Worst day: -$350/-$450 (PASS!)
-  - Max consec loss days: 5-6 (vs 10 в v1.3)
-  - Total P&L: ~+$15-17K (сохраним)
-  - Все 4 гейта — ALL PASS
+  - Сделок: ~700-800 (вернёмся к v1.3 уровням)
+  - P&L: ~$13-16K (вернёмся к v1.3 уровням)
+  - Worst day: -$300/-$450 (PASS, как в v1.4)
+  - Гейты: 4/4 ALL PASS
 """
 
 import os
@@ -64,8 +56,8 @@ else:
 
 # ===== КОНСТАНТЫ =====
 STRATEGY_NAME    = "Donchian 4H"
-STRATEGY_VERSION = "v1.4-TEST"
-STRATEGY_FILE    = "bt_donchian_4h_v14"
+STRATEGY_VERSION = "v1.5-TEST"
+STRATEGY_FILE    = "bt_donchian_4h_v15"
 
 INIT_CAPITAL     = 10_000.0
 RISK_FRACTION    = 0.008
@@ -77,24 +69,21 @@ DD_BRAKE_THRESHOLD = 900.0
 DD_BRAKE_FACTOR    = 0.4
 DD_BRAKE_RECOVERY  = 0.85
 
-# v1.4 правка ⑤⑥: больше параллельности + PerSide cap ВКЛЮЧЁН
-MAX_CONCURRENT     = 5         # было 4 → стало 5
-MAX_PER_SIDE_CAP   = 3         # v1.4: ВКЛ (было 4 без cap) — не больше 3 в одну сторону
-PER_SIDE_BUDGET    = 250       # v1.4: реально ограничивает (было 999999)
-# v1.4 правки ①②: пороги daily stop выше
-DAILY_STOP_LOSS            = -450.0  # было -300 → стало -450
-DAILY_STOP_LOSS_CONSEC     = -300.0  # было -100 → стало -300 (= базовый, ГЛАВНАЯ ПРАВКА)
+MAX_CONCURRENT     = 5
+MAX_PER_SIDE_CAP   = 3
+# v1.5 ЕДИНСТВЕННАЯ ПРАВКА: 250 → 1000
+PER_SIDE_BUDGET    = 1000    # было 250 → стало 1000
+DAILY_STOP_LOSS            = -450.0
+DAILY_STOP_LOSS_CONSEC     = -300.0
 
-# v1.4 правки ③④: мягче cooldown
 EXCLUDE_PAIRS = {
     "TRX", "XLM", "BNB", "UNI",
     "LTC", "RUNE", "PENDLE", "HBAR",
     "KAIA", "STX", "IOTA", "ARB", "GRT", "CRV",
 }
-CONSEC_LOSS_LIMIT = 4            # было 3 → стало 4
-COOLDOWN_DAYS     = 14           # было 30 → стало 14
+CONSEC_LOSS_LIMIT = 4
+COOLDOWN_DAYS     = 14
 
-# === Стратегия (4H таймфрейм) ===
 CANDLE_INTERVAL  = "4h"
 DONCHIAN_PERIOD  = 20
 BTC_REGIME_SMA   = 50
@@ -363,7 +352,6 @@ class Position:
         self.partial_taken      = False
 
     def update_trail(self, candle):
-        """v1.2+: TRAILING ПО CLOSE (не по wick)."""
         if self.side == +1:
             self.max_favorable = max(self.max_favorable, candle['h'])
             self.max_adverse   = min(self.max_adverse, candle['l'])
@@ -441,12 +429,13 @@ def compute_risk_slot(equity, dd_brake_active=False):
     return base
 
 def compute_max_per_side(current_risk):
-    """v1.4: PerSide cap ВКЛЮЧЁН — реально ограничивает."""
+    """v1.5: PerSide cap ВКЛЮЧЁН с адекватным бюджетом 1000.
+    - equity $10K, risk $80 → 1000/80=12, min(3,12)=3 позиции в сторону
+    - equity $20K, risk $160 → 1000/160=6, min(3,6)=3
+    - equity $25K+, risk $200 → 1000/200=5, min(3,5)=3
+    Cap 3 сохраняется при любой equity."""
     if current_risk <= 0:
         return 0
-    # Бюджет / риск = сколько позиций можно открыть в одну сторону
-    # С PER_SIDE_BUDGET=250 и risk=80 → 3 позиции (250/80=3.1, min(3,3)=3)
-    # С PER_SIDE_BUDGET=250 и risk=200 → 1 позиция (250/200=1.25, min(3,1)=1)
     return min(MAX_PER_SIDE_CAP, int(PER_SIDE_BUDGET / current_risk))
 
 
@@ -672,11 +661,10 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         long_count  = sum(1 for p in positions if p.side == +1)
         short_count = sum(1 for p in positions if p.side == -1)
 
-        # v1.4: пороги выше
         if prev_day_pnl < 0:
-            current_threshold = DAILY_STOP_LOSS_CONSEC  # теперь -$300 (= базовый)
+            current_threshold = DAILY_STOP_LOSS_CONSEC
         else:
-            current_threshold = DAILY_STOP_LOSS          # -$450
+            current_threshold = DAILY_STOP_LOSS
         long_unrealized  = 0.0
         short_unrealized = 0.0
         open_losses = 0.0
@@ -778,8 +766,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 continue
             candidates.append((p, sig, idx))
 
-        # v1.4: Сортировка по ATR% (волатильность = потенциал прибыли)
-        # вместо DMI силы тренда
         candidates.sort(key=lambda x: x[1]["atr_pct"], reverse=True)
 
         for p, sig, idx in candidates:
@@ -1098,7 +1084,7 @@ def format_report(result, val, n_pairs=None):
                  f"Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
     lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR} при DD>${DD_BRAKE_THRESHOLD:.0f})")
-    lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap {MAX_PER_SIDE_CAP} ВКЛ) | Daily stop: ${DAILY_STOP_LOSS:.0f} / подряд ${DAILY_STOP_LOSS_CONSEC:.0f} | New/day: {MAX_NEW_PER_DAY}")
+    lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap {MAX_PER_SIDE_CAP} ВКЛ, budget ${PER_SIDE_BUDGET}) | Daily stop: ${DAILY_STOP_LOSS:.0f} / подряд ${DAILY_STOP_LOSS_CONSEC:.0f} | New/day: {MAX_NEW_PER_DAY}")
     lines.append(f"Partial TP: +{PARTIAL_TP_PCT*100:.0f}% favorable -> закрыть {PARTIAL_TP_FRACTION*100:.0f}% позиции, остаток -> breakeven")
     lines.append(f"ATR фильтр: {ATR_PCT_MIN*100:.1f}%-{ATR_PCT_MAX*100:.1f}% (на 4H) | Max hold: {MAX_HOLD_DAYS} свечей ({MAX_HOLD_DAYS*4}h = {MAX_HOLD_DAYS*4/24:.1f}д)")
     lines.append(f"Cooldown: {COOLDOWN_DAYS}д после {CONSEC_LOSS_LIMIT} убытков подряд")
@@ -1229,7 +1215,7 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v14 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v15 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
@@ -1239,7 +1225,8 @@ def main():
     B.send_telegram(
         f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: "
         f"{len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing по close, "
-        f"max {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}), daily stop ${DAILY_STOP_LOSS:.0f}/${DAILY_STOP_LOSS_CONSEC:.0f}, "
+        f"max {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}, budget ${PER_SIDE_BUDGET}), "
+        f"daily stop ${DAILY_STOP_LOSS:.0f}/${DAILY_STOP_LOSS_CONSEC:.0f}, "
         f"окно {start} -> {end or 'сегодня'}"
     )
     result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
