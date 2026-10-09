@@ -465,7 +465,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         long_count = sum(1 for p in positions if p.side == +1)
         short_count = sum(1 for p in positions if p.side == -1)
         if prev_day_pnl < 0:
-            current_threshold = DAILY_STOP_LOSS_CONSEC
+            current_threshold = DAILY_STOP_LOSS
         else:
             current_threshold = DAILY_STOP_LOSS
         long_unrealized = 0.0
@@ -478,7 +478,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             if pos.side == +1: long_unrealized += pos_unrealized
             else: short_unrealized += pos_unrealized
             if pos_unrealized < 0: open_losses += pos_unrealized
-        if (equity - prev_day_start_equity) <= current_threshold:
+        if realized_today + open_losses <= current_threshold:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
