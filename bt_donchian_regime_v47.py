@@ -491,7 +491,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                         positions_remaining.append(pos)
                         continue
                     pos_unrealized = pos.side * (candle_now['c'] - pos.entry) / pos.entry * pos.size_usd
-                    if pos_unrealized < 0:
+                    if pos.side == bad_side and pos_unrealized < 0:
                         exit_price_now = candle_now['c']
                         gross_now = pos.side * (exit_price_now - pos.entry) / pos.entry * pos.size_usd
                         comm_now = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
