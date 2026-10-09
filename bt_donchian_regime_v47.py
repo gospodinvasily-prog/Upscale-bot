@@ -25,7 +25,6 @@ MAX_CONCURRENT = 10
 MAX_PER_SIDE_CAP = 6
 PER_SIDE_BUDGET = 2000
 MAX_NEW_PER_DAY = 10
-# v2.1: фильтр «3 лузера» — если в одну сторону уже 3 убыточные, новых входов в эту сторону нет
 MAX_LOSERS_PER_SIDE = 3
 DAILY_STOP_LOSS = -350.0
 DAILY_STOP_LOSS_CONSEC = -350.0
@@ -479,20 +478,20 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             if pos.side == +1: long_unrealized += pos_unrealized
             else: short_unrealized += pos_unrealized
             if pos_unrealized < 0: open_losses += pos_unrealized
-            if (equity - prev_day_start_equity) <= current_threshold:
+        if (equity - prev_day_start_equity) <= current_threshold:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
                 bad_side = +1 if long_unrealized <= short_unrealized else -1
                 positions_remaining = []
                 dstop_realized = 0.0
-                if pos_unrealized < 0:
+                for pos in positions:
                     candle_now = by_pair_candle[pos.contract].get(candle_ts)
                     if candle_now is None:
                         positions_remaining.append(pos)
                         continue
                     pos_unrealized = pos.side * (candle_now['c'] - pos.entry) / pos.entry * pos.size_usd
-                    if pos.side == bad_side and pos_unrealized < 0:
+                    if pos_unrealized < 0:
                         exit_price_now = candle_now['c']
                         gross_now = pos.side * (exit_price_now - pos.entry) / pos.entry * pos.size_usd
                         comm_now = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
