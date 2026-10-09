@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_4h_v16.py - Donchian Breakout на 4H (v1.6: 2× больше позиций)
-ЗАПУСК: RUN_BACKTEST=donchian_4h_v16 python bot.py
+bt_donchian_4h_v17.py - Donchian Breakout на 4H (v1.7: cap=5)
+ЗАПУСК: RUN_BACKTEST=donchian_4h_v17 python bot.py
 
-v1.6: 2× больше позиций в сторону (cap=6), MAX_CONCURRENT=10, budget=2000.
-Цель: вернуть 2026 год к $3-5K (в v1.5 было $447), worst day ≤ -$450.
+v1.7 правки vs v1.6: MAX_PER_SIDE_CAP 6→5, MAX_CONCURRENT 10→9, PER_SIDE_BUDGET 2000→1500
+Цель: cap=5 даст worst day ~-$450/-$500, daily stop не сработает, позиции выживут.
 """
 
 import os
@@ -25,8 +25,8 @@ else:
 
 # ===== КОНСТАНТЫ =====
 STRATEGY_NAME    = "Donchian 4H"
-STRATEGY_VERSION = "v1.6-TEST"
-STRATEGY_FILE    = "bt_donchian_4h_v16"
+STRATEGY_VERSION = "v1.7-TEST"
+STRATEGY_FILE    = "bt_donchian_4h_v17"
 
 INIT_CAPITAL     = 10_000.0
 RISK_FRACTION    = 0.008
@@ -38,9 +38,10 @@ DD_BRAKE_THRESHOLD = 900.0
 DD_BRAKE_FACTOR    = 0.4
 DD_BRAKE_RECOVERY  = 0.85
 
-MAX_CONCURRENT     = 10
-MAX_PER_SIDE_CAP   = 6
-PER_SIDE_BUDGET    = 2000
+# v1.7: cap=5, concurrent=9, budget=1500
+MAX_CONCURRENT     = 9
+MAX_PER_SIDE_CAP   = 5
+PER_SIDE_BUDGET    = 1500
 MAX_NEW_PER_DAY    = 10
 
 DAILY_STOP_LOSS            = -450.0
@@ -370,7 +371,9 @@ def live_signal_filters(contract):
         return True, "ok"
     except Exception as e:
         return False, f"err: {e}"
-      # ===== ДВИЖОК БЭКТЕСТА =====
+
+
+# ===== ДВИЖОК БЭКТЕСТА =====
 
 def compute_risk_slot(equity, dd_brake_active=False):
     base = max(SLOT_RISK_MIN, min(SLOT_RISK_MAX, equity * RISK_FRACTION))
@@ -382,9 +385,7 @@ def compute_max_per_side(current_risk):
     if current_risk <= 0:
         return 0
     return min(MAX_PER_SIDE_CAP, int(PER_SIDE_BUDGET / current_risk))
-
-
-def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, verbose=True):
+    def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, verbose=True):
     if B is None:
         raise RuntimeError("bot module not available")
 
@@ -812,7 +813,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         "max_dd_trough_ts": max_dd_trough_ts,
         "max_dd_value": max_dd_value,
     }
-  # ===== ВАЛИДАЦИЯ =====
+    # ===== ВАЛИДАЦИЯ =====
 
 def validate(result, z=Z_SCORE):
     final     = result["final_equity"]
@@ -1158,7 +1159,7 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v16 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v17 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
