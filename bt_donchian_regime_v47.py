@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""bt_donchian_4h_v20.py - Donchian 4H v2.0 (Daily Stop -450 + Risk $75 + Adaptive ATR). RUN_BACKTEST=donchian_4h_v20"""
+"""bt_donchian_4h_v21.py - Donchian 4H v2.1 (cap=6 + 3 losers filter). RUN_BACKTEST=donchian_4h_v21"""
 import os, sys, math, statistics, datetime as dt
 from collections import defaultdict
 try:
@@ -11,20 +11,22 @@ else:
     _BOT_IMPORT_ERR = None
 
 STRATEGY_NAME = "Donchian 4H"
-STRATEGY_VERSION = "v2.0-TEST"
-STRATEGY_FILE = "bt_donchian_4h_v20"
+STRATEGY_VERSION = "v2.1-TEST"
+STRATEGY_FILE = "bt_donchian_4h_v21"
 INIT_CAPITAL = 10_000.0
 RISK_FRACTION = 0.008
-SLOT_RISK_MIN = 75.0
+SLOT_RISK_MIN = 80.0
 SLOT_RISK_MAX = 200.0
 MAX_POSITION_PCT = 0.20
 DD_BRAKE_THRESHOLD = 900.0
 DD_BRAKE_FACTOR = 0.4
 DD_BRAKE_RECOVERY = 0.85
-MAX_CONCURRENT = 7
-MAX_PER_SIDE_CAP = 4
-PER_SIDE_BUDGET = 1200
-MAX_NEW_PER_DAY = 8
+MAX_CONCURRENT = 9
+MAX_PER_SIDE_CAP = 6
+PER_SIDE_BUDGET = 2000
+MAX_NEW_PER_DAY = 10
+# v2.1: фильтр «3 лузера» — если в одну сторону уже 3 убыточные, новых входов в эту сторону нет
+MAX_LOSERS_PER_SIDE = 3
 DAILY_STOP_LOSS = -450.0
 DAILY_STOP_LOSS_CONSEC = -300.0
 EXCLUDE_PAIRS = {"TRX","XLM","BNB","UNI","LTC","RUNE","PENDLE","HBAR","KAIA","STX","IOTA","ARB","GRT","CRV"}
@@ -39,12 +41,6 @@ ATR_PERIOD = 14
 ATR_PCT_MIN = 0.006
 ATR_PCT_MAX = 0.020
 ATR_STOP_MULT = 4.5
-# v2.0: адаптивный множитель ATR (вместо фиксированного ATR_STOP_MULT)
-ATR_MULT_LOW_VOL = 5.0      # для ATR% < 1.0% — широкий стоп, чтобы wicks не вынесли
-ATR_MULT_NORMAL = 4.5        # для ATR% 1.0-2.0% — стандарт
-ATR_MULT_HIGH_VOL = 3.5      # для ATR% > 2.0% — tighter стоп
-ATR_PCT_LOW_THRESHOLD = 0.010   # 1.0%
-ATR_PCT_HIGH_THRESHOLD = 0.020  # 2.0%
 MAX_HOLD_DAYS = 35
 PARTIAL_TP_PCT = 0.08
 PARTIAL_TP_FRACTION = 0.50
@@ -182,19 +178,6 @@ def get_funding_snapshot():
     return _FUNDING_CACHE
 
 
-def get_atr_mult(atr_pct):
-    """v2.0: Адаптивный множитель ATR в зависимости от волатильности пары.
-    - спокойные пары (ATR% < 1.0%) → широкий стоп (5.0×ATR), чтобы wicks не вынесли
-    - нормальные пары (ATR% 1.0-2.0%) → стандарт (4.5×ATR)
-    - волатильные пары (ATR% > 2.0%) → tighter стоп (3.5×ATR), цена уже большая"""
-    if atr_pct < ATR_PCT_LOW_THRESHOLD:
-        return ATR_MULT_LOW_VOL
-    elif atr_pct > ATR_PCT_HIGH_THRESHOLD:
-        return ATR_MULT_HIGH_VOL
-    else:
-        return ATR_MULT_NORMAL
-
-
 def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
     cds = candles_up_to_today
     if len(cds) < DONCHIAN_PERIOD + 2: return None
@@ -207,36 +190,31 @@ def evaluate_signal(candles_up_to_today, btc_regime_today, funding_snap):
     atr_pct = a / last['c']
     if not (ATR_PCT_MIN <= atr_pct <= ATR_PCT_MAX):
         return {"side": 0, "atr": a, "close": last['c'], "atr_pct": atr_pct,
-                "dc_high": dc_high, "dc_low": dc_low, "plus_di": 0, "minus_di": 0, "adx": 0,
-                "atr_mult": ATR_MULT_NORMAL}
+                "dc_high": dc_high, "dc_low": dc_low, "plus_di": 0, "minus_di": 0, "adx": 0}
     plus_di, minus_di, adx = dmi(cds[:-1])
     if plus_di is None:
         return {"side": 0, "atr": a, "close": last['c'], "atr_pct": atr_pct,
-                "dc_high": dc_high, "dc_low": dc_low, "plus_di": 0, "minus_di": 0, "adx": 0,
-                "atr_mult": ATR_MULT_NORMAL}
+                "dc_high": dc_high, "dc_low": dc_low, "plus_di": 0, "minus_di": 0, "adx": 0}
     funding = funding_snap.get(last.get('contract', ''), 0)
     long_ok = (last['c'] > dc_high and btc_regime_today == +1 and plus_di > minus_di and abs(funding) <= 0.0005)
     short_ok = (last['c'] < dc_low and btc_regime_today == -1 and minus_di > plus_di and abs(funding) <= 0.0005)
     side = +1 if long_ok else (-1 if short_ok else 0)
-    atr_mult = get_atr_mult(atr_pct)
     return {"side": side, "atr": a, "close": last['c'], "atr_pct": atr_pct,
-            "dc_high": dc_high, "dc_low": dc_low, "plus_di": plus_di, "minus_di": minus_di, "adx": adx,
-            "atr_mult": atr_mult}
+            "dc_high": dc_high, "dc_low": dc_low, "plus_di": plus_di, "minus_di": minus_di, "adx": adx}
 
 
 class Position:
     __slots__ = ("contract", "side", "entry", "atr_at_entry", "size_usd", "original_size_usd",
                  "initial_stop", "trail_stop", "max_favorable", "max_adverse", "entry_idx",
-                 "entry_day_ts", "hold_days", "donchian_at_entry", "partial_taken", "atr_mult")
-    def __init__(self, contract, side, entry, atr_at_entry, size_usd, entry_idx, entry_day_ts, donchian_at_entry, atr_mult):
+                 "entry_day_ts", "hold_days", "donchian_at_entry", "partial_taken")
+    def __init__(self, contract, side, entry, atr_at_entry, size_usd, entry_idx, entry_day_ts, donchian_at_entry):
         self.contract = contract
         self.side = side
         self.entry = entry
         self.atr_at_entry = atr_at_entry
         self.size_usd = size_usd
         self.original_size_usd = size_usd
-        self.atr_mult = atr_mult
-        self.initial_stop = entry - side * atr_mult * atr_at_entry
+        self.initial_stop = entry - side * ATR_STOP_MULT * atr_at_entry
         self.trail_stop = self.initial_stop
         self.max_favorable = entry
         self.max_adverse = entry
@@ -249,12 +227,12 @@ class Position:
         if self.side == +1:
             self.max_favorable = max(self.max_favorable, candle['h'])
             self.max_adverse = min(self.max_adverse, candle['l'])
-            new_stop = candle['c'] - self.atr_mult * self.atr_at_entry
+            new_stop = candle['c'] - ATR_STOP_MULT * self.atr_at_entry
             self.trail_stop = max(self.trail_stop, new_stop)
         else:
             self.max_favorable = min(self.max_favorable, candle['l'])
             self.max_adverse = max(self.max_adverse, candle['h'])
-            new_stop = candle['c'] + self.atr_mult * self.atr_at_entry
+            new_stop = candle['c'] + ATR_STOP_MULT * self.atr_at_entry
             self.trail_stop = min(self.trail_stop, new_stop)
     def check_partial_tp(self, candle):
         if self.partial_taken: return None
@@ -548,6 +526,18 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         if day_loss_stop_active: continue
         can_long = long_count < max_per_side and btc_r == +1
         can_short = short_count < max_per_side and btc_r == -1
+        # v2.1: фильтр «3 лузера» — если в сторону уже 3 убыточные, новых входов в эту сторону нет
+        long_losers = 0
+        short_losers = 0
+        for pos in positions:
+            c = by_pair_candle[pos.contract].get(candle_ts)
+            if c is None: continue
+            pos_unrealized = pos.side * (c['c'] - pos.entry) / pos.entry * pos.size_usd
+            if pos_unrealized < 0:
+                if pos.side == +1: long_losers += 1
+                else: short_losers += 1
+        if long_losers >= MAX_LOSERS_PER_SIDE: can_long = False
+        if short_losers >= MAX_LOSERS_PER_SIDE: can_short = False
         candidates = []
         for p, cds in data.items():
             idx = idx_by_pair_candle[p].get(candle_ts)
@@ -574,14 +564,14 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             else:
                 if short_count >= max_per_side: continue
                 short_count += 1
-            stop_dist = sig.get("atr_mult", ATR_STOP_MULT) * sig["atr"]
+            stop_dist = ATR_STOP_MULT * sig["atr"]
             stop_pct = stop_dist / sig["close"]
             if stop_pct <= 0: continue
             raw_size = current_risk / stop_pct
             size_usd = min(raw_size, MAX_POSITION_PCT * equity)
             if size_usd < 50: continue
             entry_price = sig["close"]
-            pos = Position(p, sig["side"], entry_price, sig["atr"], size_usd, idx, candle_ts, sig["dc_high"], sig.get("atr_mult", ATR_STOP_MULT))
+            pos = Position(p, sig["side"], entry_price, sig["atr"], size_usd, idx, candle_ts, sig["dc_high"])
             positions.append(pos)
             cash -= COMM_TAKER * size_usd
             new_today += 1
@@ -785,11 +775,10 @@ def format_report(result, val, n_pairs=None):
     lines = []
     lines.append(f"📊 *{STRATEGY_NAME} {STRATEGY_VERSION} - РЕЗУЛЬТАТЫ*  [{STRATEGY_FILE}]")
     lines.append("")
-    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing адаптивный ATR + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown")
+    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing {ATR_STOP_MULT}xATR (по close) + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown + 3 лузера фильтр")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
     lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR} при DD>${DD_BRAKE_THRESHOLD:.0f})")
-    lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap {MAX_PER_SIDE_CAP} ВКЛ, budget ${PER_SIDE_BUDGET}) | Daily stop: ${DAILY_STOP_LOSS:.0f} / подряд ${DAILY_STOP_LOSS_CONSEC:.0f} | New/day: {MAX_NEW_PER_DAY}")
-    lines.append(f"ATR mult: <1% vol→{ATR_MULT_LOW_VOL}x | 1-2%→{ATR_MULT_NORMAL}x | >2%→{ATR_MULT_HIGH_VOL}x (адаптивный)")
+    lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap {MAX_PER_SIDE_CAP} ВКЛ, budget ${PER_SIDE_BUDGET}, фильтр {MAX_LOSERS_PER_SIDE} лузера) | Daily stop: ${DAILY_STOP_LOSS:.0f} / подряд ${DAILY_STOP_LOSS_CONSEC:.0f} | New/day: {MAX_NEW_PER_DAY}")
     lines.append(f"Partial TP: +{PARTIAL_TP_PCT*100:.0f}% favorable -> закрыть {PARTIAL_TP_FRACTION*100:.0f}% позиции, остаток -> breakeven")
     lines.append(f"ATR фильтр: {ATR_PCT_MIN*100:.1f}%-{ATR_PCT_MAX*100:.1f}% (на 4H) | Max hold: {MAX_HOLD_DAYS} свечей ({MAX_HOLD_DAYS*4}h = {MAX_HOLD_DAYS*4/24:.1f}д)")
     lines.append(f"Cooldown: {COOLDOWN_DAYS}д после {CONSEC_LOSS_LIMIT} убытков подряд")
@@ -891,14 +880,14 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v20 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v21 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
     _PAIRS_USED = pairs
     start = os.environ.get("BT_START", BACKTEST_START_ISO)
     end = os.environ.get("BT_END", BACKTEST_END_ISO)
-    B.send_telegram(f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: {len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing адаптивный ATR, max {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}, budget ${PER_SIDE_BUDGET}), daily stop ${DAILY_STOP_LOSS:.0f}/${DAILY_STOP_LOSS_CONSEC:.0f}, окно {start} -> {end or 'сегодня'}")
+    B.send_telegram(f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: {len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing по close, max {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}, фильтр {MAX_LOSERS_PER_SIDE} лузера), daily stop ${DAILY_STOP_LOSS:.0f}/${DAILY_STOP_LOSS_CONSEC:.0f}, окно {start} -> {end or 'сегодня'}")
     result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
     val = validate(result)
     lines = format_report(result, val, n_pairs=len(pairs))
