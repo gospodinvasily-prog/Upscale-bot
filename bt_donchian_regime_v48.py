@@ -1,47 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_regime_v48.py - v4.7: v4.5 + Partial TP (+8%) / Breakeven stop
+bt_donchian_regime_v48.py - v4.8.1: Prop-Safe + Partial TP (+8%) / Breakeven stop
 ====================================================================
 
 Запуск через диспетчер:
     RUN_BACKTEST=donchian_regime_v48 python bot.py
 
-Что изменилось vs v4.5:
-  Sideways-фильтр BTC (который был добавлен в v4.6) УБРАН по запросу
-  пользователя - v4.7 строится от v4.5, не от v4.6.
-
-  Вместо него - новая структура тейков (PARTIAL TP + BREAKEVEN):
-    Если позиция дошла до +8% в свою сторону (favorable move от entry) -
-    закрывается 50% позиции по цене закрытия дня (reason="PTP"),
-    а trail_stop для остатка сразу переносится на entry (breakeven).
-    Дальше остаток либо идёт по trailing 2xATR (большая прибыль),
-    либо закрывается в ноль по breakeven - минус по сделке после
-    partial TP становится невозможен (на остаток; сам partial кусок
-    уже зафиксирован в плюс).
-
-  PARTIAL_TP_PCT      = 0.08  (+8% favorable)
-  PARTIAL_TP_FRACTION = 0.50  (закрывается половина позиции)
-
-Новое в отчёте (без изменения логики стратегии):
-  Для убыточных сделок, закрытых по стопу (SL/TRAIL), считаем:
-    - MAE% (max adverse excursion) - максимальная просадка от entry
-      в % за время удержания позиции (независимо от итоговой цены
-      выхода - это худшая точка, которая была пройдена).
-    - % таких сделок, где цена в течение 15 дней ПОСЛЕ закрытия по
-      стопу всё же вернулась в сторону сделки (выше entry для Long,
-      ниже entry для Short) - т.е. стоп вынес раньше времени.
-  Это чисто информационная статистика (считается постфактум по факту
-  котировок после закрытия), саму торговую логику она не меняет.
-
-Что унаследовано из v4.5 (без изменений):
-  - Compound sizing (floor $100, cap $200), DD brake x0.5 > $1,200
-  - PerSide cap ОТКЛЮЧЁН (MAX_PER_SIDE_CAP=6=MAX_CONCURRENT)
-  - Daily emergency stop -$400 (блок новых входов до конца дня)
-  - Exclude 8 пар системных лузеров, per-pair cooldown 3/30
-  - Trailing 2xATR / SIG-разворот / MAX_HOLD_DAYS=15
-  - Весь расширенный отчёт v4.5: Long/Short win/loss, MFE% убыточных
-    сделок, даты срабатывания daily stop, минусовые дни подряд,
-    разбивка по парам с long/short - плюс новый блок Partial TP.
+v4.8.1: MAX_CONCURRENT возвращено к 6 (8 дало перебор MaxDD).
+Остальные параметры v4.8 сохранены (3 входа/день, ATR 6%, 12 exclude).
 """
 
 import os
@@ -64,7 +30,7 @@ else:
 #  КОНСТАНТЫ
 # =====================================================================
 
-# --- Капитал и риск (v4.7-risk100: compound с floor $100) ---
+# --- Капитал и риск (v4.8: compound с floor $80) ---
 INIT_CAPITAL     = 10_000.0
 RISK_FRACTION    = 0.008      # v4.8: 0.8% от equity (risk $80)
 SLOT_RISK_MIN    = 80.0       # v4.8: floor $80
@@ -77,8 +43,8 @@ DD_BRAKE_FACTOR    = 0.5
 DD_BRAKE_RECOVERY  = 0.95
 
 # --- v4.5: total limits (PerSide cap УБРАН) ---
-MAX_CONCURRENT     = 8       # v4.8: увеличено с 6 до 8
-MAX_PER_SIDE_CAP   = 8       # v4.8:同步 с MAX_CONCURRENT       # v4.5: = MAX_CONCURRENT, per-side cap отключён
+MAX_CONCURRENT     = 6       # v4.8.1: возвращено с 8 к 6 (8 дало перебор MaxDD)
+MAX_PER_SIDE_CAP   = 6       # v4.8.1: синхрон с MAX_CONCURRENT
 PER_SIDE_BUDGET    = 999999  # v4.5: огромное число, per-side не ограничивает
 DAILY_STOP_LOSS            = -300.0  # v4.7-risk100-v4: базовый порог (1-й минусовой день)
 DAILY_STOP_LOSS_CONSEC     = -100.0  # v4.7-risk100-v4: 2-й минусовой день подряд -> порог -$100
@@ -110,7 +76,7 @@ MAX_HOLD_DAYS    = 15
 MAX_NEW_PER_DAY  = 3         # v4.8: увеличено с 2 до 3
 
 # --- v4.7: Partial TP + Breakeven stop ---
-PARTIAL_TP_PCT      = 0.08    # +8% favorable -> закрыть часть позиции (возвращено с 0.10)
+PARTIAL_TP_PCT      = 0.08    # +8% favorable -> закрыть часть позиции
 PARTIAL_TP_FRACTION = 0.50    # какую долю закрыть
 
 # v4.7: отчёт - сколько дней ПОСЛЕ стоп-выхода смотрим вперёд, чтобы
@@ -469,7 +435,7 @@ def live_signal_filters(contract):
 # =====================================================================
 
 def compute_risk_slot(equity, dd_brake_active=False):
-    """v4.7-risk100: compound sizing с floor $100, cap $200, brake x0.5."""
+    """v4.8: compound sizing с floor $80, cap $200, brake x0.5."""
     base = max(SLOT_RISK_MIN, min(SLOT_RISK_MAX, equity * RISK_FRACTION))
     if dd_brake_active:
         base *= DD_BRAKE_FACTOR
@@ -491,7 +457,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     pairs_active = [p for p in pairs if p not in EXCLUDE_PAIRS]
     excluded = len(pairs) - len(pairs_active)
     if verbose:
-        B.send_telegram(f"📡 v4.8: загружаю 1d свечи для {len(pairs_active)} пар "
+        B.send_telegram(f"📡 v4.8.1: загружаю 1d свечи для {len(pairs_active)} пар "
                         f"(excluded {excluded})")
     data = {}
     for i, p in enumerate(pairs_active):
@@ -509,13 +475,11 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
 
     # --- 2) BTC regime ---
     if verbose:
-        B.send_telegram("📡 v4.8: вычисляю BTC weekly regime...")
+        B.send_telegram("📡 v4.8.1: вычисляю BTC weekly regime...")
     btc_regime = get_btc_regime()
     funding_snap = get_funding_snapshot()
 
     # --- 4) Общий таймлайн ---
-    # end_iso ограничивает окно СВЕРХУ (нужно для непересекающегося "второго
-    # периода" - без этого all_days всегда шёл до сегодня).
     start_ts = int(dt.datetime.fromisoformat(start_iso).timestamp())
     end_ts = int(dt.datetime.fromisoformat(end_iso).timestamp()) if end_iso else None
     all_days = sorted(set(
@@ -554,12 +518,12 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     day_loss_stop_active = False
     day_stop_triggered = 0
     last_day_idx = -1
-    day_stop_events = []   # v4.5: [{"day": ts, "open_before": n, "open_left": n}, ...]
+    day_stop_events = []
 
     # v4.7-risk100-v4: tracking previous day's PnL для consecutive-day logic
-    prev_day_pnl = 0.0   # PnL предыдущего дня (для определения 2-го дня подряд в минусе)
-    consec_loss_days_count = 0   # сколько дней подряд в минусе (для отчёта)
-    consec_loss_days_max = 0     # макс серия минусовых дней (для отчёта)
+    prev_day_pnl = 0.0
+    consec_loss_days_count = 0
+    consec_loss_days_max = 0
 
     # v4.7: Partial TP счётчик
     partial_tp_count = 0
@@ -571,13 +535,11 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         if btc_r == 0:
             btc_blocked += 1
 
-        # v4.4: сброс флага daily stop в начале нового дня
         if day_idx != last_day_idx:
             day_loss_stop_active = False
             last_day_idx = day_idx
 
-        # 6.1) Partial TP -> Закрытие по trailing stop / TIME / SIG
-        positions_before = len(positions)   # v4.5: для отчёта "закрылись ли все позиции"
+        positions_before = len(positions)
         new_positions = []
         realized_today = 0.0
         for pos in positions:
@@ -587,9 +549,8 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 continue
 
             pos.hold_days += 1
-            pos.update_trail(candle)   # пересчёт трейла по intraday high/low
+            pos.update_trail(candle)
 
-            # v4.7: проверка partial TP (до основных exit-ов)
             ptp = pos.check_partial_tp(candle)
             if ptp is not None:
                 partial_tp_count += 1
@@ -639,7 +600,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     if dt.datetime.utcfromtimestamp(cur).hour in FUNDING_TIMES_UTC:
                         n_fund += 1
                     cur += 3600
-                # FIX: funding_snap ключи - _USDT, pos.contract - голый тикер
                 _fc = pos.contract if pos.contract.endswith("_USDT") else f"{pos.contract}_USDT"
                 funding_rate = funding_snap.get(_fc, 0.0)
                 funding_cost = pos.side * funding_rate * pos.size_usd * n_fund
@@ -654,7 +614,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     "max_favorable": pos.max_favorable,
                     "max_adverse": pos.max_adverse,
                 })
-                # v4.4: обновляем pair_stats для cooldown
                 ps = pair_stats[pos.contract]
                 if net < 0:
                     ps["consec_losses"] += 1
@@ -667,7 +626,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
 
         positions = new_positions
 
-        # 6.2) Mark-to-market
         unrealized = 0.0
         for pos in positions:
             c = by_pair_day[pos.contract].get(day_ts)
@@ -701,31 +659,20 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         if len(positions) >= MAX_CONCURRENT:
             continue
 
-        # v4.4: compound sizing + DD brake
         current_risk = compute_risk_slot(equity, dd_brake_active)
-
-        # v4.5: per-side cap отключён, max_per_side = MAX_CONCURRENT
         max_per_side = compute_max_per_side(current_risk)
         long_count  = sum(1 for p in positions if p.side == +1)
         short_count = sum(1 for p in positions if p.side == -1)
 
-        # v4.4: daily emergency stop
-        # v4.7-risk100-v4: динамический порог в зависимости от предыдущего дня.
-        #   - Если вчера был минусовой день (prev_day_pnl < 0) -> порог -$100
-        #     (2-й день подряд в минусе, не ждём больших убытков, закрываем раньше)
-        #   - Иначе -> порог -$300 (базовый)
-        # Триггер: сумма убытков открытых позиций (open_losses, только отрицательные
-        # unrealized) <= порога.
-        # Закрытие: только убыточные позиции в "плохую" сторону (где больше убыток).
-        # Прибыльные позиции и позиции в "хорошую" сторону оставляем.
+        # v4.7-risk100-v4: динамический порог
         if prev_day_pnl < 0:
-            current_threshold = DAILY_STOP_LOSS_CONSEC   # -$100 (2-й день подряд в минусе)
+            current_threshold = DAILY_STOP_LOSS_CONSEC
         else:
-            current_threshold = DAILY_STOP_LOSS          # -$300 (базовый)
-        # Считаем unrealized по сторонам и сумму только убыточных
+            current_threshold = DAILY_STOP_LOSS
+
         long_unrealized  = 0.0
         short_unrealized = 0.0
-        open_losses = 0.0   # только отрицательные unrealized
+        open_losses = 0.0
         for pos in positions:
             c = by_pair_day[pos.contract].get(day_ts)
             if c is None:
@@ -735,16 +682,14 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 long_unrealized += pos_unrealized
             else:
                 short_unrealized += pos_unrealized
-            if pos_unrealized < 0:   # только убытки
+            if pos_unrealized < 0:
                 open_losses += pos_unrealized
-        # Триггер: сумма открытых убытков пробила порог
+
         if open_losses <= current_threshold:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
-                # Определяем "плохую" сторону (с наибольшим убытком)
                 bad_side = +1 if long_unrealized <= short_unrealized else -1
-                # Закрываем только убыточные позиции в "плохую" сторону
                 positions_remaining = []
                 dstop_realized = 0.0
                 for pos in positions:
@@ -781,7 +726,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     else:
                         positions_remaining.append(pos)
                 positions = positions_remaining
-                # Пересчёт cash/equity/daily_pnl с учётом DSTOP-закрытий
                 cash      += dstop_realized
                 unrealized = 0.0
                 for pos in positions:
@@ -801,8 +745,8 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                     "threshold_used": current_threshold,
                     "consec_day": prev_day_pnl < 0,
                 })
+
         if day_loss_stop_active:
-            # v4.7-risk100-v4: даже если сработал stop, обновляем prev_day_pnl
             prev_day_pnl = daily_pnl[-1][1]
             if prev_day_pnl < 0:
                 consec_loss_days_count += 1
@@ -812,7 +756,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 consec_loss_days_count = 0
             continue
 
-        # v4.7-risk100-v4: обновляем prev_day_pnl для следующего дня
         prev_day_pnl = daily_pnl[-1][1]
         if prev_day_pnl < 0:
             consec_loss_days_count += 1
@@ -831,7 +774,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 continue
             if any(pos.contract == p for pos in positions):
                 continue
-            # v4.4: проверка cooldown
             ps = pair_stats[p]
             if day_ts < ps["cooldown_until"]:
                 cooldown_blocked += 1
@@ -857,7 +799,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 break
             if len(positions) >= MAX_CONCURRENT:
                 break
-            # v4.5: перепроверка per-side лимита (но cap = MAX_CONCURRENT, не ограничивает)
             if sig["side"] == +1:
                 if long_count >= max_per_side:
                     continue
@@ -871,7 +812,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             stop_pct  = stop_dist / sig["close"]
             if stop_pct <= 0:
                 continue
-            raw_size  = current_risk / stop_pct     # v4.4: compound risk
+            raw_size  = current_risk / stop_pct
             size_usd  = min(raw_size, MAX_POSITION_PCT * equity)
             if size_usd < 50:
                 continue
@@ -903,11 +844,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         })
         cash += net
 
-    # 8) v4.7: для убыточных стоп-выходов (SL/TRAIL) - проверяем постфактум,
-    #    вернулась ли цена в течение STOP_REVERSAL_LOOKFORWARD_DAYS дней
-    #    ПОСЛЕ закрытия обратно в сторону сделки (выше entry для Long,
-    #    ниже entry для Short). Чисто отчётная статистика, саму торговлю
-    #    не меняет и не влияет ни на один вход/выход выше.
+    # 8) Stop reversal stats
     for t in closed_trades:
         if t["reason"] not in ("SL", "TRAIL") or t["pnl"] > 0:
             continue
@@ -948,7 +885,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         "day_stop_events": day_stop_events,
         "partial_tp_count": partial_tp_count,
         "partial_tp_total_pnl": partial_tp_total_pnl,
-        "consec_loss_days_max": consec_loss_days_max,   # v4.7-risk100-v4
+        "consec_loss_days_max": consec_loss_days_max,
     }
 
 
@@ -973,7 +910,6 @@ def validate(result, z=Z_SCORE):
     worst_day = min(daily_vals) if daily_vals else 0.0
     gate2 = worst_day >= WORST_DAY_LIMIT
 
-    # худший день - с датой, + статистика минусовых дней (подряд)
     worst_day_ts = None
     if result["daily_pnl"]:
         worst_day_ts = min(result["daily_pnl"], key=lambda p: p[1])[0]
@@ -992,8 +928,6 @@ def validate(result, z=Z_SCORE):
     longest_loss_streak = max((len(s) for s in loss_streaks), default=0)
     multi_loss_streaks = [s for s in loss_streaks if len(s) >= 2]
 
-    # v4.7: суммарный убыток за серию подряд минусовых дней - максимум
-    # (самая болезненная серия), а не просто длина серии
     worst_streak_loss = 0.0
     worst_streak_detail = None
     for s in loss_streaks:
@@ -1019,7 +953,6 @@ def validate(result, z=Z_SCORE):
     for t in result["trades"]:
         reasons[t["reason"]] += 1
 
-    # разбивка по парам - сделки / PnL / winrate + long/short на каждый инструмент
     by_pair = defaultdict(lambda: {
         "n": 0, "wins": 0, "losses": 0, "pnl": 0.0,
         "long_n": 0, "long_wins": 0, "short_n": 0, "short_wins": 0,
@@ -1053,7 +986,6 @@ def validate(result, z=Z_SCORE):
         key=lambda x: x["pnl"], reverse=True,
     )
 
-    # общая статистика long/short (прибыльные/убыточные)
     all_trades = result["trades"]
     longs  = [t for t in all_trades if t["side"] == +1]
     shorts = [t for t in all_trades if t["side"] == -1]
@@ -1066,10 +998,6 @@ def validate(result, z=Z_SCORE):
         "short_losses": sum(1 for t in shorts if t["pnl"] <= 0),
     }
 
-    # для убыточных сделок - на сколько % они доходили в свою сторону
-    # до разворота (MFE, max favorable excursion). Для сделок, где был
-    # partial TP, max_favorable посчитан на всю сделку (включая остаток
-    # после breakeven), это НЕ сам кусок PTP - он отдельной записью PTP.
     def _mfe_pct(t):
         return t["side"] * (t["max_favorable"] - t["entry"]) / t["entry"] * 100
 
@@ -1084,11 +1012,6 @@ def validate(result, z=Z_SCORE):
     long_short_stats["short_losing_mfe_max"] = (
         max((_mfe_pct(t) for t in losing_shorts), default=0.0))
 
-    # v4.7: убыточные стоп-выходы (SL/TRAIL) - максимальная просадка от
-    # входа (MAE%) за время удержания + % случаев, когда цена всё же
-    # вернулась в сторону сделки в течение STOP_REVERSAL_LOOKFORWARD_DAYS
-    # дней ПОСЛЕ закрытия (стоп вынес раньше времени). Отчётная статистика,
-    # не влияет на торговую логику.
     def _mae_pct(t):
         return t["side"] * (t["entry"] - t["max_adverse"]) / t["entry"] * 100
 
@@ -1107,8 +1030,6 @@ def validate(result, z=Z_SCORE):
         "lookforward_days": STOP_REVERSAL_LOOKFORWARD_DAYS,
     }
 
-    # daily stop -400 - даты срабатывания, закрытие всех позиций,
-    # и сколько раз срабатывало несколько дней ПОДРЯД
     day_stop_events = result.get("day_stop_events", [])
     streaks = []
     cur_streak = []
@@ -1157,7 +1078,7 @@ def validate(result, z=Z_SCORE):
         "cooldown_blocked": result.get("cooldown_blocked", 0),
         "excluded_count": result.get("excluded_count", 0),
         "day_stop_triggered": result.get("day_stop_triggered", 0),
-        "consec_loss_days_max": result.get("consec_loss_days_max", 0),   # v4.7-risk100-v4
+        "consec_loss_days_max": result.get("consec_loss_days_max", 0),
         "all_pass": gate1 and gate2 and gate3 and gate4,
     }
 
@@ -1173,7 +1094,8 @@ def format_report(result, val, n_pairs=None):
     if n_pairs is None:
         n_pairs = len(_PAIRS_USED)
     lines = []
-    lines.append("📊 *bt_donchian_regime v4.8 - РЕЗУЛЬТАТЫ*")
+    lines.append("📊 *bt_donchian_regime v4.8.1 - РЕЗУЛЬТАТЫ*")
+    lines.append("⚠️ ВНИМАНИЕ: Версия v4.8.1 (MAX_CONCURRENT=6). Если в шапке ниже написано 8 — значит залит старый файл v4.8!")
     lines.append("")
     lines.append(f"Donchian(20) + BTC SMA(50) + DMI + Trailing 2xATR + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown (NO PerSide cap, NO sideways-фильтр)")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
@@ -1210,8 +1132,6 @@ def format_report(result, val, n_pairs=None):
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
-    # Long/Short - сколько всего, прибыльных/убыточных, и сколько %
-    # убыточные сделки доходили в свою сторону до разворота (MFE%)
     ls = val.get("long_short_stats")
     if ls:
         lines.append("")
@@ -1227,8 +1147,6 @@ def format_report(result, val, n_pairs=None):
             f"{ls['short_losing_mfe_avg']:.2f}% (макс {ls['short_losing_mfe_max']:.2f}%)"
         )
 
-    # v4.7: убыточные стоп-выходы (SL/TRAIL) - просадка от входа (MAE%)
-    # + % случаев, когда цена вернулась в сторону сделки после стопа
     ss = val.get("stop_reversal_stats")
     if ss and ss["n"]:
         lines.append("")
@@ -1239,8 +1157,6 @@ def format_report(result, val, n_pairs=None):
         lines.append(f"Просадка от входа (MAE%): в среднем {ss['mae_avg']:.2f}%  "
                      f"(макс {ss['mae_max']:.2f}%)")
 
-    # Daily stop -400 - даты срабатывания, закрылись ли все позиции,
-    # и сколько раз это было несколько дней подряд
     events = val.get("day_stop_events") or []
     if events:
         lines.append("")
@@ -1258,7 +1174,6 @@ def format_report(result, val, n_pairs=None):
         if len(events) > 30:
             lines.append(f"   ... и ещё {len(events)-30} срабатываний")
 
-    # максимальная просадка в день + минусовые дни (подряд или нет)
     lines.append("")
     lines.append("- МИНУСОВЫЕ ДНИ -")
     lines.append(f"Макс. просадка за день: ${val['worst_day']:,.2f} ({worst_day_date})")
@@ -1277,7 +1192,6 @@ def format_report(result, val, n_pairs=None):
         lines.append(f"   подряд {det['days']}д: {d_from} -> {d_to}  (убыток за серию: "
                      f"${det.get('total_loss', 0.0):,.2f})")
 
-    # разбивка по парам (сделки / PnL / winrate + long/short), сортировка по PnL
     pair_stats = val.get("pair_stats") or []
     if pair_stats:
         lines.append("")
@@ -1309,7 +1223,7 @@ def main():
     start = os.environ.get("BT_START", BACKTEST_START_ISO)
     end   = os.environ.get("BT_END", BACKTEST_END_ISO)
     B.send_telegram(
-        f"🚀 *bt_donchian_regime v4.8* старт: {len(pairs)} пар, "
+        f"🚀 *bt_donchian_regime v4.8.1* старт: {len(pairs)} пар, "
         f"окно {start} -> {end or 'сегодня'}"
     )
 
