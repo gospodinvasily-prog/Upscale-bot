@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""bt_donchian_4h_v22.py - Donchian 4H v2.2 ($27K version). RUN_BACKTEST=donchian_4h_v22"""
+"""bt_donchian_4h_v22.py - Donchian 4H v2.2 (Daily Stop fix: realized+unrealized). RUN_BACKTEST=donchian_4h_v22"""
 import os, sys, math, statistics, datetime as dt
 from collections import defaultdict
 try:
@@ -464,7 +464,10 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         max_per_side = compute_max_per_side(current_risk)
         long_count = sum(1 for p in positions if p.side == +1)
         short_count = sum(1 for p in positions if p.side == -1)
-        current_threshold = DAILY_STOP_LOSS
+        if prev_day_pnl < 0:
+            current_threshold = DAILY_STOP_LOSS_CONSEC
+        else:
+            current_threshold = DAILY_STOP_LOSS
         long_unrealized = 0.0
         short_unrealized = 0.0
         open_losses = 0.0
