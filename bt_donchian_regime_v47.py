@@ -478,7 +478,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             if pos.side == +1: long_unrealized += pos_unrealized
             else: short_unrealized += pos_unrealized
             if pos_unrealized < 0: open_losses += pos_unrealized
-        if open_losses <= current_threshold:
+        if (equity - prev_day_start_equity) <= current_threshold:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
@@ -491,7 +491,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                         positions_remaining.append(pos)
                         continue
                     pos_unrealized = pos.side * (candle_now['c'] - pos.entry) / pos.entry * pos.size_usd
-                    if pos.side == bad_side and pos_unrealized < 0:
+                    if pos_unrealized < 0:
                         exit_price_now = candle_now['c']
                         gross_now = pos.side * (exit_price_now - pos.entry) / pos.entry * pos.size_usd
                         comm_now = (COMM_TAKER + SLIPPAGE) * pos.size_usd * 2
@@ -623,7 +623,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         "day_stop_triggered": day_stop_triggered, "day_stop_events": day_stop_events,
         "partial_tp_count": partial_tp_count, "partial_tp_total_pnl": partial_tp_total_pnl,
         "consec_loss_days_max": consec_loss_days_max, "max_dd_peak_ts": max_dd_peak_ts,
-        "max_dd_trough_ts": max_dd_trough_ts, "max_dd_value": max_dd_value}
+        "max_dd_trough_ts": max_dd_trough_ts, "max_dd_value": max_dd_value})
 
 
 def validate(result, z=Z_SCORE):
