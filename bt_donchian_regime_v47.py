@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""bt_donchian_4h_v21.py - Donchian 4H v2.1 (cap=6 + 3 losers filter). RUN_BACKTEST=donchian_4h_v21"""
+"""bt_donchian_4h_v22.py - Donchian 4H v2.2 (Daily Stop fix: realized+unrealized). RUN_BACKTEST=donchian_4h_v22"""
 import os, sys, math, statistics, datetime as dt
 from collections import defaultdict
 try:
@@ -11,8 +11,8 @@ else:
     _BOT_IMPORT_ERR = None
 
 STRATEGY_NAME = "Donchian 4H"
-STRATEGY_VERSION = "v2.1-TEST"
-STRATEGY_FILE = "bt_donchian_4h_v21"
+STRATEGY_VERSION = "v2.2-TEST"
+STRATEGY_FILE = "bt_donchian_4h_v22"
 INIT_CAPITAL = 10_000.0
 RISK_FRACTION = 0.008
 SLOT_RISK_MIN = 80.0
@@ -21,7 +21,7 @@ MAX_POSITION_PCT = 0.20
 DD_BRAKE_THRESHOLD = 900.0
 DD_BRAKE_FACTOR = 0.4
 DD_BRAKE_RECOVERY = 0.85
-MAX_CONCURRENT = 9
+MAX_CONCURRENT = 10
 MAX_PER_SIDE_CAP = 6
 PER_SIDE_BUDGET = 2000
 MAX_NEW_PER_DAY = 10
@@ -347,6 +347,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     prev_day_start_equity = INIT_CAPITAL
     equity = INIT_CAPITAL
     new_today = 0
+    realized_today = 0.0
     for candle_idx, candle_ts in enumerate(all_candles):
         cal_day = candle_ts - (candle_ts % 86400)
         btc_r = btc_regime.get(cal_day, 0)
@@ -365,6 +366,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             prev_day_start_equity = equity
             day_loss_stop_active = False
             new_today = 0
+            realized_today = 0.0
         positions_before = len(positions)
         new_positions = []
         realized_this_candle = 0.0
@@ -432,6 +434,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             else:
                 new_positions.append(pos)
         positions = new_positions
+        realized_today += realized_this_candle
         unrealized = 0.0
         for pos in positions:
             c = by_pair_candle[pos.contract].get(candle_ts)
@@ -476,7 +479,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             if pos.side == +1: long_unrealized += pos_unrealized
             else: short_unrealized += pos_unrealized
             if pos_unrealized < 0: open_losses += pos_unrealized
-        if open_losses <= current_threshold:
+        if realized_today + open_losses <= current_threshold:
             if not day_loss_stop_active:
                 day_loss_stop_active = True
                 day_stop_triggered += 1
@@ -526,7 +529,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         if day_loss_stop_active: continue
         can_long = long_count < max_per_side and btc_r == +1
         can_short = short_count < max_per_side and btc_r == -1
-        # v2.1: фильтр «3 лузера» — если в сторону уже 3 убыточные, новых входов в эту сторону нет
         long_losers = 0
         short_losers = 0
         for pos in positions:
@@ -775,7 +777,7 @@ def format_report(result, val, n_pairs=None):
     lines = []
     lines.append(f"📊 *{STRATEGY_NAME} {STRATEGY_VERSION} - РЕЗУЛЬТАТЫ*  [{STRATEGY_FILE}]")
     lines.append("")
-    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing {ATR_STOP_MULT}xATR (по close) + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop + Cooldown + 3 лузера фильтр")
+    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing {ATR_STOP_MULT}xATR (по close) + Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{PARTIAL_TP_FRACTION*100:.0f}% + Compound + Daily stop (fixed) + Cooldown + 3 лузера фильтр")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs}  |  Excluded: {val['excluded_count']}")
     lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR} при DD>${DD_BRAKE_THRESHOLD:.0f})")
     lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap {MAX_PER_SIDE_CAP} ВКЛ, budget ${PER_SIDE_BUDGET}, фильтр {MAX_LOSERS_PER_SIDE} лузера) | Daily stop: ${DAILY_STOP_LOSS:.0f} / подряд ${DAILY_STOP_LOSS_CONSEC:.0f} | New/day: {MAX_NEW_PER_DAY}")
@@ -880,14 +882,14 @@ def format_report(result, val, n_pairs=None):
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v21 python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v22 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
     _PAIRS_USED = pairs
     start = os.environ.get("BT_START", BACKTEST_START_ISO)
     end = os.environ.get("BT_END", BACKTEST_END_ISO)
-    B.send_telegram(f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: {len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing по close, max {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}, фильтр {MAX_LOSERS_PER_SIDE} лузера), daily stop ${DAILY_STOP_LOSS:.0f}/${DAILY_STOP_LOSS_CONSEC:.0f}, окно {start} -> {end or 'сегодня'}")
+    B.send_telegram(f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: {len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing по close, max {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}, фильтр {MAX_LOSERS_PER_SIDE} лузера), daily stop ${DAILY_STOP_LOSS:.0f}/${DAILY_STOP_LOSS_CONSEC:.0f} (fixed), окно {start} -> {end or 'сегодня'}")
     result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
     val = validate(result)
     lines = format_report(result, val, n_pairs=len(pairs))
