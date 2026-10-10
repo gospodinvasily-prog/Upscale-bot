@@ -449,7 +449,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 if pos.entry_day_ts >= cal_day:
                     today_entry_realized += net
                 closed_trades.append({"contract": pos.contract, "side": pos.side, "entry": pos.entry,
-                    "exit": exit_price, "size_usd": pos.size_usd", "pnl": net, "reason": exit_reason,
+                    "exit": exit_price, "size_usd": pos.size_usd, "pnl": net, "reason": exit_reason,
                     "hold_days": pos.hold_days, "entry_day": pos.entry_day_ts, "exit_day": candle_ts,
                     "max_favorable": pos.max_favorable, "max_adverse": pos.max_adverse})
                 ps = pair_stats[pos.contract]
