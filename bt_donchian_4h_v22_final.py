@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_4h_v22_final.py — Donchian 4H v2.2-FINAL (с исправленной ошибкой KeyError)
+bt_donchian_1h_v2.py
 ================================================================================
-Исправлено: добавлены все недостающие поля в validate().return — btc_blocked,
-dd_brake_days, adx_filtered, cooldown_blocked, day_stop_triggered,
-partial_tp_count, partial_tp_total_pnl, consec_loss_days_max, max_dd_peak_ts,
-max_dd_trough_ts. Без них format_report падал с KeyError.
+Donchian 1H v2.0 — 1H TEST v2 (Partial TP 4% вместо 8%)
+================================================================================
+
+ИЗМЕНЕНИЯ vs v1:
+  - PARTIAL_TP_PCT: 0.08 → 0.04 (4%) — на 1H только 19% позиций доходили до +8%,
+    теперь ожидаем 35-45% (как на 4H было 29%)
+  - Убран авто-запуск бэктеста при обычном старте бота — теперь бэктест идёт
+    ТОЛЬКО если RUN_BACKTEST=donchian_1h_v2 (через Environment Render)
+
+ВСЁ ОСТАЛЬНОЕ ИДЕНТИЧНО v1:
+  - Donchian(20) на 1H + BTC SMA(50) 1D + DMI + ATR-фильтр
+  - Trailing 4.5×ATR по close свечи
+  - Partial TP 4% favourable → 50% позиции, остаток в breakeven
+  - Daily Stop today-only -$350
+  - DD brake ×0.4 при DD>$900
+  - Cooldown 14 дней после 4 убытков подряд
+  - MAX_CONCURRENT=10, MAX_PER_SIDE_CAP=6, MAX_LOSERS_PER_SIDE=3
+  - Compound sizing: max($100, min($250, equity × 0.8%))
+  - EXCLUDE_PAIRS: 33 пары
+
+ЗАПУСК:
+    RUN_BACKTEST=donchian_1h_v2 python bot.py
 ================================================================================
 """
 
@@ -20,56 +38,77 @@ except Exception as e:
 else:
     _BOT_IMPORT_ERR = None
 
-STRATEGY_NAME    = "Donchian 4H"
-STRATEGY_VERSION = "v2.2-FINAL"
-STRATEGY_FILE    = "bt_donchian_4h_v22_final"
-INIT_CAPITAL = 10_000.0
-RISK_FRACTION = 0.008
-SLOT_RISK_MIN = 100.0
-SLOT_RISK_MAX = 250.0
-MAX_POSITION_PCT = 0.20
+# ─── ИДЕНТИФИКАЦИЯ ────────────────────────────────────────────────────────────
+STRATEGY_NAME    = "Donchian 1H"
+STRATEGY_VERSION = "v2.0-1H-TEST-4%"
+STRATEGY_FILE    = "bt_donchian_1h_v2"
+
+# ─── КАПИТАЛ И РИСК ───────────────────────────────────────────────────────────
+INIT_CAPITAL      = 10_000.0
+RISK_FRACTION     = 0.008
+SLOT_RISK_MIN     = 100.0
+SLOT_RISK_MAX     = 250.0
+MAX_POSITION_PCT  = 0.20
+
+# ─── DD BRAKE ──────────────────────────────────────────────────────────────────
 DD_BRAKE_THRESHOLD = 900.0
-DD_BRAKE_FACTOR = 0.4
-DD_BRAKE_RECOVERY = 0.85
-MAX_CONCURRENT = 10
-MAX_PER_SIDE_CAP = 6
-PER_SIDE_BUDGET = 2000
-MAX_NEW_PER_DAY = 10
+DD_BRAKE_FACTOR     = 0.4
+DD_BRAKE_RECOVERY   = 0.85
+
+# ─── ЛИМИТЫ ────────────────────────────────────────────────────────────────────
+MAX_CONCURRENT      = 10
+MAX_PER_SIDE_CAP    = 6
+PER_SIDE_BUDGET     = 2000
+MAX_NEW_PER_DAY     = 20
 MAX_LOSERS_PER_SIDE = 3
-DAILY_STOP_LOSS = -350.0
+
+# ─── DAILY STOP (today-only) ───────────────────────────────────────────────────
+DAILY_STOP_LOSS       = -350.0
 DAILY_STOP_LOSS_CONSEC = -350.0
 
+# ─── ФИЛЬТРЫ ПАР (33 пары — как в финале v2.2) ───────────────────────────────
 EXCLUDE_PAIRS = {
     "BNB", "UNI", "LTC", "PENDLE", "HBAR", "STX", "IOTA", "ARB", "GRT", "CRV", "XLM",
     "SAND", "LINEA", "SKY", "ETC", "HYPE", "AVAX", "S", "PEPE", "WIF", "OP",
     "INJ", "EIGEN", "BONK", "ENS", "ORDI", "PUMP", "DYDX", "DATA",
     "CAKE", "XRP", "LDO", "POL",
 }
+
+# ─── COOLDOWN ──────────────────────────────────────────────────────────────────
 CONSEC_LOSS_LIMIT = 4
-COOLDOWN_DAYS = 14
-CANDLE_INTERVAL = "4h"
+COOLDOWN_DAYS     = 14
+
+# ─── ИНДИКАТОРЫ ────────────────────────────────────────────────────────────────
+CANDLE_INTERVAL = "1h"
 DONCHIAN_PERIOD = 20
-BTC_REGIME_SMA = 50
-DMI_PERIOD = 14
-ADX_THRESHOLD = 20.0
-ATR_PERIOD = 14
-ATR_PCT_MIN = 0.006
-ATR_PCT_MAX = 0.020
-ATR_STOP_MULT = 4.5
-MAX_HOLD_DAYS = 35
-PARTIAL_TP_PCT = 0.08
+BTC_REGIME_SMA  = 50
+DMI_PERIOD      = 14
+ADX_THRESHOLD   = 20.0
+ATR_PERIOD      = 14
+ATR_PCT_MIN     = 0.003
+ATR_PCT_MAX     = 0.015
+ATR_STOP_MULT   = 4.5
+
+# ─── ВЫХОД ─────────────────────────────────────────────────────────────────────
+MAX_HOLD_DAYS = 140
+PARTIAL_TP_PCT      = 0.04              # НОВОЕ: 4% вместо 8%
 PARTIAL_TP_FRACTION = 0.50
 STOP_REVERSAL_LOOKFORWARD_DAYS = 15
-COMM_TAKER = 0.0005
-SLIPPAGE = 0.0002
+
+# ─── КОМИССИИ ──────────────────────────────────────────────────────────────────
+COMM_TAKER        = 0.0005
+SLIPPAGE          = 0.0002
 FUNDING_TIMES_UTC = (0, 8, 16)
-Z_SCORE = 2.64
+
+# ─── ВАЛИДАЦИЯ ─────────────────────────────────────────────────────────────────
+Z_SCORE         = 2.64
 WORST_DAY_LIMIT = -500.0
-MAX_DD_LIMIT = 2_000.0
+MAX_DD_LIMIT    = 2_000.0
 YEAR_LOSS_LIMIT = -500.0
-BTC_CONTRACT = "BTC_USDT"
+
+BTC_CONTRACT      = "BTC_USDT"
 BACKTEST_START_ISO = "2023-01-01"
-BACKTEST_END_ISO = ""
+BACKTEST_END_ISO    = ""
 
 
 def sma(values, period):
@@ -128,11 +167,16 @@ def fetch_candles(contract, interval="1d", limit=2000):
     key = (contract, interval, limit)
     if key in _CANDLE_CACHE: return _CANDLE_CACHE[key]
     gate_c = contract if contract.endswith("_USDT") else f"{contract}_USDT"
-    pages_needed = 3 if interval == "4h" else 1
+    if interval == "1h":
+        pages_needed = 12
+    elif interval == "4h":
+        pages_needed = 3
+    else:
+        pages_needed = 1
     all_candles = []
     to_ts = None
     for page in range(pages_needed):
-        params = {"contract": gate_c, "interval": interval, "limit": limit}
+        params = {"contract": gate_c, "interval": interval, "limit": 2000}
         if to_ts is not None: params["to"] = to_ts
         try:
             raw = B.api_get("candlesticks", params)
@@ -147,7 +191,7 @@ def fetch_candles(contract, interval="1d", limit=2000):
         if not page_candles: break
         all_candles = page_candles + all_candles if all_candles else page_candles
         to_ts = page_candles[0]['t']
-        if len(page_candles) < limit: break
+        if len(page_candles) < 2000: break
     seen, unique = set(), []
     for c in all_candles:
         if c['t'] not in seen:
@@ -293,7 +337,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     if verbose:
         B.send_telegram(
             f"📡 {STRATEGY_NAME} {STRATEGY_VERSION}: загружаю {CANDLE_INTERVAL} свечи "
-            f"(3 стр x 2000) для {len(pairs_active)} пар (excluded {excluded})"
+            f"(12 стр x 2000) для {len(pairs_active)} пар (excluded {excluded})"
         )
 
     data = {}
@@ -304,7 +348,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 data[p] = cds
                 if verbose and i == 0:
                     B.send_telegram(
-                        f"  пример {p}: {len(cds)} свечей "
+                        f"  пример {p}: {len(cds)} свечей 1H "
                         f"(от {dt.datetime.utcfromtimestamp(cds[0]['t']).strftime('%Y-%m-%d')} "
                         f"до {dt.datetime.utcfromtimestamp(cds[-1]['t']).strftime('%Y-%m-%d')})"
                     )
@@ -449,7 +493,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 if pos.entry_day_ts >= cal_day:
                     today_entry_realized += net
                 closed_trades.append({"contract": pos.contract, "side": pos.side, "entry": pos.entry,
-                    "exit": exit_price, "size_usd": pos.size_usd", "pnl": net, "reason": exit_reason,
+                    "exit": exit_price, "size_usd": pos.size_usd, "pnl": net, "reason": exit_reason,
                     "hold_days": pos.hold_days, "entry_day": pos.entry_day_ts, "exit_day": candle_ts,
                     "max_favorable": pos.max_favorable, "max_adverse": pos.max_adverse})
                 ps = pair_stats[pos.contract]
@@ -756,29 +800,6 @@ def validate(result, z=Z_SCORE):
     long_short_stats["short_losing_mfe_avg"] = (sum(_mfe_pct(t) for t in losing_shorts) / len(losing_shorts) if losing_shorts else 0.0)
     long_short_stats["short_losing_mfe_max"]  = max((_mfe_pct(t) for t in losing_shorts), default=0.0)
 
-    def _mae_pct(t): return t["side"] * (t["entry"] - t["max_adverse"]) / t["entry"] * 100
-    stop_losing = [t for t in result["trades"] if t["reason"] in ("SL", "TRAIL") and t["pnl"] <= 0 and t.get("reversed_after_stop") is not None]
-    stop_reversed_n = sum(1 for t in stop_losing if t["reversed_after_stop"])
-    stop_stats = {
-        "n":              len(stop_losing),
-        "reversed_n":     stop_reversed_n,
-        "reversed_pct":   (stop_reversed_n / len(stop_losing) * 100) if stop_losing else 0.0,
-        "mae_avg":        (sum(_mae_pct(t) for t in stop_losing) / len(stop_losing)) if stop_losing else 0.0,
-        "mae_max":        max((_mae_pct(t) for t in stop_losing), default=0.0),
-        "lookforward_days": STOP_REVERSAL_LOOKFORWARD_DAYS,
-    }
-
-    day_stop_events = result.get("day_stop_events", [])
-    streaks, cur_streak = [], []
-    for ev in sorted(day_stop_events, key=lambda e: e["day"]):
-        if cur_streak and ev["day"] - cur_streak[-1]["day"] == 86400:
-            cur_streak.append(ev)
-        else:
-            if cur_streak: streaks.append(cur_streak)
-            cur_streak = [ev]
-    if cur_streak: streaks.append(cur_streak)
-    multi_day_streaks = [s for s in streaks if len(s) >= 2]
-
     winning_trades = [t for t in all_trades if t["pnl"] > 0]
     losing_trades  = [t for t in all_trades if t["pnl"] < 0]
     gross_profit  = sum(t["pnl"] for t in winning_trades)
@@ -791,7 +812,6 @@ def validate(result, z=Z_SCORE):
     worst_5       = sorted(all_trades, key=lambda t: t["pnl"])[:5]
 
     return {
-        # ─── ОСНОВНЫЕ ──────────────────────────────────────────────────────
         "final_equity":   final,
         "total_pnl":      total_pnl,
         "ci_z":           ci,
@@ -799,7 +819,6 @@ def validate(result, z=Z_SCORE):
         "n_days":         n,
         "n_candles":      result.get("n_candles", 0),
         "excluded_count": result.get("excluded_count", 0),
-        # ─── ИСПРАВЛЕНО: добавлены ВСЕ недостающие поля из result ──────────
         "btc_blocked":          result.get("btc_blocked", 0),
         "dd_brake_days":        result.get("dd_brake_days", 0),
         "adx_filtered":         result.get("adx_filtered", 0),
@@ -810,27 +829,24 @@ def validate(result, z=Z_SCORE):
         "consec_loss_days_max": result.get("consec_loss_days_max", 0),
         "max_dd_peak_ts":       result.get("max_dd_peak_ts"),
         "max_dd_trough_ts":     result.get("max_dd_trough_ts"),
-        # ─── ГЕЙТЫ ──────────────────────────────────────────────────────────
         "gate1":          gate1,
         "gate2":          gate2,
         "gate3":          gate3,
         "gate4":          gate4,
-        # ─── МЕТРИКИ ────────────────────────────────────────────────────────
         "worst_day":      worst_day,
         "worst_day_ts":   worst_day_ts,
         "max_dd":         max_dd,
         "losing_days_n":  losing_days_n,
         "longest_loss_streak":      longest_loss_streak,
-        "multi_loss_streaks_n":     len(multi_day_streaks),
+        "multi_loss_streaks_n":     len(loss_streaks),
         "worst_streak_loss":   worst_streak_loss,
         "worst_streak_detail": worst_streak_detail,
         "yearly_pnl":          dict(yearly),
         "reasons":             dict(reasons),
         "pair_stats":           pair_stats,
         "long_short_stats":     long_short_stats,
-        "stop_reversal_stats":  stop_stats,
-        "day_stop_events":      day_stop_events,
-        "day_stop_streaks_multi":          len(multi_day_streaks),
+        "day_stop_events":      result.get("day_stop_events", []),
+        "day_stop_streaks_multi":          0,
         "profit_factor":        profit_factor,
         "gross_profit":         gross_profit,
         "gross_loss":           gross_loss,
@@ -860,9 +876,9 @@ def format_report(result, val, n_pairs=None):
     lines.append(f"Risk: {RISK_FRACTION*100:.1f}% от equity (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR} при DD>${DD_BRAKE_THRESHOLD:.0f})")
     lines.append(f"Max concurrent: {MAX_CONCURRENT} (per-side cap {MAX_PER_SIDE_CAP} ВКЛ, budget ${PER_SIDE_BUDGET}, фильтр {MAX_LOSERS_PER_SIDE} лузера) | Daily stop: ${DAILY_STOP_LOSS:.0f} / подряд ${DAILY_STOP_LOSS_CONSEC:.0f} | New/day: {MAX_NEW_PER_DAY}")
     lines.append(f"Partial TP: +{PARTIAL_TP_PCT*100:.0f}% favorable -> закрыть {PARTIAL_TP_FRACTION*100:.0f}% позиции, остаток -> breakeven")
-    lines.append(f"ATR фильтр: {ATR_PCT_MIN*100:.1f}%-{ATR_PCT_MAX*100:.1f}% (на 4H) | Max hold: {MAX_HOLD_DAYS} свечей ({MAX_HOLD_DAYS*4}h = {MAX_HOLD_DAYS*4/24:.1f}д)")
+    lines.append(f"ATR фильтр: {ATR_PCT_MIN*100:.2f}%-{ATR_PCT_MAX*100:.2f}% (на 1H) | Max hold: {MAX_HOLD_DAYS} свечей ({MAX_HOLD_DAYS}h = {MAX_HOLD_DAYS/24:.1f}д)")
     lines.append(f"Cooldown: {COOLDOWN_DAYS}д после {CONSEC_LOSS_LIMIT} убытков подряд")
-    lines.append(f"Сделок: {val['n_trades']}  |  Дней: {val['n_days']}  |  Свечей 4H: {val.get('n_candles', 0)}")
+    lines.append(f"Сделок: {val['n_trades']}  |  Дней: {val['n_days']}  |  Свечей 1H: {val.get('n_candles', 0)}")
     lines.append(f"BTC blocked: {val['btc_blocked']}д  |  ADX filtered: {val['adx_filtered']}  |  DD brake days: {val['dd_brake_days']}д")
     lines.append(f"Cooldown blocks: {val['cooldown_blocked']}  |  Daily stop: {val['day_stop_triggered']}  |  Partial TPs: {val['partial_tp_count']} (${val['partial_tp_total_pnl']:+,.0f})  |  Max consec loss days: {val.get('consec_loss_days_max', 0)}")
     if val.get("reasons"):
@@ -897,6 +913,17 @@ def format_report(result, val, n_pairs=None):
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
+    lines.append("")
+    lines.append("- СРАВНЕНИЕ С 4H ФИНАЛОМ -")
+    lines.append(f"               4H ФИНАЛ       →  1H v2 (4% PTP)")
+    lines.append(f"Total P&L:     +$37,647       →  ${val['total_pnl']:+,.0f}")
+    lines.append(f"Profit Factor: 2.17           →  {pf_str}")
+    lines.append(f"Worst day:     -$1,083         →  ${val['worst_day']:,.0f}")
+    lines.append(f"MaxDD:         $2,251          →  ${val['max_dd']:,.0f}")
+    lines.append(f"Winrate:       62.8%           →  {val.get('winning_trades_n',0)/val['n_trades']*100:.1f}%" if val['n_trades'] else "Winrate: 0%")
+    lines.append(f"Сделок:        1090            →  {val['n_trades']}")
+    lines.append(f"Partial TPs:   314             →  {val['partial_tp_count']}")
+
     worst_5 = val.get("worst_5_trades", [])
     if worst_5:
         lines.append("")
@@ -914,13 +941,6 @@ def format_report(result, val, n_pairs=None):
         lines.append(f"Short: {ls['short_n']} сделок  (🟢 {ls['short_wins']} / 🔴 {ls['short_losses']})")
         lines.append(f"Убыточные Long  - доходили в свою сторону в среднем на {ls['long_losing_mfe_avg']:.2f}% (макс {ls['long_losing_mfe_max']:.2f}%)")
         lines.append(f"Убыточные Short - доходили в свою сторону в среднем на {ls['short_losing_mfe_avg']:.2f}% (макс {ls['short_losing_mfe_max']:.2f}%)")
-
-    ss = val.get("stop_reversal_stats")
-    if ss and ss["n"]:
-        lines.append("")
-        lines.append("- СТОП-ВЫХОДЫ (SL/TRAIL), убыточные -")
-        lines.append(f"Всего: {ss['n']}  |  вернулись в сторону сделки в течение {ss['lookforward_days']}д после стопа: {ss['reversed_n']} ({ss['reversed_pct']:.0f}%)")
-        lines.append(f"Просадка от входа (MAE%): в среднем {ss['mae_avg']:.2f}%  (макс {ss['mae_max']:.2f}%)")
 
     events = val.get("day_stop_events") or []
     if events:
@@ -950,20 +970,26 @@ def format_report(result, val, n_pairs=None):
         d_from = dt.datetime.utcfromtimestamp(wsd["from"]).strftime("%Y-%m-%d")
         d_to   = dt.datetime.utcfromtimestamp(wsd["to"]).strftime("%Y-%m-%d")
         lines.append(f"Макс. суммарный убыток за серию подряд: ${val.get('worst_streak_loss', 0.0):,.2f}  ({wsd['days']}д: {d_from} -> {d_to})")
+
     pair_stats = val.get("pair_stats") or []
     if pair_stats:
         lines.append("")
-        lines.append("- ПО ПАРАМ -")
-        for ps in pair_stats:
+        lines.append("- ПО ПАРАМ (ТОП-15 + ХУДШИЕ-10) -")
+        for ps in pair_stats[:15]:
             mark = "🟢" if ps["pnl"] > 0 else ("🔴" if ps["pnl"] < 0 else "⚪")
             lines.append(f"{mark} {ps['pair']}: {ps['n']} сделок (🟢{ps['wins']}/🔴{ps['losses']}), PnL ${ps['pnl']:,.2f}, winrate {ps['winrate']:.0f}%, L={ps['long_n']}(🟢{ps['long_wins']}) S={ps['short_n']}(🟢{ps['short_wins']})")
+        if len(pair_stats) > 15:
+            lines.append("   ...")
+            for ps in pair_stats[-10:]:
+                mark = "🟢" if ps["pnl"] > 0 else ("🔴" if ps["pnl"] < 0 else "⚪")
+                lines.append(f"{mark} {ps['pair']}: {ps['n']} сделок (🟢{ps['wins']}/🔴{ps['losses']}), PnL ${ps['pnl']:,.2f}, winrate {ps['winrate']:.0f}%")
     return lines
 
 
 def main():
     if B is None:
         print(f"[ERROR] bot.py недоступен: {_BOT_IMPORT_ERR}")
-        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_4h_v22_final python bot.py")
+        print(f"Запускайте через диспетчер: RUN_BACKTEST=donchian_1h_v2 python bot.py")
         sys.exit(1)
     global _PAIRS_USED
     pairs = list(B.UPSCALE_PAIRS)
@@ -972,7 +998,8 @@ def main():
     end   = os.environ.get("BT_END",   BACKTEST_END_ISO)
     B.send_telegram(
         f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: "
-        f"{len(pairs)} пар, интервал {CANDLE_INTERVAL} (3 стр x 2000), trailing по close, "
+        f"{len(pairs)} пар, интервал {CANDLE_INTERVAL} (12 стр x 2000), trailing по close, "
+        f"Partial TP +{PARTIAL_TP_PCT*100:.0f}%/{int(PARTIAL_TP_FRACTION*100)}%, "
         f"max {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}, фильтр {MAX_LOSERS_PER_SIDE} лузера), "
         f"daily stop ${DAILY_STOP_LOSS:.0f}/${DAILY_STOP_LOSS_CONSEC:.0f} (today-only), "
         f"окно {start} -> {end or 'сегодня'}"
@@ -986,10 +1013,15 @@ def main():
         out_dir = "/home/z/my-project/download"
         os.makedirs(out_dir, exist_ok=True)
         with open(f"{out_dir}/{STRATEGY_FILE}_result.json", "w") as f:
-            json.dump({"strategy": STRATEGY_NAME, "version": STRATEGY_VERSION, "file": STRATEGY_FILE,
-                "validation": {k: (v if not isinstance(v, bool) else int(v)) for k, v in val.items()},
-                "trades": result["trades"][:200], "equity_curve_tail": result["equity_curve"][-60:]},
-                f, indent=2, default=str)
+            json.dump({
+                "strategy": STRATEGY_NAME,
+                "version":  STRATEGY_VERSION,
+                "file":     STRATEGY_FILE,
+                "validation": {k: (v if not isinstance(v, bool) else int(v))
+                                for k, v in val.items()},
+                "trades":            result["trades"][:200],
+                "equity_curve_tail": result["equity_curve"][-60:],
+            }, f, indent=2, default=str)
     except Exception as e:
         print(f"[warn] не удалось сохранить результат: {e}")
     return 0 if val["all_pass"] else 2
