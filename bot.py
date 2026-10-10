@@ -1,22 +1,39 @@
 
 
 """
-Бот v11.0 — автоматическая торговля стратегией Donchian Regime v4.4 на Upscale.
+Бот v12.0 — автоматическая торговля стратегией Donchian 4H v2.2 на Upscale.
 
-Старая воронка ЗАРЯД → ПРОБОЙ → ИМПУЛЬС → УКЛОН (ручной дискреционный вход по
-сигналам в Telegram) полностью убрана — она давала минус на демо-счету.
-Теперь единственная стратегия — donchian_regime_v42 (exec_donchian_regime_v42.py):
-полностью автоматическая, без ручных команд входа/выхода.
+Единственная стратегия — donchian_4h_v22 (exec_donchian_4h_v22.py):
+полностью автоматическая, без ручных команд входа/выхода. Логика идентична
+бэктесту bt_donchian_4h_v22_final.py:
+  - Donchian(20) на 4H-свечах (6 сканов в сутки)
+  - BTC SMA(50) режим на 1D
+  - DMI + ATR фильтр 0.6%–2.0%
+  - Trailing 4.5×ATR по CLOSE свечи (не по high/low)
+  - Partial TP +8% favourable → закрыть 50% позиции, остаток в breakeven
+  - Daily Stop today-only -$350 (закрывает только сегодня-открытые убыточные,
+    старые позиции НЕ трогает)
+  - MAX_LOSERS_PER_SIDE=3 (не открываем новые в сторону, где 3+ убыточные)
+  - Cooldown 14 дней после 4 убытков подряд по паре
+  - Compound sizing: max($100, min($250, equity × 0.8%))
+  - DD brake ×0.4 при DD > $900 (восстановление при 85% от пика)
+
+Два независимых контура защиты:
+  1. Контур стратегии (exec_donchian_4h_v22.py): DAILY_STOP_LOSS = -$350 today-only
+  2. Контур Upscale (upscale_exec.py watchdog):
+     DAY_HARD_FRAC=0.8 → $400 при $10k (close-all + halt до 00:00 UTC)
+     TOT_HARD_FRAC=0.8 → $800 при $10k (close-all + halt + ручной /resume)
 
 Что делает этот файл:
   - инфраструктура: Gate.io REST API, Telegram, CSV-журнал авто-слоя
   - EXECUTOR (upscale_exec.py) — реальное исполнение ордеров на Upscale (demo/dry)
-  - раз в сутки (после закрытия дневной свечи UTC) запускает
-    exec_donchian_regime_v42.check_signals() — сканирует пары, шлёт сигналы в EXECUTOR
-  - команды в чате: /up /btc /hist /risk /riskraw /uptest /closeall /halt /resume /log /help
+  - каждые 4 часа (после закрытия 4H-свечи UTC + 5 мин буфер) запускает
+    exec_donchian_4h_v22.check_signals() — сканирует пары, шлёт сигналы в EXECUTOR
+  - команды в чате: /up /btc /hist /risk /riskraw /uptest /closeall /halt
+                    /resume /log /scan /state /trail /daily /help
   - диспетчер бэктестов: RUN_BACKTEST=<mode> запускает соответствующий bt_*.py один раз
 
-Зависимости: requests, upscale_exec.py, exec_donchian_regime_v42.py.
+Зависимости: requests, upscale_exec.py, exec_donchian_4h_v22.py.
 Переменные окружения: TELEGRAM_TOKEN, LOG_DIR (необязательно).
 """
 
@@ -32,14 +49,14 @@ import traceback
 import json
 import requests
 import upscale_exec
-import exec_donchian_regime_v42 as DR42
+import exec_donchian_4h_v22 as DR42
 from datetime import datetime, timezone, timedelta
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v11.0"
+BOT_VERSION    = "v12.0"
 
 MSK = timezone(timedelta(hours=3))
 
@@ -47,7 +64,7 @@ GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 
 # ── Риск по умолчанию для EXECUTOR (donchian передаёт свой риск в каждом
 # сигнале — compound sizing от текущего equity Upscale, см.
-# exec_donchian_regime_v42.py — эти значения остаются только как запасной
+# exec_donchian_4h_v22.py — эти значения остаются только как запасной
 # дефолт конструктора Executor, реально по ним торговли не бывает) ──
 RISK_USD      = float(os.environ.get("RISK_USD", "20"))
 MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "3000"))
@@ -57,11 +74,14 @@ MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "3000"))
 BTC_VWAP_MARGIN_PCT = float(os.environ.get("BTC_VWAP_MARGIN_PCT", "0.2"))
 VWAP_WINDOW_BARS    = 97      # ≈ сутки 15м свечей
 
-# ── Когда запускать скан сигналов donchian (раз в сутки, после закрытия
-# дневной свечи Gate.io по UTC). Небольшой буфер, чтобы свеча точно закрылась
-# и успела обновиться. ──
-DR42_CHECK_HOUR_UTC = int(os.environ.get("DR42_CHECK_HOUR_UTC", "0"))
-DR42_CHECK_MIN_UTC  = int(os.environ.get("DR42_CHECK_MIN_UTC", "10"))
+# ── Расписание скана donchian_4h_v22: 4H свечи закрываются в 00:00, 04:00,
+# 08:00, 12:00, 16:00, 20:00 UTC. Буфер SCAN_BUFFER_SEC (300 = 5 мин) даёт
+# свече зафиксироваться на стороне Gate.io. Скан запускается ОДИН РАЗ на
+# каждую закрытую 4H-свечу — метка последнего скан-таймстампа лежит в файле,
+# чтобы при рестарте Render не отработать повторно за ту же свечу. ──
+SCAN_INTERVAL_SEC = 4 * 3600                  # 4H = 14400 сек
+SCAN_BUFFER_SEC    = int(os.environ.get("DR42_SCAN_BUFFER_SEC", "300"))
+SCAN_MARK_FILE     = os.path.join(os.environ.get("LOG_DIR", "."), "donchian_4h_last_scan.txt")
 
 # ── Сеть ──
 API_RATE_PER_SEC = 12      # общий лимит запросов к Gate (с запасом к публичному лимиту)
@@ -397,20 +417,27 @@ HELP_TEXT = (
     "<b>📊 СТАТИСТИКА С БИРЖИ</b>\n"
     "/hist — результаты закрытых сделок: по дням, по монетам, в единицах риска\n"
     "        <i>/hist 30 — за 30 дней (по умолчанию 7). Эти данные не теряются при перезапуске</i>\n"
-    "/up — версия, режим, эквити, открытые позиции, статус donchian_regime_v42\n"
-    "/risk — баланс, просадка, до лимитов\n"
+    "/up — версия, режим, эквити, открытые позиции, статус donchian_4h_v22\n"
+    "/risk — баланс, просадка, до лимитов Upscale\n"
     "/riskraw — то же сырым ответом API (для разбора проблем)\n"
     "/btc — уклон биткоина по VWAP (справочно; стратегия сама считает режим по SMA(50))\n"
     "\n<b>⚙️ УПРАВЛЕНИЕ</b>\n"
     "/halt — пауза: новых входов не будет, открытые позиции и их ордера остаются\n"
-    "/resume — снять паузу\n"
+    "/resume — снять паузу (включая сброс аварийки TOTAL)\n"
     "/closeall — закрыть все позиции на демо\n"
     "/uptest — тест связи: открыть и сразу закрыть BTC на демо\n"
+    "\n<b>🔬 СТРАТЕГИЯ donchian_4h_v22</b>\n"
+    "/scan — ручной запуск скана (не ждать следующей 4H-свечи)\n"
+    "/state — состояние: cooldown, today_realized, day_loss_stop, prev_day_pnl\n"
+    "/trail — текущие trailing-стопы всех открытых donchian-позиций\n"
+    "/daily — P&L дня (сегодня, вчера) с разбивкой по причинам выхода\n"
     "\n<b>📒 ЖУРНАЛЫ</b>\n"
-    "/log — прислать журнал авто-слоя прямо сейчас\n"
-    "\nСтратегия: <b>donchian_regime_v42</b> — полностью автоматическая, без "
-    "ручных команд входа/выхода. Сканирует раз в сутки после закрытия дневной "
-    f"свечи (~{DR42_CHECK_HOUR_UTC:02d}:{DR42_CHECK_MIN_UTC:02d} UTC).")
+    "/log — прислать журнал авто-слоя (CSV) прямо сейчас — только по вызову\n"
+    "\nСтратегия: <b>donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая. "
+    "Сканирует каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, "
+    "16:05, 20:05 UTC). Два контура защиты: стратегийный -$350 today-only + Upscale "
+    "аварийка $400/$800 (close-all + halt)."
+)
 
 def handle_command(text: str) -> str:
     parts = text.replace(",", ".").split()
@@ -439,6 +466,21 @@ def handle_command(text: str) -> str:
         return EXECUTOR.halt()
     if cmd == "/resume":
         return EXECUTOR.resume()
+    if cmd == "/scan":
+        # Ручной запуск скана в отдельном потоке, чтобы команда ответила быстро
+        def _run_scan():
+            try:
+                DR42.check_signals()
+            except Exception as e:
+                send_telegram(f"⚠️ /scan ошибка: {esc(str(e))}")
+        threading.Thread(target=_run_scan, daemon=True, name="manual-scan").start()
+        return "🔍 Запускаю ручной скан donchian_4h_v22 — результат будет в чате."
+    if cmd == "/state":
+        return DR42.state_report()
+    if cmd == "/trail":
+        return DR42.trail_report()
+    if cmd == "/daily":
+        return DR42.daily_report()
     if cmd in ("/log", "/files", "/journal"):
         today = datetime.now(MSK).strftime("%Y-%m-%d")
         sent = 0
@@ -493,7 +535,8 @@ def main():
     # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
     bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
     print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
-          ("DONCHIAN REGIME v4.7 (bt_donchian_regime_v47.py)" if bt_mode in ("donchian_regime_v47", "30")
+          ("DONCHIAN 4H v2.2 FINAL (bt_donchian_4h_v22_final.py)" if bt_mode in ("donchian_4h_v22", "31")
+           else "DONCHIAN REGIME v4.7 (bt_donchian_regime_v47.py)" if bt_mode in ("donchian_regime_v47", "30")
            else "DONCHIAN REGIME v4.6 (bt_donchian_regime_v46.py)" if bt_mode in ("donchian_regime_v46", "29")
            else "DONCHIAN REGIME v4.5 (bt_donchian_regime_v45.py)" if bt_mode in ("donchian_regime_v45", "28")
            else "DONCHIAN REGIME v4.4, 60д (bt_donchian_regime_v44_60d.py)" if bt_mode in ("donchian_regime_v44_60d", "27")
@@ -524,7 +567,7 @@ def main():
            else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
            else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
            else "не запускаю"))
-    if bt_mode in ("1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "breakout", "18", "draft", "19", "draft3", "20", "multiregime_all", "21", "daily_trend", "22", "donchian_regime", "23", "donchian_regime_v41", "24", "donchian_regime_v42", "25", "donchian_regime_v44", "26", "donchian_regime_v44_60d", "27", "donchian_regime_v45", "28", "donchian_regime_v46", "29", "donchian_regime_v47", "30"):
+    if bt_mode in ("donchian_4h_v22", "31", "1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "breakout", "18", "draft", "19", "draft3", "20", "multiregime_all", "21", "daily_trend", "22", "donchian_regime", "23", "donchian_regime_v41", "24", "donchian_regime_v42", "25", "donchian_regime_v44", "26", "donchian_regime_v44_60d", "27", "donchian_regime_v45", "28", "donchian_regime_v46", "29", "donchian_regime_v47", "30"):
         # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
         # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
         mark = os.path.join(LOG_DIR, "backtest_done.txt")
@@ -546,7 +589,10 @@ def main():
             except Exception:
                 pass
             try:
-                if bt_mode in ("donchian_regime_v47", "30"):
+                if bt_mode in ("donchian_4h_v22", "31"):
+                    import bt_donchian_4h_v22_final
+                    bt_donchian_4h_v22_final.main()  # Donchian(20) на 4H + BTC SMA(50) + DMI + ATR + trailing по close + Partial TP +8%/50% + Daily Stop today-only -$350
+                elif bt_mode in ("donchian_regime_v47", "30"):
                     import bt_donchian_regime_v47
                     bt_donchian_regime_v47.main()  # v4.5 + Partial TP +5%/50% + breakeven (без sideways-фильтра v4.6)
                 elif bt_mode in ("donchian_regime_v46", "29"):
@@ -648,25 +694,26 @@ def main():
         f"🚀 <b>Upscale Bot {BOT_VERSION}</b> | режим: <b>{EXECUTOR.mode}</b>"
         + {"dry": " (только сообщения)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""),
         "",
-        "📐 <b>Стратегия: donchian_regime_v42 (логика v4.4)</b> — полностью автоматическая",
-        "   Donchian(20) пробой + BTC SMA(50) режим + DMI + ATR-фильтр",
-        "   Compound sizing: риск 0.8% equity (старт $80, макс $200), DD-brake ×0.5 при DD > $1200",
+        "📐 <b>Стратегия: donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая",
+        "   Donchian(20) на 4H + BTC SMA(50) 1D + DMI + ATR-фильтр 0.6%-2.0%",
+        "   Compound sizing: риск 0.8% equity (старт $100, макс $250), DD-brake ×0.4 при DD > $900",
         "   Вход с плечом (EXEC_LEVERAGE, по умолчанию 5×)",
-        f"   Выход: trailing-стоп 2×ATR / разворот Donchian / {DR42.MAX_HOLD_DAYS}д (без TP) | "
-        f"Лимит в сторону: ${DR42.SAME_SIDE_RISK_ANCHOR_USD:.0f}/риск (до {DR42.MAX_SAME_SIDE_CEILING}, "
-        f"итого до {DR42.MAX_CONCURRENT_CEILING}) | новых в день: {DR42.MAX_NEW_PER_DAY}",
-        f"   Дневной стоп: убыток дня ≥ ${abs(DR42.DAILY_STOP_LOSS):.0f} → новых входов нет до завтра (UTC)",
+        f"   Выход: trailing-стоп 4.5×ATR по CLOSE / разворот Donchian / {DR42.MAX_HOLD_DAYS} свечей 4H (без TP) | "
+        f"Partial TP +{int(DR42.PARTIAL_TP_PCT*100)}% favourable → закрыть {int(DR42.PARTIAL_TP_FRACTION*100)}% позиции, остаток в breakeven",
+        f"   Лимит: {DR42.MAX_CONCURRENT} одновременно (до {DR42.MAX_PER_SIDE_CAP} в сторону) | "
+        f"новых в день: {DR42.MAX_NEW_PER_DAY} | фильтр: {DR42.MAX_LOSERS_PER_SIDE} лузера в сторону",
+        f"   Daily Stop today-only: -$350 (закрывает только сегодня-открытые убыточные)",
         f"   Cooldown: {DR42.CONSEC_LOSS_LIMIT} убытка подряд → блок {DR42.COOLDOWN_DAYS} дней",
         f"   Exclude: {sorted(DR42.EXCLUDE_PAIRS)}",
-        f"   Скан раз в сутки, ~{DR42_CHECK_HOUR_UTC:02d}:{DR42_CHECK_MIN_UTC:02d} UTC",
-        "   Аварийный стоп (счёт целиком): дневной убыток ≥90% дневного лимита → закрыть всё, пауза до след. дня UTC",
+        f"   Скан каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, 16:05, 20:05 UTC)",
+        "   Аварийка Upscale (контур Upscale, отдельный от -$350): дневной $400 / общий $800 при $10k → close-all + halt",
         "",
     ]
     if EXCLUDE_SYMBOLS:
         start_lines.append(f"🚫 Не торгуем (глобально): {', '.join(sorted(EXCLUDE_SYMBOLS))}")
     start_lines += [
         f"📊 Пар: {len(UPSCALE_PAIRS)}",
-        "💬 /help — все команды | /up статус | /halt пауза",
+        "💬 /help — все команды | /up статус | /halt пауза | /scan ручной скан | /state состояние",
     ]
     send_telegram("\n".join(start_lines))
 
@@ -688,42 +735,51 @@ def main():
             time.sleep(2)
     threading.Thread(target=_command_loop, daemon=True, name="tg-commands").start()
 
-    # Дата последнего скана DR42 — ПЕРСИСТЕНТНО на диске (тот же паттерн, что
-    # и у backtest_done.txt выше). Без этого: Render перезапустит контейнер
-    # (деплой/OOM/сбой) после времени скана в тот же день → last_dr42_date
-    # в памяти сотрётся → check_signals() выполнится повторно за те же сутки,
-    # и может открыть больше входов, чем задумано MAX_NEW_PER_DAY (если часть
-    # утренних позиций уже закрылась стопом к моменту рестарта).
-    dr42_mark = os.path.join(LOG_DIR, "dr42_scan_date.txt")
+    # ── 4H-расписание скана: метка — это TS последней закрытой 4H-свечи,
+    # по которой уже отработал скан. Хранится в файле SCAN_MARK_FILE, чтобы
+    # пережить рестарт Render. Алгоритм:
+    #   1. Текущая закрытая 4H-свеча: last_4h_ts = (now // 4h) * 4h
+    #   2. Скан можно запустить, если now >= last_4h_ts + SCAN_BUFFER_SEC
+    #      (свеча точно зафиксировалась на Gate)
+    #   3. Если last_scanned_4h_ts < last_4h_ts и время пришло — запускаем
+    #      скан, сохраняем last_4h_ts в файл.
+    # Таким образом, даже если бот был остановлен 8 часов и пропустил 2 свечи,
+    # при старте он отработает только ОДИН скан (по последней закрытой свече) —
+    # не пытается "наверстать" пропущенные, потому что сигналы уже устарели.
     try:
-        with open(dr42_mark, encoding="utf-8") as f:
-            last_dr42_date = f.read().strip()
+        with open(SCAN_MARK_FILE, encoding="utf-8") as f:
+            last_scanned_4h_ts = int(f.read().strip() or "0")
     except Exception:
-        last_dr42_date = None
+        last_scanned_4h_ts = 0
+    print(f"[DR42] старт: last_scanned_4h_ts={last_scanned_4h_ts} ({datetime.fromtimestamp(last_scanned_4h_ts, timezone.utc).isoformat() if last_scanned_4h_ts else 'never'})")
 
     while True:
         try:
-            now_utc = datetime.now(timezone.utc)
-            today_utc = now_utc.strftime("%Y-%m-%d")
-            if ((now_utc.hour, now_utc.minute) >= (DR42_CHECK_HOUR_UTC, DR42_CHECK_MIN_UTC)
-                    and last_dr42_date != today_utc):
-                last_dr42_date = today_utc
+            now = time.time()
+            last_4h_ts = (int(now) // SCAN_INTERVAL_SEC) * SCAN_INTERVAL_SEC
+            # Если с момента закрытия 4H-свечи прошло >= SCAN_BUFFER_SEC и
+            # эту свечу мы ещё не сканировали — запускаем.
+            if (now >= last_4h_ts + SCAN_BUFFER_SEC
+                    and last_scanned_4h_ts < last_4h_ts):
+                last_scanned_4h_ts = last_4h_ts
                 try:
-                    with open(dr42_mark, "w", encoding="utf-8") as f:
-                        f.write(today_utc)
+                    with open(SCAN_MARK_FILE, "w", encoding="utf-8") as f:
+                        f.write(str(last_4h_ts))
                 except Exception as e:
                     print(f"[DR42] не удалось сохранить метку скана: {e}")
+                candle_str = datetime.fromtimestamp(last_4h_ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                print(f"[DR42] запуск скана по свече {candle_str}")
                 try:
                     DR42.check_signals()
                 except Exception as e:
                     print(f"[DR42 ERROR] {e}")
                     traceback.print_exc()
-                    send_telegram(f"⚠️ donchian_regime_v42: ошибка скана — {esc(str(e))}")
+                    send_telegram(f"⚠️ donchian_4h_v22: ошибка скана — {esc(str(e))}")
 
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
             traceback.print_exc()
-        time.sleep(2)
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()

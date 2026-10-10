@@ -58,11 +58,14 @@ MAX_OPEN      = int(os.environ.get("EXEC_MAX_OPEN", "0"))       # 0 = без л�
 MAX_SAME_SIDE_OPEN = int(os.environ.get("EXEC_MAX_SAME_SIDE", "3"))
 API_TIMEOUT   = float(os.environ.get("EXEC_API_TIMEOUT", "20"))   # сек на запрос к Upscale
 MAX_TRADES_DAY = int(os.environ.get("EXEC_MAX_TRADES_DAY", "0"))  # 0 = без лимита, ориентир только на риск
-# Защита по просадке — доли от лимитов счёта (при 5%/10%: стоп входов 3%/6%, аварийное закрытие 4%/7%)
+# Защита по просадке — доли от лимитов счёта (при 5%/10% на $10k: стоп входов $300/$600,
+# аварийное закрытие $400/$800 = 80% от лимитов). Контур Upscale, ОТДЕЛЬНЫЙ от дневного
+# стопа -$350 стратегии donchian_4h_v22 (тот закрывает только сегодня-открытые убыточные,
+# этот — close-all ВСЕХ + halt бота).
 DAY_SOFT_FRAC = Decimal(os.environ.get("EXEC_DAY_SOFT_FRAC", "0.6"))
-DAY_HARD_FRAC = Decimal(os.environ.get("EXEC_DAY_HARD_FRAC", "0.9"))  # -$450 при дне $500 (10k, 5%)
+DAY_HARD_FRAC = Decimal(os.environ.get("EXEC_DAY_HARD_FRAC", "0.8"))  # 80% от дневного лимита $500 = $400 при $10k (контур Upscale, отдельный от -$350 стратегии)
 TOT_SOFT_FRAC = Decimal(os.environ.get("EXEC_TOT_SOFT_FRAC", "0.6"))
-TOT_HARD_FRAC = Decimal(os.environ.get("EXEC_TOT_HARD_FRAC", "0.7"))
+TOT_HARD_FRAC = Decimal(os.environ.get("EXEC_TOT_HARD_FRAC", "0.8"))   # 80% от общего лимита $1000 = $800 при $10k (close-all + halt, ручной /resume)
 DAY_GAIN_CAP_PCT = Decimal(os.environ.get("EXEC_DAY_GAIN_CAP_PCT", "0"))   # >0: не входить, если плюс за день ≥ N% (правило 30%); 0 = выкл
 WATCHDOG_SEC  = int(os.environ.get("EXEC_WATCHDOG_SEC", "60"))
 # v1.6: перевод стопа в безубыток после срабатывания TP1.
