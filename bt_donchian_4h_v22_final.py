@@ -1,40 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-bt_donchian_4h_v22_soft.py
+bt_donchian_4h_v22_pairs.py
 ================================================================================
-Donchian 4H v2.2 — SOFT EXCLUDE TEST (динамическое исключение пар)
+Donchian 4H v2.2 — PAIRS ANALYSIS (детальный анализ всех 103 пар по годам)
 ================================================================================
 
 ЧТО ПРОВЕРЯЕМ:
-  - ВСЕ 103 пары участвуют (статичный EXCLUDE_PAIRS пустой — пусть dynamic
-    сам отсеет плохих)
-  - Rolling history: последние 5 сделок по каждой паре
-  - SOFT EXCLUDE: если 3+ из 5 последних сделок в минусе → 30 дней кулдаун
-    (поверх существующего 14-дневного кулдауна после 4 убытков подряд)
-  - Сброс rolling_history после срабатывания (после 30 дней начинаем заново)
+  - ВСЕ 103 пары участвуют (static EXCLUDE пустой)
+  - Для каждой пары считаем PnL/winrate/сделки ПО ГОДАМ (2024, 2025, 2026)
+  - Разделяем пары на 4 категории:
+    1) STABLE PROFITABLE — прибыль во все 3 года (сильные, точно торгуем)
+    2) STABLE LOSS-MAKER — убыток во все 3 года (точно в EXCLUDE)
+    3) BROKEN RECENTLY — был плюс, сломался в 2026 (можно дать шанс)
+    4) NEW BAD — новая пара, сразу минус (вероятно не подходит)
+    5) MIXED — нестабильная, прыгает туда-сюда
 
-ОЖИДАЕМ:
-  - AVAX/LINEA/INJ (худшие в финальном бэктесте) автоматически уйдут в кулдаун
-  - Total P&L вырастет на 5-10% (от -$2,000 убытка избавимся)
-  - Worst day улучшится (плохие пары не войдут в плохой день)
-  - Winrate вырастет (хвосты обрезаны)
-
-СРАВНИВАЕМ С ФИНАЛОМ:
-  Финал:    P&L +$25,063 | PF 1.79 | MaxDD $1,739 | Worst day -$830 | Winrate 61.6%
-  Soft:     P&L ???       | PF ???  | MaxDD ???    | Worst day ???    | Winrate ???
+ЦЕЛЬ: точно понять, какие пары исключить насовсем, а кому дать шанс.
 
 ВСЁ ОСТАЛЬНОЕ ИДЕНТИЧНО ФИНАЛУ:
   - Donchian(20) на 4H + BTC SMA(50) 1D + DMI + ATR
   - Trailing 4.5×ATR по close свечи
   - Partial TP +8% favourable → 50% позиции, остаток в breakeven
-  - Daily Stop today-only -$350 (закрывает только сегодня-открытые убыточные)
-  - DD brake ×0.4 при DD>$900 (восстановление 85%)
-  - Cooldown 14 дней после 4 убытков подряд (как было)
+  - Daily Stop today-only -$350
+  - DD brake ×0.4 при DD>$900
+  - Cooldown 14 дней после 4 убытков подряд
   - MAX_CONCURRENT=10, MAX_PER_SIDE_CAP=6, MAX_LOSERS_PER_SIDE=3
   - Compound sizing: max($100, min($250, equity × 0.8%))
 
 ЗАПУСК:
-    RUN_BACKTEST=donchian_4h_v22_soft python bot.py
+    RUN_BACKTEST=donchian_4h_v22_pairs python bot.py
+    (или заменить код в bt_donchian_4h_v22_final.py)
 ================================================================================
 """
 
@@ -51,8 +46,8 @@ else:
 
 # ─── ИДЕНТИФИКАЦИЯ ────────────────────────────────────────────────────────────
 STRATEGY_NAME    = "Donchian 4H"
-STRATEGY_VERSION = "v2.2-SOFT-TEST"
-STRATEGY_FILE    = "bt_donchian_4h_v22_soft"
+STRATEGY_VERSION = "v2.2-PAIRS-ANALYSIS"
+STRATEGY_FILE    = "bt_donchian_4h_v22_pairs"
 
 # ─── КАПИТАЛ И РИСК ───────────────────────────────────────────────────────────
 INIT_CAPITAL      = 10_000.0
@@ -77,15 +72,10 @@ MAX_LOSERS_PER_SIDE = 3
 DAILY_STOP_LOSS       = -350.0
 DAILY_STOP_LOSS_CONSEC = -350.0
 
-# ─── НОВОЕ: SOFT EXCLUDE (динамическое исключение пар) ────────────────────────
-SOFT_EXCLUDE_LOOKBACK   = 5     # смотрим последние N сделок
-SOFT_EXCLUDE_MIN_LOSERS = 3     # если 3+ из 5 в минусе → кулдаун
-SOFT_EXCLUDE_DAYS       = 30    # длительность кулдауна (дней)
+# ─── КЛЮЧЕВОЕ: static EXCLUDE ПУСТОЙ — все 103 пары тестируем ─────────────────
+EXCLUDE_PAIRS = set()
 
-# ─── EXCLUDE_PAIRS — ПУСТОЙ! Все 103 пары тестируются ─────────────────────────
-EXCLUDE_PAIRS = set()   # ← КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: ничего не исключаем статично
-
-# ─── COOLDOWN (статичный, как был) ────────────────────────────────────────────
+# ─── COOLDOWN ──────────────────────────────────────────────────────────────────
 CONSEC_LOSS_LIMIT = 4
 COOLDOWN_DAYS     = 14
 
@@ -355,20 +345,19 @@ def compute_max_per_side(current_risk):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ОСНОВНОЙ БЭКТЕСТ (с soft exclude)
+# ОСНОВНОЙ БЭКТЕСТ
 # ═════════════════════════════════════════════════════════════════════════════
 
 def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, verbose=True):
     if B is None: raise RuntimeError("bot module not available")
 
-    # EXCLUDE_PAIRS пустой — все 103 пары тестируются
     pairs_active = [p for p in pairs if p not in EXCLUDE_PAIRS]
     excluded = len(pairs) - len(pairs_active)
 
     if verbose:
         B.send_telegram(
             f"📡 {STRATEGY_NAME} {STRATEGY_VERSION}: загружаю {CANDLE_INTERVAL} свечи "
-            f"для {len(pairs_active)} пар (SOFT EXCLUDE ВКЛЮЧЁН, static EXCLUDE пустой)"
+            f"для {len(pairs_active)} пар (PAIRS ANALYSIS — static EXCLUDE пустой)"
         )
 
     data = {}
@@ -407,7 +396,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     by_pair_candle = {p: {c['t']: c for c in cds} for p, cds in data.items()}
     idx_by_pair_candle = {p: {c['t']: i for i, c in enumerate(cds)} for p, cds in data.items()}
 
-    # --- Состояние ---
     cash = INIT_CAPITAL
     positions = []
     closed_trades = []
@@ -418,18 +406,8 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
     dd_brake_days_set = set()
     btc_blocked_days_set = set()
     adx_filtered = 0
-    # НОВОЕ: pair_stats с rolling_history для soft exclude
-    pair_stats = defaultdict(lambda: {
-        "consec_losses": 0,
-        "cooldown_until": 0,
-        "recent_pnls": [],          # последние 5 PnL (для soft exclude)
-        "soft_blocks": 0,           # сколько раз блокировался soft exclude
-        "total_trades": 0,
-        "total_wins": 0,
-        "total_pnl": 0.0,
-    })
+    pair_stats = defaultdict(lambda: {"consec_losses": 0, "cooldown_until": 0})
     cooldown_blocked = 0
-    soft_blocked = 0  # НОВОЕ: счётчик блокировок soft exclude
     excluded_count = excluded
     day_loss_stop_active = False
     day_stop_triggered = 0
@@ -477,7 +455,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         new_positions = []
         realized_this_candle = 0.0
 
-        # 1) Обновление и выходы открытых позиций
+        # 1) Обновление и выходы
         for pos in positions:
             candle = by_pair_candle[pos.contract].get(candle_ts)
             if candle is None:
@@ -533,42 +511,19 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                 funding_cost = pos.side * funding_rate * pos.size_usd * n_fund
                 net = gross - comm - funding_cost
                 realized_this_candle += net
-
                 if pos.entry_day_ts >= cal_day:
                     today_entry_realized += net
-
                 closed_trades.append({"contract": pos.contract, "side": pos.side, "entry": pos.entry,
                     "exit": exit_price, "size_usd": pos.size_usd, "pnl": net, "reason": exit_reason,
                     "hold_days": pos.hold_days, "entry_day": pos.entry_day_ts, "exit_day": candle_ts,
                     "max_favorable": pos.max_favorable, "max_adverse": pos.max_adverse})
-
-                # ── НОВОЕ: обновляем pair_stats с rolling_history для SOFT EXCLUDE ──
                 ps = pair_stats[pos.contract]
-                ps["total_trades"] += 1
-                ps["total_pnl"] += net
-                if net > 0: ps["total_wins"] += 1
-
                 if net < 0:
                     ps["consec_losses"] += 1
                     if ps["consec_losses"] >= CONSEC_LOSS_LIMIT:
                         ps["cooldown_until"] = candle_ts + COOLDOWN_DAYS * 86400
                 else:
                     ps["consec_losses"] = 0
-
-                # НОВОЕ: rolling history для SOFT EXCLUDE
-                ps["recent_pnls"].append(net)
-                if len(ps["recent_pnls"]) > SOFT_EXCLUDE_LOOKBACK:
-                    ps["recent_pnls"] = ps["recent_pnls"][-SOFT_EXCLUDE_LOOKBACK:]
-
-                # Проверяем SOFT EXCLUDE: 3+ из 5 последних в минусе → 30 дней кулдаун
-                if (len(ps["recent_pnls"]) >= SOFT_EXCLUDE_LOOKBACK
-                        and sum(1 for p in ps["recent_pnls"] if p < 0) >= SOFT_EXCLUDE_MIN_LOSERS):
-                    soft_until = candle_ts + SOFT_EXCLUDE_DAYS * 86400
-                    # Берём максимум — если уже есть cooldown, продлеваем
-                    ps["cooldown_until"] = max(ps["cooldown_until"], soft_until)
-                    ps["soft_blocks"] += 1
-                    ps["recent_pnls"] = []   # сбрасываем, после 30 дней начнём заново
-                    soft_blocked += 1
             else:
                 new_positions.append(pos)
 
@@ -654,29 +609,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
                         realized_this_candle += net_now
                         dstop_realized += net_now
                         today_entry_realized += net_now
-
-                        # НОВОЕ: обновляем pair_stats для DSTOP закрытий тоже
-                        ps_d = pair_stats[pos.contract]
-                        ps_d["total_trades"] += 1
-                        ps_d["total_pnl"] += net_now
-                        if net_now > 0: ps_d["total_wins"] += 1
-                        if net_now < 0:
-                            ps_d["consec_losses"] += 1
-                            if ps_d["consec_losses"] >= CONSEC_LOSS_LIMIT:
-                                ps_d["cooldown_until"] = candle_ts + COOLDOWN_DAYS * 86400
-                        else:
-                            ps_d["consec_losses"] = 0
-                        ps_d["recent_pnls"].append(net_now)
-                        if len(ps_d["recent_pnls"]) > SOFT_EXCLUDE_LOOKBACK:
-                            ps_d["recent_pnls"] = ps_d["recent_pnls"][-SOFT_EXCLUDE_LOOKBACK:]
-                        if (len(ps_d["recent_pnls"]) >= SOFT_EXCLUDE_LOOKBACK
-                                and sum(1 for p in ps_d["recent_pnls"] if p < 0) >= SOFT_EXCLUDE_MIN_LOSERS):
-                            soft_until = candle_ts + SOFT_EXCLUDE_DAYS * 86400
-                            ps_d["cooldown_until"] = max(ps_d["cooldown_until"], soft_until)
-                            ps_d["soft_blocks"] += 1
-                            ps_d["recent_pnls"] = []
-                            soft_blocked += 1
-
                         closed_trades.append({"contract": pos.contract, "side": pos.side, "entry": pos.entry,
                             "exit": exit_price_now, "size_usd": pos.size_usd, "pnl": net_now, "reason": "DSTOP",
                             "hold_days": pos.hold_days, "entry_day": pos.entry_day_ts, "exit_day": candle_ts,
@@ -718,14 +650,13 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         if long_losers >= MAX_LOSERS_PER_SIDE: can_long = False
         if short_losers >= MAX_LOSERS_PER_SIDE: can_short = False
 
-        # 6) Сканирование кандидатов
+        # 6) Сканирование
         candidates = []
         for p, cds in data.items():
             idx = idx_by_pair_candle[p].get(candle_ts)
             if idx is None or idx < DONCHIAN_PERIOD + 2: continue
             if any(pos.contract == p for pos in positions): continue
             ps = pair_stats[p]
-            # ── НОВОЕ: проверяем cooldown (включая soft exclude) ──
             if candle_ts < ps["cooldown_until"]:
                 cooldown_blocked += 1
                 continue
@@ -737,10 +668,9 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             if sig["side"] == -1 and not can_short: continue
             candidates.append((p, sig, idx))
 
-        # Сортировка по atr_pct (как в финале)
         candidates.sort(key=lambda x: x[1]["atr_pct"], reverse=True)
 
-        # 7) Открытие новых
+        # 7) Открытие
         for p, sig, idx in candidates:
             if new_today >= MAX_NEW_PER_DAY: break
             if len(positions) >= MAX_CONCURRENT: break
@@ -762,7 +692,6 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
             cash -= COMM_TAKER * size_usd
             new_today += 1
 
-    # Хвост: закрытие оставшихся
     if prev_cal_day is not None:
         day_pnl = equity - prev_day_start_equity
         daily_pnl.append((prev_cal_day, day_pnl))
@@ -802,14 +731,11 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
         "max_dd_peak_ts":       max_dd_peak_ts,
         "max_dd_trough_ts":     max_dd_trough_ts,
         "max_dd_value":         max_dd_value,
-        # НОВОЕ:
-        "soft_blocked":         soft_blocked,
-        "pair_stats":           dict(pair_stats),
     }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ВАЛИДАЦИЯ (сокращённая)
+# ВАЛИДАЦИЯ + АНАЛИЗ ПАР ПО ГОДАМ
 # ═════════════════════════════════════════════════════════════════════════════
 
 def validate(result, z=Z_SCORE):
@@ -828,24 +754,6 @@ def validate(result, z=Z_SCORE):
     worst_day = min(daily_vals) if daily_vals else 0.0
     gate2 = worst_day >= WORST_DAY_LIMIT
     worst_day_ts = min(result["daily_pnl"], key=lambda p: p[1])[0] if result["daily_pnl"] else None
-
-    losing_days_n = sum(1 for _, pnl in result["daily_pnl"] if pnl < 0)
-    loss_streaks, cur_loss_streak = [], []
-    for ts, pnl in sorted(result["daily_pnl"], key=lambda p: p[0]):
-        if pnl < 0:
-            cur_loss_streak.append((ts, pnl))
-        else:
-            if cur_loss_streak: loss_streaks.append(cur_loss_streak)
-            cur_loss_streak = []
-    if cur_loss_streak: loss_streaks.append(cur_loss_streak)
-    longest_loss_streak = max((len(s) for s in loss_streaks), default=0)
-    worst_streak_loss = 0.0
-    worst_streak_detail = None
-    for s in loss_streaks:
-        streak_total = sum(p for _, p in s)
-        if streak_total < worst_streak_loss:
-            worst_streak_loss = streak_total
-            worst_streak_detail = {"from": s[0][0], "to": s[-1][0], "days": len(s)}
 
     eqs = [e for _, e in result["equity_curve"]]
     peak, max_dd = -math.inf, 0.0
@@ -872,8 +780,68 @@ def validate(result, z=Z_SCORE):
     expectancy = ((avg_win * len(winning_trades) + avg_loss * len(losing_trades))
                    / len(result["trades"])) if result["trades"] else 0.0
 
-    # НОВОЕ: статистика по парам для soft exclude анализа
-    pair_stats = result.get("pair_stats", {})
+    # ─── НОВОЕ: АНАЛИЗ ПАР ПО ГОДАМ ──────────────────────────────────────────
+    # Группируем сделки по (pair, year) и считаем PnL/winrate/сделок
+    pair_year_stats = defaultdict(lambda: {"n": 0, "wins": 0, "pnl": 0.0})
+    for t in result["trades"]:
+        year = dt.datetime.utcfromtimestamp(t["exit_day"]).year
+        key = (t["contract"], year)
+        s = pair_year_stats[key]
+        s["n"] += 1
+        s["pnl"] += t["pnl"]
+        if t["pnl"] > 0: s["wins"] += 1
+
+    # Группируем по парам — итоговые + по годам
+    pair_summary = {}
+    all_pairs = sorted({t["contract"] for t in result["trades"]})
+    years_sorted = sorted(yearly.keys())
+
+    for pair in all_pairs:
+        total_n = 0
+        total_wins = 0
+        total_pnl_pair = 0.0
+        by_year = {}
+        for y in years_sorted:
+            s = pair_year_stats.get((pair, y), {"n": 0, "wins": 0, "pnl": 0.0})
+            by_year[y] = {"n": s["n"], "wins": s["wins"], "pnl": s["pnl"],
+                          "winrate": (s["wins"] / s["n"] * 100) if s["n"] else 0.0}
+            total_n += s["n"]
+            total_wins += s["wins"]
+            total_pnl_pair += s["pnl"]
+        pair_summary[pair] = {
+            "total_n":     total_n,
+            "total_wins":  total_wins,
+            "total_pnl":   total_pnl_pair,
+            "total_winrate": (total_wins / total_n * 100) if total_n else 0.0,
+            "by_year":     by_year,
+            "years":       years_sorted,
+        }
+
+    # Классификация пар по категориям
+    def classify(pair_data):
+        years_with_trades = [y for y in pair_data["years"]
+                             if pair_data["by_year"][y]["n"] > 0]
+        if not years_with_trades:
+            return "NO_TRADES"
+        # Считаем сколько лет было +/- PnL
+        profit_years = sum(1 for y in years_with_trades
+                            if pair_data["by_year"][y]["pnl"] > 0)
+        loss_years = sum(1 for y in years_with_trades
+                         if pair_data["by_year"][y]["pnl"] < 0)
+        total_pnl = pair_data["total_pnl"]
+
+        if total_pnl > 0 and profit_years == len(years_with_trades):
+            return "STABLE_PROFIT"   # прибыль во все годы
+        if total_pnl < 0 and loss_years == len(years_with_trades):
+            return "STABLE_LOSS"     # убыток во все годы
+        if len(years_with_trades) == 1 and total_pnl < 0:
+            return "NEW_BAD"          # одна пора торговли, сразу минус
+        if total_pnl < 0 and profit_years > 0:
+            return "BROKEN_RECENTLY"  # был плюс, но стал минусом
+        return "MIXED"
+
+    for pair, data in pair_summary.items():
+        data["category"] = classify(data)
 
     return {
         "final_equity":   final,
@@ -888,10 +856,6 @@ def validate(result, z=Z_SCORE):
         "worst_day":      worst_day,
         "worst_day_ts":   worst_day_ts,
         "max_dd":         max_dd,
-        "losing_days_n":  losing_days_n,
-        "longest_loss_streak":  longest_loss_streak,
-        "worst_streak_loss":    worst_streak_loss,
-        "worst_streak_detail":  worst_streak_detail,
         "yearly_pnl":     dict(yearly),
         "reasons":        dict(reasons),
         "profit_factor":  profit_factor,
@@ -902,14 +866,13 @@ def validate(result, z=Z_SCORE):
         "expectancy":     expectancy,
         "winning_trades_n": len(winning_trades),
         "losing_trades_n":  len(losing_trades),
-        "soft_blocked":   result.get("soft_blocked", 0),
-        "pair_stats":     pair_stats,
+        "pair_summary":   pair_summary,
         "all_pass":       gate1 and gate2 and gate3 and gate4,
     }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ОТЧЁТ (сокращённый + блок Soft Exclude)
+# ОТЧЁТ (с детализацией по парам и годам)
 # ═════════════════════════════════════════════════════════════════════════════
 
 _PAIRS_USED = []
@@ -919,14 +882,14 @@ def format_report(result, val, n_pairs=None):
     lines = []
     lines.append(f"📊 *{STRATEGY_NAME} {STRATEGY_VERSION} - РЕЗУЛЬТАТЫ*  [{STRATEGY_FILE}]")
     lines.append("")
-    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing {ATR_STOP_MULT}xATR + Partial TP +{int(PARTIAL_TP_PCT*100)}%/{int(PARTIAL_TP_FRACTION*100)}% + Daily Stop today-only + Soft exclude (3/5→30д)")
+    lines.append(f"Donchian({DONCHIAN_PERIOD}) на {CANDLE_INTERVAL} + BTC SMA({BTC_REGIME_SMA}) 1D + DMI + Trailing {ATR_STOP_MULT}xATR + Partial TP +{int(PARTIAL_TP_PCT*100)}%/{int(PARTIAL_TP_FRACTION*100)}% + Daily Stop today-only + PAIRS ANALYSIS")
     lines.append(f"Капитал: ${INIT_CAPITAL:,.0f}  |  Пары: {n_pairs} (ВСЕ, без static EXCLUDE)")
     lines.append(f"Risk: {RISK_FRACTION*100:.1f}% (floor ${SLOT_RISK_MIN:.0f}, cap ${SLOT_RISK_MAX:.0f}, brake x{DD_BRAKE_FACTOR} при DD>${DD_BRAKE_THRESHOLD:.0f})")
     lines.append(f"Max: {MAX_CONCURRENT} поз (per-side {MAX_PER_SIDE_CAP}, фильтр {MAX_LOSERS_PER_SIDE} лузера) | Daily stop: ${abs(DAILY_STOP_LOSS):.0f} today-only | New/day: {MAX_NEW_PER_DAY}")
-    lines.append(f"Cooldown: {COOLDOWN_DAYS}д после {CONSEC_LOSS_LIMIT} убытков | SOFT EXCLUDE: {SOFT_EXCLUDE_MIN_LOSERS}/{SOFT_EXCLUDE_LOOKBACK} → {SOFT_EXCLUDE_DAYS}д")
+    lines.append(f"Cooldown: {COOLDOWN_DAYS}д после {CONSEC_LOSS_LIMIT} убытков")
     lines.append(f"Сделок: {val['n_trades']}  |  Дней: {val['n_days']}  |  Свечей 4H: {result.get('n_candles', 0)}")
-    lines.append(f"BTC blocked: {val.get('btc_blocked', 0)}д | ADX filtered: {val.get('adx_filtered', 0)} | DD brake: {val.get('dd_brake_days', 0)}д")
-    lines.append(f"Cooldown blocks: {val.get('cooldown_blocked', 0)} | Soft exclude blocks: {val.get('soft_blocked', 0)} | Daily stop: {val.get('day_stop_triggered', 0)} | Partial TPs: {val.get('partial_tp_count', 0)} (${val.get('partial_tp_total_pnl', 0):+.0f}) | Max consec loss days: {val.get('consec_loss_days_max', 0)}")
+    lines.append(f"BTC blocked: {result.get('btc_blocked', 0)}д | ADX filtered: {result.get('adx_filtered', 0)} | DD brake: {result.get('dd_brake_days', 0)}д | Cooldown blocks: {result.get('cooldown_blocked', 0)}")
+    lines.append(f"Daily stop: {result.get('day_stop_triggered', 0)} | Partial TPs: {result.get('partial_tp_count', 0)} (${result.get('partial_tp_total_pnl', 0):+.0f}) | Max consec loss days: {result.get('consec_loss_days_max', 0)}")
     if val.get("reasons"):
         r = val["reasons"]
         lines.append(f"Исходы: SL/TRAIL={r.get('TRAIL',0)+r.get('SL',0)} PTP={r.get('PTP',0)} TIME={r.get('TIME',0)} SIG={r.get('SIG',0)} DSTOP={r.get('DSTOP',0)} END={r.get('END',0)}")
@@ -942,8 +905,8 @@ def format_report(result, val, n_pairs=None):
     lines.append(f"① Final - CI > 0   : {'✅ PASS' if val['gate1'] else '❌ FAIL'}  (edge = ${val['total_pnl']-val['ci_z']:,.2f})")
     worst_day_date = (dt.datetime.utcfromtimestamp(val["worst_day_ts"]).strftime("%Y-%m-%d") if val.get("worst_day_ts") else "-")
     lines.append(f"② Worst day ≥ ${WORST_DAY_LIMIT:.0f}: {'✅ PASS' if val['gate2'] else '❌ FAIL'}  (worst = ${val['worst_day']:,.2f}, {worst_day_date})")
-    max_dd_peak_ts = val.get("max_dd_peak_ts")
-    max_dd_trough_ts = val.get("max_dd_trough_ts")
+    max_dd_peak_ts = result.get("max_dd_peak_ts")
+    max_dd_trough_ts = result.get("max_dd_trough_ts")
     dd_dates = ""
     if max_dd_peak_ts and max_dd_trough_ts:
         d_peak = dt.datetime.utcfromtimestamp(max_dd_peak_ts).strftime("%Y-%m-%d")
@@ -957,85 +920,160 @@ def format_report(result, val, n_pairs=None):
     verdict = "✅✅✅✅ ALL PASS" if val["all_pass"] else "❌ НЕ ПРОШЁЛ"
     lines.append(f"ИТОГ: {verdict}")
 
-    # ── НОВОЕ: БЛОК SOFT EXCLUDE ──
-    lines.append("")
-    lines.append(f"- SOFT EXCLUDE (3 из {SOFT_EXCLUDE_LOOKBACK} → {SOFT_EXCLUDE_DAYS}д) -")
-    lines.append(f"Сработал: {val.get('soft_blocked', 0)} раз(а) суммарно")
-    pair_stats = val.get("pair_stats", {})
-    if pair_stats:
-        sorted_by_blocks = sorted(pair_stats.items(), key=lambda x: x[1].get("soft_blocks", 0), reverse=True)
-        blocked_pairs = [(p, s) for p, s in sorted_by_blocks if s.get("soft_blocks", 0) > 0]
-        if blocked_pairs:
-            lines.append(f"Топ пар по числу блокировок:")
-            for p, s in blocked_pairs[:15]:
-                wr = (s["total_wins"] / s["total_trades"] * 100) if s["total_trades"] else 0
-                lines.append(f"   {p}: {s['soft_blocks']} раз(а) | всего {s['total_trades']} сделок, winrate {wr:.0f}%, PnL ${s['total_pnl']:+,.2f}")
+    # ───── НОВОЕ: ДЕТАЛИЗАЦИЯ ПО ПАРАМ ПО ГОДАМ ─────
+    pair_summary = val.get("pair_summary", {})
+    if pair_summary:
+        years_sorted = sorted(val["yearly_pnl"].keys())
+
+        # Сводная таблица: категория + итог + по годам
+        lines.append("")
+        lines.append("════════ АНАЛИЗ ПАР ПО ГОДАМ ════════")
+        lines.append(f"Категории:")
+        lines.append(f"  🟢 STABLE_PROFIT      = прибыль во все годы с сделками")
+        lines.append(f"  🔴 STABLE_LOSS        = убыток во все годы с сделками")
+        lines.append(f"  ⚠️ BROKEN_RECENTLY     = был плюс, но стал минусом (включая 2026)")
+        lines.append(f"  🆕 NEW_BAD            = новая пара, первая пора — минус")
+        lines.append(f"  ❓ MIXED              = нестабильная")
+        lines.append("")
+
+        # ─── 1) STABLE LOSS (точно в EXCLUDE) ───
+        lines.append("─────────────────────────────────────────────────")
+        lines.append("🔴 STABLE LOSS-MAKER (рекомендация: В EXCLUDE)")
+        lines.append("─────────────────────────────────────────────────")
+        stable_loss = [(p, d) for p, d in pair_summary.items() if d["category"] == "STABLE_LOSS"]
+        stable_loss.sort(key=lambda x: x[1]["total_pnl"])  # худшие первыми
+        if stable_loss:
+            # Заголовок таблицы
+            header = f"{'Пара':<8} {'Сд':>4} {'WR%':>5} {'PnL':>9}"
+            for y in years_sorted:
+                header += f" | {y}: сд/WR%/PnL"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for p, d in stable_loss:
+                row = f"{p:<8} {d['total_n']:>4} {d['total_winrate']:>4.0f}% ${d['total_pnl']:>+8.0f}"
+                for y in years_sorted:
+                    yi = d["by_year"].get(y, {"n": 0, "wins": 0, "pnl": 0.0, "winrate": 0.0})
+                    if yi["n"] > 0:
+                        row += f" | {yi['n']:>2}/{yi['winrate']:>3.0f}%/${yi['pnl']:>+6.0f}"
+                    else:
+                        row += " |  —"
+                lines.append(row)
         else:
-            lines.append("Ни одна пара не блокировалась — soft exclude не сработал.")
+            lines.append("  Нет пар со стабильным минусом по всем годам.")
 
-    # ── НОВОЕ: CANDIDATES FOR PERMANENT EXCLUDE ──
-    lines.append("")
-    lines.append("- CANDIDATES FOR PERMANENT EXCLUDE (winrate <40% при ≥10 сделок) -")
-    if pair_stats:
-        candidates = []
-        for p, s in pair_stats.items():
-            if s["total_trades"] >= 10:
-                wr = s["total_wins"] / s["total_trades"]
-                if wr < 0.40:
-                    candidates.append((p, s["total_trades"], wr, s["total_pnl"]))
-        candidates.sort(key=lambda x: x[3])  # сортируем по PnL (худшие первыми)
-        if candidates:
-            for p, n_tr, wr, pnl in candidates[:15]:
-                lines.append(f"   {p}: {n_tr} сделок, winrate {wr*100:.0f}%, PnL ${pnl:+,.2f}")
+        # ─── 2) BROKEN RECENTLY ───
+        lines.append("")
+        lines.append("─────────────────────────────────────────────────")
+        lines.append("⚠️ BROKEN RECENTLY (был плюс, но испортился — проверить)")
+        lines.append("─────────────────────────────────────────────────")
+        broken = [(p, d) for p, d in pair_summary.items() if d["category"] == "BROKEN_RECENTLY"]
+        broken.sort(key=lambda x: x[1]["total_pnl"])  # худшие первыми
+        if broken:
+            header = f"{'Пара':<8} {'Сд':>4} {'WR%':>5} {'PnL':>9}"
+            for y in years_sorted:
+                header += f" | {y}: сд/WR%/PnL"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for p, d in broken:
+                row = f"{p:<8} {d['total_n']:>4} {d['total_winrate']:>4.0f}% ${d['total_pnl']:>+8.0f}"
+                for y in years_sorted:
+                    yi = d["by_year"].get(y, {"n": 0, "wins": 0, "pnl": 0.0, "winrate": 0.0})
+                    if yi["n"] > 0:
+                        row += f" | {yi['n']:>2}/{yi['winrate']:>3.0f}%/${yi['pnl']:>+6.0f}"
+                    else:
+                        row += " |  —"
+                lines.append(row)
         else:
-            lines.append("Нет кандидатов — все пары с winrate ≥40% при ≥10 сделках.")
+            lines.append("  Нет пар, которые 'сломались'.")
 
-    # ── СРАВНЕНИЕ С ФИНАЛОМ ──
-    lines.append("")
-    lines.append("- СРАВНЕНИЕ С ФИНАЛЬНЫМ БЭКТЕСТОМ -")
-    lines.append(f"               ФИНАЛ          →  SOFT TEST")
-    lines.append(f"Total P&L:     +$25,063       →  ${val['total_pnl']:+,.0f}")
-    lines.append(f"Profit Factor: 1.79           →  {pf_str}")
-    lines.append(f"Worst day:     -$830          →  ${val['worst_day']:,.0f}")
-    lines.append(f"MaxDD:         $1,739         →  ${val['max_dd']:,.0f}")
-    lines.append(f"Winrate:       61.6%          →  {val.get('winning_trades_n',0)/val['n_trades']*100:.1f}%" if val['n_trades'] else "Winrate: 0%")
-    lines.append(f"Сделок:        1086           →  {val['n_trades']}")
-
-    # Худшие 5 сделок
-    worst_5 = sorted(result["trades"], key=lambda t: t["pnl"])[:5]
-    if worst_5:
+        # ─── 3) NEW BAD ───
         lines.append("")
-        lines.append("- ХУДШИЕ 5 СДЕЛОК -")
-        for w in worst_5:
-            d_entry = dt.datetime.utcfromtimestamp(w["entry_day"]).strftime("%Y-%m-%d")
-            d_exit = dt.datetime.utcfromtimestamp(w["exit_day"]).strftime("%Y-%m-%d")
-            lines.append(f"   {w['contract']} {'L' if w['side']==+1 else 'S'} ${w['pnl']:,.2f} ({w['reason']}, {d_entry} → {d_exit})")
+        lines.append("─────────────────────────────────────────────────")
+        lines.append("🆕 NEW BAD (всего 1 год с сделками, и он в минусе)")
+        lines.append("─────────────────────────────────────────────────")
+        new_bad = [(p, d) for p, d in pair_summary.items() if d["category"] == "NEW_BAD"]
+        new_bad.sort(key=lambda x: x[1]["total_pnl"])
+        if new_bad:
+            header = f"{'Пара':<8} {'Сд':>4} {'WR%':>5} {'PnL':>9}"
+            for y in years_sorted:
+                header += f" | {y}: сд/WR%/PnL"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for p, d in new_bad:
+                row = f"{p:<8} {d['total_n']:>4} {d['total_winrate']:>4.0f}% ${d['total_pnl']:>+8.0f}"
+                for y in years_sorted:
+                    yi = d["by_year"].get(y, {"n": 0, "wins": 0, "pnl": 0.0, "winrate": 0.0})
+                    if yi["n"] > 0:
+                        row += f" | {yi['n']:>2}/{yi['winrate']:>3.0f}%/${yi['pnl']:>+6.0f}"
+                    else:
+                        row += " |  —"
+                lines.append(row)
+        else:
+            lines.append("  Нет пар в этой категории.")
 
-    # Минусовые дни (кратко)
-    lines.append("")
-    lines.append("- МИНУСОВЫЕ ДНИ (кратко) -")
-    lines.append(f"Всего в минусе: {val.get('losing_days_n', 0)}/{val['n_days']}")
-    lines.append(f"Самая длинная серия: {val.get('longest_loss_streak', 0)} дн.")
-    wsd = val.get("worst_streak_detail")
-    if wsd:
-        d_from = dt.datetime.utcfromtimestamp(wsd["from"]).strftime("%Y-%m-%d")
-        d_to = dt.datetime.utcfromtimestamp(wsd["to"]).strftime("%Y-%m-%d")
-        lines.append(f"Худшая серия: {wsd['days']}д ({d_from} → {d_to}), убыток ${val.get('worst_streak_loss', 0):,.2f}")
+        # ─── 4) MIXED ───
+        lines.append("")
+        lines.append("─────────────────────────────────────────────────")
+        lines.append("❓ MIXED (нестабильные — решение за тобой)")
+        lines.append("─────────────────────────────────────────────────")
+        mixed = [(p, d) for p, d in pair_summary.items() if d["category"] == "MIXED"]
+        mixed.sort(key=lambda x: x[1]["total_pnl"])
+        if mixed:
+            header = f"{'Пара':<8} {'Сд':>4} {'WR%':>5} {'PnL':>9}"
+            for y in years_sorted:
+                header += f" | {y}: сд/WR%/PnL"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for p, d in mixed:
+                row = f"{p:<8} {d['total_n']:>4} {d['total_winrate']:>4.0f}% ${d['total_pnl']:>+8.0f}"
+                for y in years_sorted:
+                    yi = d["by_year"].get(y, {"n": 0, "wins": 0, "pnl": 0.0, "winrate": 0.0})
+                    if yi["n"] > 0:
+                        row += f" | {yi['n']:>2}/{yi['winrate']:>3.0f}%/${yi['pnl']:>+6.0f}"
+                    else:
+                        row += " |  —"
+                lines.append(row)
+        else:
+            lines.append("  Нет пар в этой категории.")
 
-    # Топ-10 лучших и топ-10 худших пар
-    if pair_stats:
+        # ─── 5) STABLE PROFIT (сильные, точно торгуем) ───
         lines.append("")
-        lines.append("- ТОП-10 ПРИБЫЛЬНЫХ ПАР -")
-        sorted_profit = sorted(pair_stats.items(), key=lambda x: x[1].get("total_pnl", 0), reverse=True)
-        for p, s in sorted_profit[:10]:
-            wr = (s["total_wins"] / s["total_trades"] * 100) if s["total_trades"] else 0
-            lines.append(f"   🟢 {p}: {s['total_trades']} сд, winrate {wr:.0f}%, PnL ${s['total_pnl']:+,.2f}")
+        lines.append("─────────────────────────────────────────────────")
+        lines.append("🟢 STABLE PROFITABLE (прибыль во все годы — точно торгуем)")
+        lines.append("─────────────────────────────────────────────────")
+        stable_profit = [(p, d) for p, d in pair_summary.items() if d["category"] == "STABLE_PROFIT"]
+        stable_profit.sort(key=lambda x: -x[1]["total_pnl"])  # лучшие первыми
+        if stable_profit:
+            header = f"{'Пара':<8} {'Сд':>4} {'WR%':>5} {'PnL':>9}"
+            for y in years_sorted:
+                header += f" | {y}: сд/WR%/PnL"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for p, d in stable_profit:
+                row = f"{p:<8} {d['total_n']:>4} {d['total_winrate']:>4.0f}% ${d['total_pnl']:>+8.0f}"
+                for y in years_sorted:
+                    yi = d["by_year"].get(y, {"n": 0, "wins": 0, "pnl": 0.0, "winrate": 0.0})
+                    if yi["n"] > 0:
+                        row += f" | {yi['n']:>2}/{yi['winrate']:>3.0f}%/${yi['pnl']:>+6.0f}"
+                    else:
+                        row += " |  —"
+                lines.append(row)
+        else:
+            lines.append("  Нет пар, прибыльных во все годы.")
+
+        # ─── ИТОГО СВОДКА ПО КАТЕГОРИЯМ ───
         lines.append("")
-        lines.append("- ТОП-10 УБЫТОЧНЫХ ПАР -")
-        sorted_loss = sorted(pair_stats.items(), key=lambda x: x[1].get("total_pnl", 0))
-        for p, s in sorted_loss[:10]:
-            wr = (s["total_wins"] / s["total_trades"] * 100) if s["total_trades"] else 0
-            lines.append(f"   🔴 {p}: {s['total_trades']} сд, winrate {wr:.0f}%, PnL ${s['total_pnl']:+,.2f}")
+        lines.append("════════ СВОДКА ПО КАТЕГОРИЯМ ════════")
+        cat_counts = defaultdict(lambda: {"n_pairs": 0, "n_trades": 0, "pnl": 0.0})
+        for p, d in pair_summary.items():
+            cat = d["category"]
+            cat_counts[cat]["n_pairs"] += 1
+            cat_counts[cat]["n_trades"] += d["total_n"]
+            cat_counts[cat]["pnl"] += d["total_pnl"]
+        for cat in ["STABLE_LOSS", "BROKEN_RECENTLY", "NEW_BAD", "MIXED", "STABLE_PROFIT", "NO_TRADES"]:
+            if cat in cat_counts:
+                c = cat_counts[cat]
+                lines.append(f"  {cat:<18}: {c['n_pairs']:>3} пар | {c['n_trades']:>4} сд | PnL ${c['pnl']:>+9.2f}")
 
     return lines
 
@@ -1056,7 +1094,7 @@ def main():
     B.send_telegram(
         f"🚀 *{STRATEGY_NAME} {STRATEGY_VERSION}* [{STRATEGY_FILE}] старт: "
         f"{len(pairs)} пар (БЕЗ static EXCLUDE), {CANDLE_INTERVAL}, "
-        f"SOFT EXCLUDE {SOFT_EXCLUDE_MIN_LOSERS}/{SOFT_EXCLUDE_LOOKBACK}→{SOFT_EXCLUDE_DAYS}д, "
+        f"PAIRS ANALYSIS по годам, "
         f"окно {start} → {end or 'сегодня'}"
     )
     result = run_backtest(pairs, start_iso=start, end_iso=end, verbose=True)
@@ -1067,14 +1105,26 @@ def main():
         import json
         out_dir = "/home/z/my-project/download"
         os.makedirs(out_dir, exist_ok=True)
+        # Сохраняем полный pair_summary для последующего анализа
+        pair_summary_serializable = {}
+        for pair, d in val.get("pair_summary", {}).items():
+            pair_summary_serializable[pair] = {
+                "total_n":       d["total_n"],
+                "total_wins":    d["total_wins"],
+                "total_pnl":     d["total_pnl"],
+                "total_winrate": d["total_winrate"],
+                "category":      d["category"],
+                "by_year":       {str(y): v for y, v in d["by_year"].items()},
+            }
         with open(f"{out_dir}/{STRATEGY_FILE}_result.json", "w") as f:
             json.dump({
                 "strategy": STRATEGY_NAME,
                 "version":  STRATEGY_VERSION,
                 "file":     STRATEGY_FILE,
-                "validation": {k: (v if not isinstance(v, bool) else int(v)) for k, v in val.items() if k != "pair_stats"},
-                "pair_stats": {k: v for k, v in val.get("pair_stats", {}).items()},
-                "trades": result["trades"][:200],
+                "validation": {k: (v if not isinstance(v, bool) else int(v))
+                                for k, v in val.items() if k != "pair_summary"},
+                "pair_summary": pair_summary_serializable,
+                "trades": result["trades"][:500],
                 "equity_curve_tail": result["equity_curve"][-60:],
             }, f, indent=2, default=str)
     except Exception as e:
