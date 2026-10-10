@@ -25,17 +25,6 @@ Donchian 1H v1.0 — 1H TEST (та же стратегия, но на 1-часо
   - Compound sizing: max($100, min($250, equity × 0.8%))
   - EXCLUDE_PAIRS: 33 пары (как в финале v2.2)
 
-ОЖИДАЕМ:
-  - В 4× больше сделок (~4000 vs 1090)
-  - Winrate ниже (50-55% vs 63%)
-  - Profit Factor ниже (1.4-1.6 vs 2.17)
-  - MaxDD выше (30-40% vs 21%)
-  - Больше шуму, но возможно раньше входы в тренды
-
-СРАВНИМ С ФИНАЛОМ 4H:
-  4H: P&L +$38,210 | PF 2.17 | MaxDD $2,096 | Winrate 63% | 1090 сделок
-  1H: P&L ???       | PF ???   | MaxDD ???    | Winrate ??? | ~??? сделок
-
 ЗАПУСК:
     RUN_BACKTEST=donchian_1h_v1 python bot.py
     (или заменить код в bt_donchian_4h_v22_final.py)
@@ -203,7 +192,6 @@ def fetch_candles(contract, interval="1d", limit=2000):
     all_candles = []
     to_ts = None
     for page in range(pages_needed):
-        # Для 1H и 4H — limit=2000, для 1D — limit=2000 (хватит)
         params = {"contract": gate_c, "interval": interval, "limit": 2000}
         if to_ts is not None: params["to"] = to_ts
         try:
@@ -759,7 +747,7 @@ def run_backtest(pairs, start_iso=BACKTEST_START_ISO, end_iso=BACKTEST_END_ISO, 
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ВАЛИДАЦИЯ
+# ВАЛИДАЦИЯ (ИСПРАВЛЕНО: добавлено excluded_count в return)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def validate(result, z=Z_SCORE):
@@ -896,6 +884,7 @@ def validate(result, z=Z_SCORE):
         "n_trades":       result["n_trades"],
         "n_days":         n,
         "n_candles":      result.get("n_candles", 0),
+        "excluded_count": result.get("excluded_count", 0),
         "gate1":          gate1,
         "gate2":          gate2,
         "gate3":          gate3,
