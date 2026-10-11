@@ -591,6 +591,32 @@ def _manage_positions():
         if rec.get("status") != "open":
             continue
 
+        # Если это pending-запись (ещё не сопоставлена с реальной позицией) —
+        # пытаемся найти реальную позицию по символу и стороне
+        if pos_id.startswith("pending_"):
+            sym_match = rec.get("sym")
+            side_match = rec.get("side")
+            for lp in live_positions:
+                if not isinstance(lp, dict):
+                    continue
+                lp_sym = None
+                lp_mid = UE._pos_market(lp)
+                if executor._mk:
+                    for s, m in executor._mk.items():
+                        if str(m.get("id", "")) == lp_mid:
+                            lp_sym = s
+                            break
+                if lp_sym == sym_match:
+                    # Нашли реальную позицию! Заменяем pending на реальный pos_id
+                    real_id = UE._pos_id(lp)
+                    tracked[real_id] = rec
+                    del tracked[pos_id]
+                    executor._registry_set(real_id, STRATEGY_TAG)
+                    changed = True
+                    print(f"[exec_of] {sym_match}: pending → {real_id}")
+                    break
+            continue  # в этом тике пропускаем — позиция только что сопоставлена
+
         if pos_id not in live_ids:
             entry = rec.get("entry", 0)
             exit_price = rec.get("tp", entry)
@@ -605,9 +631,10 @@ def _manage_positions():
             if pnl > 0:
                 _stats["wins"] += 1
                 _stats["consec_losses"] = 0
-            else:
+            elif pnl < 0:
                 _stats["losses"] += 1
                 _stats["consec_losses"] += 1
+            # PnL == 0: не считаем ни как win, ни как loss (не смогли получить PnL)
 
             if _stats["consec_losses"] >= OF_COOLDOWN_LOSSES:
                 _state["cooldown_until"] = now + OF_COOLDOWN_MIN * 60
