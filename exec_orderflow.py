@@ -77,8 +77,8 @@ OF_PAIRS = [p.strip() for p in os.environ.get("OF_PAIRS", ",".join(OF_PAIRS_DEFA
 # --- Параметры сделок ────────────────────────────────────────────────────────
 OF_MARGIN_USD    = float(os.environ.get("OF_MARGIN_USD", "50"))
 OF_LEVERAGE      = int(os.environ.get("OF_LEVERAGE", "5"))
-OF_STOP_PCT      = float(os.environ.get("OF_STOP_PCT", "0.1"))   # 0.1% — очень тесный стоп
-OF_TP_PCT        = float(os.environ.get("OF_TP_PCT", "0.5"))     # 0.5%
+OF_STOP_PCT      = float(os.environ.get("OF_STOP_PCT", "0.3"))   # 0.3% — тесный, но переживает 60с шум
+OF_TP_PCT        = float(os.environ.get("OF_TP_PCT", "0.6"))     # 0.6% — RR 1:2
 OF_MAX_OPEN      = int(os.environ.get("OF_MAX_OPEN", "5"))
 OF_MAX_SAME_SIDE = int(os.environ.get("OF_MAX_SAME_SIDE", "3"))
 OF_MAX_NEW_PER_DAY = int(os.environ.get("OF_MAX_NEW_PER_DAY", "20"))
@@ -609,6 +609,7 @@ def _manage_positions():
         if pos_id.startswith("pending_"):
             sym_match = rec.get("sym")
             side_match = rec.get("side")
+            found_real = False
             for lp in live_positions:
                 if not isinstance(lp, dict):
                     continue
@@ -627,8 +628,16 @@ def _manage_positions():
                     executor._registry_set(real_id, STRATEGY_TAG)
                     changed = True
                     print(f"[exec_of] {sym_match}: pending → {real_id}")
+                    found_real = True
                     break
-            continue  # в этом тике пропускаем — позиция только что сопоставлена
+            if not found_real:
+                # Позиция не найдена на бирже. Возможно ордер отклонён или стоп сработал.
+                # Если pending висит больше 120 сек — удаляем, не считая убытком.
+                if now - rec.get("opened_ts", now) > 120:
+                    print(f"[exec_of] {sym_match}: pending истёк (нет позиции 120с) — удаляем")
+                    del tracked[pos_id]
+                    changed = True
+            continue
 
         if pos_id not in live_ids:
             entry = rec.get("entry", 0)

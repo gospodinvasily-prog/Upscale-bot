@@ -769,7 +769,10 @@ class Executor:
         # разъехаться, если риск на сделку когда-нибудь изменится).
         same_side_limit = b.get("max_same_side", MAX_SAME_SIDE_OPEN)
         if same_side_limit:
-            same = sum(1 for p in pos_now if _pos_dir(p) == side)
+            # Per-strategy подсчёт: считаем только позиции текущей стратегии через реестр
+            same = sum(1 for p in pos_now 
+                       if _pos_dir(p) == side 
+                       and self._registry_get(_pos_id(p)) == strategy)
             if same >= same_side_limit:
                 return (f"пропуск: уже {same} открытых позиций в {side} "
                         f"(лимит {same_side_limit}) — не набираем одну ставку")
