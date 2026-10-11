@@ -99,7 +99,7 @@ DETECTOR_PERCENTILE          = 95
 DETECTOR_PERCENTILE_WINDOW   = 1800  # 30 мин
 
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
-GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/usdt"
+GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 GATE_REST   = "https://api.gateio.ws/api/v4/futures/usdt"
 
 # --- Файлы состояния ────────────────────────────────────────────────────────
