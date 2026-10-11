@@ -416,6 +416,11 @@ def _process_trade(sym, size_contracts, price, ts):
 
     side = _get_side(size_contracts)
 
+    # Фильтр: работаем ТОЛЬКО в Long (покупки).
+    # Игнорируем все sell-сделки для детектора айсбергов.
+    if side != "buy":
+        return
+
     # Добавляем в буфер
     _trade_buffer[sym].append({
         "ts": ts,
