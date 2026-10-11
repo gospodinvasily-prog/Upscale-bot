@@ -415,7 +415,7 @@ class Executor:
         self._day = {"date": "", "n": 0}
         self._lock = threading.Lock()
         self._pending_lock = threading.Lock()   # сериализует запись PENDING_TP_FILE
-        self._open_lock = threading.Lock()       # сериализует критическую секцию _execute (защита от race между стратегиями)
+        self._open_lock = threading.Lock()       # сериализует критическую секцию _execute
         self._watching_be = set()               # id позиций, за которыми уже следит поток _watch_breakeven
         self._strategy_registry = {}            # {pos_id: "strategy_name"} — для изоляции стратегий
         self._registry_lock = threading.Lock()
@@ -724,7 +724,7 @@ class Executor:
                 # нигде по этому пути (видно по _execute() ниже), поэтому в их
                 # отсутствие подставляем entry просто как безопасную заглушку.
                 plan = build_plan(b["price"], b["stop_pct"], side, b["stop"],
-                                  b.get("tp1_price", b["price"]), b.get("tp2_price", b["price"]),
+                                  b.get("tp1_price", b["price"]), b.get("tp2_price", b.get("tp1_price", b["price"])),
                                   risk_usd, max_pos_usd)
             if not skip and self.mode == "demo":
                 skip = self._real_block()
@@ -754,9 +754,9 @@ class Executor:
 
     def _execute(self, b, plan, market) -> str:
         sym, side, mid, acc = b["symbol"], b["side"], str(market["id"]), self.account_id
-        strategy = b.get("strategy", "donchian_4h_v22")  # тег стратегии для изоляции
-        leverage_override = b.get("leverage_override")     # OrderFlow может хотеть 10x
-        with self._open_lock:  # сериализуем критическую секцию (защита от race между стратегиями)
+        strategy = b.get("strategy", "donchian_4h_v22")
+        leverage_override = b.get("leverage_override")
+        with self._open_lock:
             pos_now = self._positions()
         if MAX_OPEN and len(pos_now) >= MAX_OPEN:
             return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
@@ -834,7 +834,7 @@ class Executor:
         rr1_real = abs(Decimal(str(b["tp1_price"])) - fill) / (risk_px or Decimal(1)) if has_tp else None
         info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size, "sym": sym, "entry": fill}
         if has_tp:
-            info.update(tp1=b["tp1_price"], tp2=b["tp2_price"], tp3=b.get("tp3_price"))
+            info.update(tp1=b.get("tp1_price"), tp2=b.get("tp2_price"), tp3=b.get("tp3_price"))
         with self._lock:
             self._open_risk[info["id"]] = real_risk
         if exit_mode == "trailing":
@@ -1072,7 +1072,9 @@ class Executor:
         if skip:
             self.send(f"🧪 <b>{self.mode.upper()} · {sym} {arrow}: пропускаю</b> — {skip}")
         elif self.mode == "dry":
-            tp_line = (f"TP1 {b['tp1_price']:.6g} и TP2 {b['tp2_price']:.6g} через {plan['tp_delay_sec']}с (правило 60с)"
+            tp_line = (f"TP1 {b.get('tp1_price',0):.6g}" + 
+                       (f" и TP2 {b['tp2_price']:.6g}" if b.get("tp2_price") else "") +
+                       f" через {plan['tp_delay_sec']}с (правило 60с)"
                        if has_tp else "выход — trailing-стоп/сигнал/время (без TP)")
             self.send(f"🧪 <b>DRY · открыл бы {sym} {arrow}</b>\n"
                       f"позиция ${plan['pos_usd']:.0f} (риск ${plan['real_risk_usd']:.1f}), "
