@@ -313,17 +313,24 @@ def _get_side(size):
 def _detect_iceberg(sym, side, size_usd, ts):
     """Проверяет, является ли новая сделка частью айсберга.
     Возвращает dict с сигналом или None."""
+    # Жёсткая конвертация
+    try:
+        ts = float(ts)
+        size_usd = float(size_usd)
+    except (ValueError, TypeError):
+        return None
+
     buf = _trade_buffer[sym]
 
     # Чистим старые
-    while buf and buf[0]["ts"] < ts - DETECTOR_WINDOW_SEC:
+    while buf and float(buf[0].get("ts", 0)) < ts - DETECTOR_WINDOW_SEC:
         buf.popleft()
 
     # Разделяем на buy/sell
-    buys = [t for t in buf if t["side"] == "buy"]
-    sells = [t for t in buf if t["side"] == "sell"]
-    buy_vol = sum(t["size"] for t in buys)
-    sell_vol = sum(t["size"] for t in sells)
+    buys = [t for t in buf if t.get("side") == "buy"]
+    sells = [t for t in buf if t.get("side") == "sell"]
+    buy_vol = sum(float(t.get("size", 0)) for t in buys)
+    sell_vol = sum(float(t.get("size", 0)) for t in sells)
 
     # Определяем доминирующую сторону
     if buy_vol >= sell_vol * DETECTOR_MIN_IMBALANCE_RATIO:
@@ -337,13 +344,13 @@ def _detect_iceberg(sym, side, size_usd, ts):
         return None
 
     # Кластеризация по размеру
-    sizes = sorted([t["size"] for t in dom_trades])
+    sizes = sorted([float(t.get("size", 0)) for t in dom_trades])
     for i in range(len(sizes) - DETECTOR_MIN_TRADES + 1):
         window = sizes[i:i + DETECTOR_MIN_TRADES]
         med = _median(window)
         if med <= 0:
             continue
-        if all(abs(s - med) / med <= DETECTOR_SIZE_TOLERANCE_PCT / 100 for s in window):
+        if all(abs(float(s) - med) / med <= DETECTOR_SIZE_TOLERANCE_PCT / 100 for s in window):
             cluster_total = sum(window)
             if cluster_total >= DETECTOR_MIN_TOTAL_NOTIONAL:
                 return {
@@ -393,6 +400,14 @@ def _record_signal(sym):
 def _process_trade(sym, size_contracts, price, ts):
     """Обрабатывает одну сделку из WebSocket."""
     global _state
+
+    # Жёсткая конвертация всех входных данных в числа
+    try:
+        size_contracts = float(size_contracts)
+        price = float(price)
+        ts = float(ts)
+    except (ValueError, TypeError):
+        return
 
     size_usd = _size_to_usd(sym, size_contracts, price)
     if size_usd < DETECTOR_MIN_NOTIONAL_ABS:
@@ -738,6 +753,8 @@ class GateWSClient:
         self.last_msg_ts = _now_ts()
         try:
             data = json.loads(message)
+            if not isinstance(data, dict):
+                return
             if data.get("channel") != "futures.trades":
                 return
             if data.get("event") != "update":
@@ -764,7 +781,9 @@ class GateWSClient:
                 ts = ts_ms / 1000 if ts_ms else _now_ts()
                 _process_trade(sym, size, price, ts)
         except Exception as e:
+            import traceback
             print(f"[exec_of] WS message error: {e}")
+            traceback.print_exc()
 
     def on_error(self, ws, error):
         print(f"[exec_of] WS error: {error}")
