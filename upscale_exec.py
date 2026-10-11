@@ -415,9 +415,25 @@ class Executor:
         self._day = {"date": "", "n": 0}
         self._lock = threading.Lock()
         self._pending_lock = threading.Lock()   # сериализует запись PENDING_TP_FILE
+        self._open_lock = threading.Lock()       # сериализует критическую секцию _execute (защита от race между стратегиями)
         self._watching_be = set()               # id позиций, за которыми уже следит поток _watch_breakeven
+        self._strategy_registry = {}            # {pos_id: "strategy_name"} — для изоляции стратегий
+        self._registry_lock = threading.Lock()
         if self.mode == "demo" and self.client:
             threading.Thread(target=self._watchdog, daemon=True).start()
+
+    # -- реестр стратегий (для изоляции 4H и OrderFlow) --
+    def _registry_set(self, pos_id, strategy_name):
+        with self._registry_lock:
+            self._strategy_registry[pos_id] = strategy_name
+
+    def _registry_get(self, pos_id):
+        with self._registry_lock:
+            return self._strategy_registry.get(pos_id, "donchian_4h_v22")
+
+    def _registry_del(self, pos_id):
+        with self._registry_lock:
+            self._strategy_registry.pop(pos_id, None)
 
     # -- персистентность TP/безубытка (переживает перезапуск процесса) --
     def _pending_set(self, info, stage, due_ts=None):
