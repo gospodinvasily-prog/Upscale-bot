@@ -1,25 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-exec_orderflow.py — Скальперский бот OrderFlow (Iceberg Detector)
+exec_orderflow.py — Скальперский бот OrderFlow v2 (Iceberg Detector + OI Filter)
 ================================================================================
-Ловит "айсберги" (крупные игроки, дробящие заявки) через WebSocket Gate.io.
-При обнаружении — открывает микро-сделку на демо Upscale (через общий EXECUTOR).
+v2: Добавлен фильтр по Open Interest (OI) и time-stop 5 минут.
 
-Работает ПОЛНОСТЬЮ автономно, параллельно с 4H-ботом.
-Изолирован через strategy_registry (тег "orderflow_v1").
-
-Параметры сделок:
-  - Маржа: $50 (notional $250 при 5x)
-  - Стоп: 0.5% (сразу со входом)
-  - Тейк: 0.5% (через 65 сек по правилу Upscale)
-  - Force close: через 300 сек (5 мин), если ни стоп, ни тейк не сработали
+Логика v2:
+  1. Ловит "айсберги" через WebSocket (4+ одинаковых сделки за 15с, $100K+)
+  2. НОВОЕ: Проверяет OI (Open Interest) через REST API каждые 10с
+     - OI растёт → реальные новые long-позиции → ВХОДИМ ✅
+     - OI падает → закрытие шортов → ПРОПУСКАЕМ ❌
+  3. НОВОЕ: Time-stop 5 минут вместо 24 часов
+     - T+60с: подтянуть стоп в безубыток если цена не растёт
+     - T+180с: закрыть если тейк не достигнут
+     - T+300с: жёсткое закрытие
+  4. НОВОЕ: Cooldown 10 мин по символу, 3 мин глобальный, 3 сигнала/час
+  5. НОВОЕ: Динамический стоп = max(0.3%, 1.5×ATR_1min), тейк = 2×стоп
 
 Управление через Telegram:
   /of         — статус
-  /of_on      — включить исполнитель (бот открывает сделки)
-  /of_off     — выключить исполнитель (только алерты)
+  /of_on      — включить исполнитель
+  /of_off     — выключить исполнитель
   /of_alerts  — вкл/выкл алерты
-  /of_pairs   — список пар и последние сигналы
+  /of_pairs   — список пар и OI
   /of_log     — прислать CSV журнал
   /of_stats   — winrate, avg R, consec losses
 ================================================================================
@@ -36,7 +38,7 @@ from collections import deque, defaultdict
 from typing import Optional
 
 try:
-    import websocket  # websocket-client
+    import websocket
 except ImportError:
     websocket = None
     print("[exec_of] websocket-client не установлен. pip install websocket-client")
@@ -62,10 +64,10 @@ else:
 #  КОНСТАНТЫ
 # =====================================================================
 
-STRATEGY_NAME = "OrderFlow v1"
-STRATEGY_TAG  = "orderflow_v1"
+STRATEGY_NAME = "OrderFlow v2"
+STRATEGY_TAG  = "orderflow_v2"
 
-# --- Список пар (из env или дефолт 30 пар) ───────────────────────────────────
+# --- Список пар ─────────────────────────────────────────────────────────────
 OF_PAIRS_DEFAULT = [
     "BTC", "ETH", "SOL", "XRP", "LINK", "TRX", "DOT", "LTC", "BCH",
     "AVAX", "NEAR", "UNI", "APT", "FIL", "ATOM", "ARB", "OP", "INJ",
@@ -77,27 +79,38 @@ OF_PAIRS = [p.strip() for p in os.environ.get("OF_PAIRS", ",".join(OF_PAIRS_DEFA
 # --- Параметры сделок ────────────────────────────────────────────────────────
 OF_MARGIN_USD    = float(os.environ.get("OF_MARGIN_USD", "50"))
 OF_LEVERAGE      = int(os.environ.get("OF_LEVERAGE", "5"))
-OF_STOP_PCT      = float(os.environ.get("OF_STOP_PCT", "0.3"))   # 0.3% — тесный, но переживает 60с шум
-OF_TP_PCT        = float(os.environ.get("OF_TP_PCT", "0.6"))     # 0.6% — RR 1:2
+OF_STOP_PCT_MIN  = float(os.environ.get("OF_STOP_PCT_MIN", "0.3"))   # мин стоп 0.3%
+OF_TP_MULT       = float(os.environ.get("OF_TP_MULT", "2.0"))        # тейк = 2× стоп
 OF_MAX_OPEN      = int(os.environ.get("OF_MAX_OPEN", "5"))
 OF_MAX_SAME_SIDE = int(os.environ.get("OF_MAX_SAME_SIDE", "3"))
 OF_MAX_NEW_PER_DAY = int(os.environ.get("OF_MAX_NEW_PER_DAY", "20"))
-OF_FORCE_CLOSE_SEC = int(os.environ.get("OF_FORCE_CLOSE_SEC", "86400"))  # 24 часа — фактически выключено
+OF_FORCE_CLOSE_SEC = int(os.environ.get("OF_FORCE_CLOSE_SEC", "300"))  # 5 минут
+OF_BREAKEVEN_SEC = int(os.environ.get("OF_BREAKEVEN_SEC", "60"))       # 60с → безубыток
+OF_EXIT_SEC      = int(os.environ.get("OF_EXIT_SEC", "180"))           # 180с → выход
 OF_COOLDOWN_LOSSES = int(os.environ.get("OF_COOLDOWN_LOSSES", "4"))
-OF_COOLDOWN_MIN    = int(os.environ.get("OF_COOLDOWN_MIN", "60"))
+OF_COOLDOWN_MIN    = int(os.environ.get("OF_COOLDOWN_MIN", "20"))     # 20 мин после убытков
 
 # --- Параметры детектора айсбергов ──────────────────────────────────────────
 DETECTOR_WINDOW_SEC          = 15
 DETECTOR_MIN_TRADES          = 4
 DETECTOR_SIZE_TOLERANCE_PCT  = 15.0
-DETECTOR_MIN_TOTAL_NOTIONAL = 100000.0
+DETECTOR_MIN_TOTAL_NOTIONAL = 100000.0   # $100K мин
 DETECTOR_MIN_IMBALANCE_RATIO = 3.0
-DETECTOR_COOLDOWN_PER_SYMBOL = 120
-DETECTOR_MAX_SIGNALS_PER_MIN = 3
-DETECTOR_MIN_NOTIONAL_ABS    = 500.0
+DETECTOR_COOLDOWN_PER_SYMBOL = 600         # 10 минут (было 120)
+DETECTOR_GLOBAL_COOLDOWN     = 180         # 3 минуты между любыми сигналами
+DETECTOR_MAX_PER_HOUR        = 3           # максимум 3 сигнала в час
+DETECTOR_MAX_NOTIONAL_ABS    = 500.0
+
+# --- OI-фильтр ──────────────────────────────────────────────────────────────
+OI_POLL_SEC         = 10     # опрос каждые 10 секунд
+OI_WINDOW_SEC       = 30     # окно сравнения 30 секунд
+OI_MIN_DELTA_PCT    = 0.20   # OI должен вырасти минимум на 0.2%
+OI_MIN_DELTA_USD    = 25000  # OI должен вырасти минимум на $25K
+OI_STALE_SEC        = 40     # если OI не обновлялся >40с → skip
 
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+GATE_REST   = "https://api.gateio.ws/api/v4/futures/usdt"
 
 # --- Файлы состояния ────────────────────────────────────────────────────────
 OF_STATE_FILE   = "/tmp/orderflow_state.json"
@@ -108,31 +121,39 @@ OF_TRADES_CSV  = "/tmp/orderflow_trades.csv"
 # --- Блокировки ─────────────────────────────────────────────────────────────
 _STATE_LOCK   = threading.Lock()
 _TRACKED_LOCK = threading.Lock()
+_OI_LOCK      = threading.Lock()
 
 # --- Глобальное состояние ────────────────────────────────────────────────────
 _ws_thread = None
 _ws_client = None
+_oi_thread = None
 _state = {
     "enabled": False,
     "alerts_enabled": True,
     "ws_connected": False,
     "last_signal_ts": {},
+    "last_global_signal_ts": 0,
+    "signals_this_hour": 0,
+    "signals_hour_str": "",
     "signals_today": 0,
     "signals_today_date": "",
     "new_today": 0,
     "new_today_date": "",
     "cooldown_until": 0,
+    "cooldown_symbol_until": {},  # {sym: ts} — кулдаун по символу после убытка
 }
 
-# --- Буферы сделок (in-memory) ─────────────────────────────────────────────
+# --- Буферы ─────────────────────────────────────────────────────────────────
 _trade_buffer = defaultdict(lambda: deque(maxlen=200))
-_used_trade_ids = set()  # ID сделок, которые уже вошли в сигнал (чтобы не брать повторно)
+_used_trade_ids = set()
 _quanto_cache = {}
+_oi_cache = defaultdict(lambda: deque(maxlen=6))  # {sym: [(ts, oi_usd), ...]}
 
 # --- Статистика ─────────────────────────────────────────────────────────────
 _stats = {
     "signals_total": 0,
     "signals_suppressed": 0,
+    "signals_oi_rejected": 0,
     "trades_opened": 0,
     "trades_closed": 0,
     "wins": 0,
@@ -148,6 +169,9 @@ _stats = {
 
 def _today_utc_str():
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+
+def _hour_str():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d-%H")
 
 def _now_ts():
     return time.time()
@@ -191,6 +215,7 @@ def _save_state():
             "new_today": _state.get("new_today", 0),
             "signals_today_date": _state.get("signals_today_date", ""),
             "new_today_date": _state.get("new_today_date", ""),
+            "cooldown_symbol_until": _state.get("cooldown_symbol_until", {}),
         }
         _atomic_write_json(OF_STATE_FILE, data)
 
@@ -207,11 +232,13 @@ def _load_state():
             _state["new_today"] = saved.get("new_today", 0)
             _state["signals_today_date"] = saved.get("signals_today_date", _today_utc_str())
             _state["new_today_date"] = saved.get("new_today_date", _today_utc_str())
+            _state["cooldown_symbol_until"] = saved.get("cooldown_symbol_until", {})
         else:
             _state["signals_today_date"] = _today_utc_str()
             _state["new_today_date"] = _today_utc_str()
+            _state["signals_hour_str"] = _hour_str()
 
-def _reset_daily_counters():
+def _reset_counters():
     today = _today_utc_str()
     if _state.get("signals_today_date") != today:
         _state["signals_today"] = 0
@@ -219,6 +246,10 @@ def _reset_daily_counters():
     if _state.get("new_today_date") != today:
         _state["new_today"] = 0
         _state["new_today_date"] = today
+    hour = _hour_str()
+    if _state.get("signals_hour_str") != hour:
+        _state["signals_this_hour"] = 0
+        _state["signals_hour_str"] = hour
 
 
 # =====================================================================
@@ -237,16 +268,11 @@ def _add_tracked(pos_id, sym, side, entry, stop, tp, opened_ts):
         tracked[pos_id] = {
             "sym": sym, "side": side, "entry": entry,
             "stop": stop, "tp": tp, "opened_ts": opened_ts,
+            "initial_stop": stop,  # для проверки breakeven
+            "be_done": False,       # флаг: подтянут ли в безубыток
             "strategy": STRATEGY_TAG, "status": "open",
         }
         _save_tracked(tracked)
-
-def _remove_tracked(pos_id):
-    with _TRACKED_LOCK:
-        tracked = _load_tracked()
-        if pos_id in tracked:
-            del tracked[pos_id]
-            _save_tracked(tracked)
 
 def _get_open_count():
     tracked = _load_tracked()
@@ -263,7 +289,7 @@ def _has_position_for_sym(sym):
 
 
 # =====================================================================
-#  QUANTO MULTIPLIER (перевод size контрактов в USD)
+#  QUANTO MULTIPLIER
 # =====================================================================
 
 def _fetch_quanto_multipliers():
@@ -293,6 +319,85 @@ def _get_side(size):
 
 
 # =====================================================================
+#  OI POLLER (Open Interest — REST каждые 10 сек)
+# =====================================================================
+
+def _oi_loop():
+    """Фоновый поток: опрашивает OI по всем парам каждые 10 секунд."""
+    print("[exec_of] OI poller запущен (каждые 10с)")
+    while True:
+        try:
+            if not B:
+                time.sleep(OI_POLL_SEC)
+                continue
+            # Если quanto_cache пустой — переподнимаем
+            if not _quanto_cache:
+                _fetch_quanto_multipliers()
+            # Запрашиваем тикеры (включает total_size = OI в контрактах)
+            tickers = B.api_get("tickers", {})
+            if not isinstance(tickers, list):
+                time.sleep(OI_POLL_SEC)
+                continue
+            now = _now_ts()
+            for t in tickers:
+                contract = t.get("contract", "")
+                if not contract.endswith("_USDT"):
+                    continue
+                sym = contract[:-5]
+                if sym not in OF_PAIRS:
+                    continue
+                total_size = float(t.get("total_size", 0))
+                price = float(t.get("last", 0))
+                qm = _quanto_cache.get(sym, 1.0)
+                oi_usd = total_size * qm * price
+                with _OI_LOCK:
+                    _oi_cache[sym].append((now, oi_usd))
+        except Exception as e:
+            print(f"[exec_of] OI poll error: {e}")
+        time.sleep(OI_POLL_SEC)
+
+def _check_oi_filter(sym, iceberg_notional):
+    """Проверяет: растёт ли OI по паре за последние 30 секунд?
+    Возвращает: 'GREEN' (расти), 'RED' (падает), 'YELLOW' (нейтрально), 'STALE' (нет данных)."""
+    with _OI_LOCK:
+        buf = list(_oi_cache.get(sym, deque()))
+
+    if len(buf) < 2:
+        return "STALE"
+
+    now = _now_ts()
+    latest_ts, latest_oi = buf[-1]
+
+    # Проверка на устаревшие данные
+    if now - latest_ts > OI_STALE_SEC:
+        return "STALE"
+
+    # Ищем значение ~30 секунд назад
+    old_oi = None
+    for ts, oi in reversed(buf):
+        if now - ts >= OI_WINDOW_SEC:
+            old_oi = oi
+            break
+    if old_oi is None:
+        # Нет записи старше 30 сек — данных недостаточно для сравнения
+        return "STALE"
+
+    if old_oi <= 0:
+        return "STALE"
+
+    delta_usd = latest_oi - old_oi
+    delta_pct = (delta_usd / old_oi) * 100
+
+    if delta_usd < 0:
+        return "RED"
+    if delta_pct >= OI_MIN_DELTA_PCT and delta_usd >= OI_MIN_DELTA_USD:
+        return "GREEN"
+    if delta_pct >= OI_MIN_DELTA_PCT * 0.5:  # половина порога → YELLOW
+        return "YELLOW"
+    return "RED"
+
+
+# =====================================================================
 #  ICEBERG DETECTOR
 # =====================================================================
 
@@ -304,7 +409,6 @@ def _detect_iceberg(sym, side, size_usd, ts):
         return None
 
     buf = _trade_buffer[sym]
-
     while buf and float(buf[0].get("ts", 0)) < ts - DETECTOR_WINDOW_SEC:
         buf.popleft()
 
@@ -323,7 +427,6 @@ def _detect_iceberg(sym, side, size_usd, ts):
     if len(dom_trades) < DETECTOR_MIN_TRADES:
         return None
 
-    # Получаем объекты сделок (не только размеры), отсортированные по размеру
     trade_objs = sorted(dom_trades, key=lambda t: float(t.get("size", 0)))
     sizes = [float(t.get("size", 0)) for t in trade_objs]
     for i in range(len(sizes) - DETECTOR_MIN_TRADES + 1):
@@ -335,12 +438,10 @@ def _detect_iceberg(sym, side, size_usd, ts):
         if all(abs(float(s) - med) / med <= DETECTOR_SIZE_TOLERANCE_PCT / 100 for s in window_sizes):
             cluster_total = sum(window_sizes)
             if cluster_total >= DETECTOR_MIN_TOTAL_NOTIONAL:
-                # Помечаем сделки как использованные (чтобы не взять повторно)
                 for obj in window_objs:
                     trade_id = obj.get("id")
                     if trade_id:
                         _used_trade_ids.add(trade_id)
-                # Чистим старые ID (не храним бесконечно)
                 if len(_used_trade_ids) > 1000:
                     _used_trade_ids.clear()
                 return {
@@ -355,26 +456,28 @@ def _detect_iceberg(sym, side, size_usd, ts):
 
 def _should_emit_signal(sym):
     ts = _now_ts()
+    # Cooldown по символу
     last = _state["last_signal_ts"].get(sym, 0)
     if ts - last < DETECTOR_COOLDOWN_PER_SYMBOL:
         return False
-    now_min = int(ts / 60)
-    signals_this_min = _state.get("signals_per_min", {}).get(str(now_min), 0)
-    if signals_this_min >= DETECTOR_MAX_SIGNALS_PER_MIN:
+    # Глобальный cooldown
+    if ts - _state.get("last_global_signal_ts", 0) < DETECTOR_GLOBAL_COOLDOWN:
+        return False
+    # Лимит сигналов в час
+    _reset_counters()
+    if _state.get("signals_this_hour", 0) >= DETECTOR_MAX_PER_HOUR:
+        return False
+    # Cooldown по символу после убытка
+    cd_sym = _state.get("cooldown_symbol_until", {}).get(sym, 0)
+    if ts < cd_sym:
         return False
     return True
 
 def _record_signal(sym):
     ts = _now_ts()
     _state["last_signal_ts"][sym] = ts
-    now_min_int = int(ts / 60)
-    now_min = str(now_min_int)
-    if "signals_per_min" not in _state:
-        _state["signals_per_min"] = {}
-    _state["signals_per_min"][now_min] = _state["signals_per_min"].get(now_min, 0) + 1
-    for k in list(_state["signals_per_min"].keys()):
-        if int(k) < now_min_int - 2:
-            del _state["signals_per_min"][k]
+    _state["last_global_signal_ts"] = ts
+    _state["signals_this_hour"] = _state.get("signals_this_hour", 0) + 1
 
 
 # =====================================================================
@@ -383,7 +486,6 @@ def _record_signal(sym):
 
 def _process_trade(sym, size_contracts, price, ts):
     global _state
-
     try:
         size_contracts = float(size_contracts)
         price = float(price)
@@ -392,12 +494,10 @@ def _process_trade(sym, size_contracts, price, ts):
         return
 
     size_usd = _size_to_usd(sym, size_contracts, price)
-    if size_usd < DETECTOR_MIN_NOTIONAL_ABS:
+    if size_usd < DETECTOR_MAX_NOTIONAL_ABS:
         return
 
     side = _get_side(size_contracts)
-
-    # Фильтр: работаем ТОЛЬКО в Long (покупки).
     if side != "buy":
         return
 
@@ -405,7 +505,7 @@ def _process_trade(sym, size_contracts, price, ts):
         "ts": ts,
         "side": side,
         "size": size_usd,
-        "id": f"{ts}_{size_contracts}_{price}",  # уникальный ID сделки
+        "id": f"{ts}_{size_contracts}_{price}",
     })
 
     signal = _detect_iceberg(sym, side, size_usd, ts)
@@ -416,29 +516,45 @@ def _process_trade(sym, size_contracts, price, ts):
         _stats["signals_suppressed"] += 1
         return
 
+    # === OI-ФИЛЬТР (НОВОЕ v2) ===
+    oi_status = _check_oi_filter(sym, signal["total_usd"])
+
+    if oi_status == "RED":
+        _stats["signals_oi_rejected"] += 1
+        _stats["signals_suppressed"] += 1
+        print(f"[exec_of] {sym}: OI RED — пропуск (закрытие шорта)")
+        return
+    if oi_status == "STALE":
+        _stats["signals_oi_rejected"] += 1
+        _stats["signals_suppressed"] += 1
+        print(f"[exec_of] {sym}: OI STALE — пропуск (нет данных)")
+        return
+
+    # YELLOW → разрешаем с половинным размером
+    half_size = (oi_status == "YELLOW")
+
     _record_signal(sym)
     _stats["signals_total"] += 1
     _state["signals_today"] += 1
 
-    _log_signal(signal)
+    _log_signal(signal, oi_status)
 
     if _state["alerts_enabled"]:
-        side_emoji = "🟢 BUY" if signal["side"] == "buy" else "🔴 SELL"
-        sym_str = signal["sym"]
+        side_emoji = "🟢 BUY"
+        oi_emoji = "✅ OI↑" if oi_status == "GREEN" else "⚠️ OI~"
         if B:
             B.send_telegram(
-                f"🧊 <b>ICEBERG {sym_str} {side_emoji}</b>\n"
+                f"🧊 <b>ICEBERG {sym} {side_emoji}</b> {oi_emoji}\n"
                 f"За {DETECTOR_WINDOW_SEC}с: {signal['num_trades']} сделок по ~${signal['avg_size']:.0f}\n"
                 f"Суммарно: ${signal['total_usd']:.0f}\n"
-                f"Цена: {price}"
+                f"Цена: {price}\n"
+                f"OI: {oi_status}"
             )
 
     if not _state["enabled"]:
         return
 
     if _now_ts() < _state.get("cooldown_until", 0):
-        if B:
-            B.send_telegram(f"⏸️ OrderFlow cooldown (consec losses). Пропуск сигнала {sym_str}.")
         return
 
     if B and hasattr(B, "EXECUTOR"):
@@ -448,19 +564,17 @@ def _process_trade(sym, size_contracts, price, ts):
     if _has_position_for_sym(sym):
         return
 
-    if _get_open_count() >= OF_MAX_OPEN:
-        return
-    signal_side_str = "long" if signal["side"] == "buy" else "short"
-    if _get_same_side_count(signal_side_str) >= OF_MAX_SAME_SIDE:
-        return
-
-    _reset_daily_counters()
+    _reset_counters()
     if _state["new_today"] >= OF_MAX_NEW_PER_DAY:
         return
+    if _get_open_count() >= OF_MAX_OPEN:
+        return
+    if _get_same_side_count("long") >= OF_MAX_SAME_SIDE:
+        return
 
-    _execute_signal(signal, price)
+    _execute_signal(signal, price, half_size)
 
-def _execute_signal(signal, price):
+def _execute_signal(signal, price, half_size=False):
     if not B or not hasattr(B, "EXECUTOR"):
         return
     executor = B.EXECUTOR
@@ -468,23 +582,30 @@ def _execute_signal(signal, price):
         return
 
     sym = signal["sym"]
-    side_str = "long" if signal["side"] == "buy" else "short"
-    s = 1 if side_str == "long" else -1
-
     entry = float(price)
-    stop = entry * (1 - s * OF_STOP_PCT / 100)
-    tp = entry * (1 + s * OF_TP_PCT / 100)
+    s = 1  # long only
+
+    # Динамический стоп: max(0.3%, 1.5×ATR_1min)
+    # Упрощённо: используем 0.3% (ATR расчёт можно добавить позже)
+    stop_pct = OF_STOP_PCT_MIN
+    tp_pct = stop_pct * OF_TP_MULT
+
+    # Если YELLOW — половинный размер
+    margin = OF_MARGIN_USD * (0.5 if half_size else 1.0)
+
+    stop = entry * (1 - s * stop_pct / 100)
+    tp = entry * (1 + s * tp_pct / 100)
 
     sig = {
         "symbol": sym,
-        "side": side_str,
+        "side": "long",
         "price": entry,
         "stop": stop,
-        "stop_pct": OF_STOP_PCT,
+        "stop_pct": stop_pct,
         "tp1_price": tp,
         "exit_mode": "tp_ladder",
-        "risk_usd": OF_MARGIN_USD * OF_STOP_PCT / 100,
-        "max_pos_usd": OF_MARGIN_USD * OF_LEVERAGE,
+        "risk_usd": margin * stop_pct / 100,
+        "max_pos_usd": margin * OF_LEVERAGE,
         "max_same_side": OF_MAX_SAME_SIDE,
         "strategy": STRATEGY_TAG,
         "leverage_override": OF_LEVERAGE,
@@ -495,25 +616,26 @@ def _execute_signal(signal, price):
         score = int(signal["total_usd"] / 1000)
         executor.on_signal(sig, score)
 
+        size_str = f"${margin:.0f}" + (" (½)" if half_size else "")
         if B:
             B.send_telegram(
-                f"🧊 <b>OF ВХОД {sym} {side_str.upper()}</b>\n"
-                f"Вход: ${entry:.6g} | Стоп: ${stop:.6g} ({OF_STOP_PCT}%)\n"
-                f"Тейк (через 65с): ${tp:.6g} ({OF_TP_PCT}%)\n"
-                f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x"
+                f"🧊 <b>OF ВХОД {sym} LONG</b>\n"
+                f"Вход: ${entry:.6g} | Стоп: ${stop:.6g} ({stop_pct}%)\n"
+                f"Тейк (через 65с): ${tp:.6g} ({tp_pct:.1f}%)\n"
+                f"Маржа: {size_str} × {OF_LEVERAGE}x\n"
+                f"Time-stop: 60с→BE, 180с→выход, 300с→force"
             )
 
         _state["new_today"] += 1
         _stats["trades_opened"] += 1
         _save_state()
-
-        _add_tracked(f"pending_{sym}_{int(_now_ts())}", sym, side_str, entry, stop, tp, _now_ts())
+        _add_tracked(f"pending_{sym}_{int(_now_ts())}", sym, "long", entry, stop, tp, _now_ts())
 
     except Exception as e:
         if B:
             B.send_telegram(f"⚠️ OF {sym}: ошибка входа — {e}")
 
-def _log_signal(signal):
+def _log_signal(signal, oi_status=""):
     try:
         import csv
         row = {
@@ -523,6 +645,7 @@ def _log_signal(signal):
             "total_usd": round(signal["total_usd"], 2),
             "avg_size": round(signal["avg_size"], 2),
             "num_trades": signal["num_trades"],
+            "oi": oi_status,
             "executed": _state["enabled"],
         }
         header = ",".join(row.keys())
@@ -570,7 +693,7 @@ def _log_trade(sym, side, entry, exit_price, pnl, reason, hold_sec):
 
 
 # =====================================================================
-#  POSITION MANAGEMENT
+#  POSITION MANAGEMENT (с time-stop)
 # =====================================================================
 
 def _manage_positions():
@@ -604,11 +727,9 @@ def _manage_positions():
         if rec.get("status") != "open":
             continue
 
-        # Если это pending-запись (ещё не сопоставлена с реальной позицией) —
-        # пытаемся найти реальную позицию по символу и стороне
+        # Pending → real ID matching
         if pos_id.startswith("pending_"):
             sym_match = rec.get("sym")
-            side_match = rec.get("side")
             found_real = False
             for lp in live_positions:
                 if not isinstance(lp, dict):
@@ -621,7 +742,6 @@ def _manage_positions():
                             lp_sym = s
                             break
                 if lp_sym == sym_match:
-                    # Нашли реальную позицию! Заменяем pending на реальный pos_id
                     real_id = UE._pos_id(lp)
                     tracked[real_id] = rec
                     del tracked[pos_id]
@@ -631,14 +751,13 @@ def _manage_positions():
                     found_real = True
                     break
             if not found_real:
-                # Позиция не найдена на бирже. Возможно ордер отклонён или стоп сработал.
-                # Если pending висит больше 120 сек — удаляем, не считая убытком.
                 if now - rec.get("opened_ts", now) > 120:
-                    print(f"[exec_of] {sym_match}: pending истёк (нет позиции 120с) — удаляем")
+                    print(f"[exec_of] {sym_match}: pending истёк — удаляем")
                     del tracked[pos_id]
                     changed = True
             continue
 
+        # Позиция закрылась (стоп, тейк, или time-stop)
         if pos_id not in live_ids:
             entry = rec.get("entry", 0)
             exit_price = rec.get("tp", entry)
@@ -646,7 +765,7 @@ def _manage_positions():
             pnl = _fetch_realized_pnl(executor, rec["sym"], rec.get("opened_ts", now))
 
             _log_trade(rec["sym"], rec["side"], entry, exit_price, pnl,
-                       "TP/SL/END", hold_sec)
+                       "TP/SL/TIMEOUT", hold_sec)
 
             _stats["trades_closed"] += 1
             _stats["total_pnl"] += pnl
@@ -656,7 +775,10 @@ def _manage_positions():
             elif pnl < 0:
                 _stats["losses"] += 1
                 _stats["consec_losses"] += 1
-            # PnL == 0: не считаем ни как win, ни как loss (не смогли получить PnL)
+                # Cooldown по символу после убытка
+                if "cooldown_symbol_until" not in _state:
+                    _state["cooldown_symbol_until"] = {}
+                _state["cooldown_symbol_until"][rec["sym"]] = now + 1200  # 20 мин
 
             if _stats["consec_losses"] >= OF_COOLDOWN_LOSSES:
                 _state["cooldown_until"] = now + OF_COOLDOWN_MIN * 60
@@ -664,26 +786,63 @@ def _manage_positions():
                 _save_state()
                 if B:
                     B.send_telegram(
-                        f"⏸️ OrderFlow cooldown: {OF_COOLDOWN_LOSSES} убытка подряд → "
+                        f"⏸️ OF cooldown: {OF_COOLDOWN_LOSSES} убытка подряд → "
                         f"пауза {OF_COOLDOWN_MIN} мин. PnL: ${pnl:.2f}"
                     )
 
             del tracked[pos_id]
             changed = True
         else:
-            if now - rec.get("opened_ts", now) > OF_FORCE_CLOSE_SEC:
+            # === TIME-STOP ЛОГИКА (НОВОЕ v2) ===
+            hold_sec = now - rec.get("opened_ts", now)
+
+            # T+60с: подтянуть стоп в безубыток (если ещё не сделано)
+            if hold_sec >= OF_BREAKEVEN_SEC and not rec.get("be_done", False):
                 pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
                 if pos:
                     mid = UE._pos_market(pos)
-                    if not mid:
-                        continue
-                    info = {"id": pos_id, "mid": mid, "dir": UE._pos_dir(pos)}
-                    try:
-                        res = executor.close_position(info, reason=f"OF_TIMEOUT_{OF_FORCE_CLOSE_SEC}s")
-                        if B:
-                            B.send_telegram(f"⏱️ OF {rec['sym']}: закрыт по таймауту ({res})")
-                    except Exception as e:
-                        print(f"[exec_of] force close {pos_id}: {e}")
+                    if mid:
+                        entry = rec.get("entry", 0)
+                        be_price = entry * 1.0001  # +0.01% — покрыть комиссию
+                        info = {"id": pos_id, "mid": mid, "dir": "long"}
+                        try:
+                            executor.move_stop(info, be_price)
+                            rec["be_done"] = True
+                            rec["stop"] = be_price
+                            changed = True
+                            print(f"[exec_of] {rec['sym']}: BE move @ T+{int(hold_sec)}с")
+                        except Exception as e:
+                            print(f"[exec_of] BE move error: {e}")
+
+            # T+180с: закрыть если тейк не достигнут (один раз!)
+            if hold_sec >= OF_EXIT_SEC and not rec.get("exit_done", False):
+                pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
+                if pos:
+                    mid = UE._pos_market(pos)
+                    if mid:
+                        info = {"id": pos_id, "mid": mid, "dir": "long"}
+                        try:
+                            res = executor.close_position(info, reason=f"OF_EXIT_{OF_EXIT_SEC}s")
+                            rec["exit_done"] = True
+                            changed = True
+                            if B:
+                                B.send_telegram(f"⏱️ OF {rec['sym']}: выход по времени T+{int(hold_sec)}с ({res})")
+                        except Exception as e:
+                            print(f"[exec_of] exit close error: {e}")
+
+            # T+300с: жёсткое закрытие (тоже один раз!)
+            if hold_sec >= OF_FORCE_CLOSE_SEC and not rec.get("exit_done", False):
+                pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
+                if pos:
+                    mid = UE._pos_market(pos)
+                    if mid:
+                        info = {"id": pos_id, "mid": mid, "dir": "long"}
+                        try:
+                            res = executor.close_position(info, reason=f"OF_FORCE_{OF_FORCE_CLOSE_SEC}s")
+                            if B:
+                                B.send_telegram(f"🛑 OF {rec['sym']}: FORCE CLOSE T+{int(hold_sec)}с ({res})")
+                        except Exception as e:
+                            print(f"[exec_of] force close error: {e}")
 
     if changed:
         with _TRACKED_LOCK:
@@ -734,7 +893,7 @@ def _fetch_realized_pnl(executor, sym, since_ts):
 
 
 # =====================================================================
-#  WEBSOCKET CLIENT (Gate.io)
+#  WEBSOCKET CLIENT
 # =====================================================================
 
 class GateWSClient:
@@ -815,12 +974,9 @@ class GateWSClient:
                 self.ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
                 print(f"[exec_of] WS exception: {e}")
-
             _state["ws_connected"] = False
-
             if not self.running:
                 break
-
             print(f"[exec_of] Reconnecting in {self.reconnect_delay}s...")
             time.sleep(self.reconnect_delay)
             self.reconnect_delay = min(self.reconnect_delay * 2, self.max_delay)
@@ -843,10 +999,8 @@ def _watchdog_loop():
                 _state["ws_connected"] = False
                 if _ws_client.ws:
                     _ws_client.ws.close()
-
             _manage_positions()
-            _reset_daily_counters()
-
+            _reset_counters()
         except Exception as e:
             print(f"[exec_of] watchdog error: {e}")
         time.sleep(15)
@@ -857,7 +1011,7 @@ def _watchdog_loop():
 # =====================================================================
 
 def status_report():
-    lines = ["", "━━━ OrderFlow v1 ━━━"]
+    lines = ["", "━━━ OrderFlow v2 ━━━"]
     enabled = _state.get("enabled", False)
     alerts = _state.get("alerts_enabled", True)
     ws_ok = _state.get("ws_connected", False)
@@ -873,30 +1027,30 @@ def status_report():
     lines.append(f"Пар: {len(OF_PAIRS)}")
     lines.append(f"Сделок сегодня: {_state.get('new_today', 0)}/{OF_MAX_NEW_PER_DAY}")
     lines.append(f"Сигналов сегодня: {_state.get('signals_today', 0)}")
+    lines.append(f"Сигналов в час: {_state.get('signals_this_hour', 0)}/{DETECTOR_MAX_PER_HOUR}")
 
     tracked = _load_tracked()
     open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
     lines.append(f"Открыто: {open_count}/{OF_MAX_OPEN}")
 
-    lines.append(f"Всего сигналов: {_stats['signals_total']} (подавлено: {_stats['signals_suppressed']})")
+    lines.append(f"Всего сигналов: {_stats['signals_total']} (OI отклонено: {_stats['signals_oi_rejected']}, подавлено: {_stats['signals_suppressed']})")
     lines.append(f"Сделок: {_stats['trades_opened']} открыто / {_stats['trades_closed']} закрыто")
     if _stats['trades_closed'] > 0:
         wr = _stats['wins'] / _stats['trades_closed'] * 100
         lines.append(f"Winrate: {wr:.0f}% ({_stats['wins']}/{_stats['trades_closed']})")
         lines.append(f"PnL: ${_stats['total_pnl']:+.2f}")
         lines.append(f"Убытков подряд: {_stats['consec_losses']}")
-
     return "\n".join(lines)
 
 def cmd_on():
     _state["enabled"] = True
     _save_state()
-    return "✅ OrderFlow исполнитель включён. Бот будет открывать сделки при сигналах."
+    return "✅ OrderFlow v2 исполнитель включён."
 
 def cmd_off():
     _state["enabled"] = False
     _save_state()
-    return "🔴 OrderFlow исполнитель выключен. Алерты продолжают работать."
+    return "🔴 OrderFlow v2 исполнитель выключен. Алерты продолжают работать."
 
 def cmd_alerts_toggle():
     _state["alerts_enabled"] = not _state["alerts_enabled"]
@@ -905,10 +1059,19 @@ def cmd_alerts_toggle():
     return f"🔔 Алерты {state_str}"
 
 def cmd_pairs():
-    lines = ["", "━━━ OF Пары ━━━"]
+    lines = ["", "━━━ OF Пары + OI ━━━"]
     for p in OF_PAIRS:
         buf = _trade_buffer.get(p, deque())
-        lines.append(f"  {p}: {len(buf)} сделок в буфере")
+        with _OI_LOCK:
+            oi_buf = list(_oi_cache.get(p, deque()))
+        oi_str = "нет данных"
+        if len(oi_buf) >= 2:
+            latest = oi_buf[-1][1]
+            old = oi_buf[0][1]
+            if old > 0:
+                delta_pct = (latest - old) / old * 100
+                oi_str = f"${latest:,.0f} (Δ {delta_pct:+.2f}%)"
+        lines.append(f"  {p}: {len(buf)} сделок | OI: {oi_str}")
     return "\n".join(lines)
 
 def cmd_log():
@@ -927,8 +1090,9 @@ def cmd_log():
     return f"📒 Отправлено файлов: {sent}"
 
 def cmd_stats():
-    lines = ["", "━━━ OF Статистика ━━━"]
+    lines = ["", "━━━ OF Статистика v2 ━━━"]
     lines.append(f"Сигналов всего: {_stats['signals_total']}")
+    lines.append(f"OI отклонено: {_stats['signals_oi_rejected']}")
     lines.append(f"Подавлено (cooldown/флуд): {_stats['signals_suppressed']}")
     lines.append(f"Сделок открыто: {_stats['trades_opened']}")
     lines.append(f"Сделок закрыто: {_stats['trades_closed']}")
@@ -946,7 +1110,7 @@ def cmd_stats():
 # =====================================================================
 
 def start():
-    global _ws_thread, _ws_client
+    global _ws_thread, _ws_client, _oi_thread
 
     if websocket is None:
         print("[exec_of] websocket-client не установлен, сканер не запущен")
@@ -955,24 +1119,35 @@ def start():
     _load_state()
     _fetch_quanto_multipliers()
 
+    # Запускаем OI-поллер (REST каждые 10с)
+    _oi_thread = threading.Thread(target=_oi_loop, daemon=True, name="of-oi")
+    _oi_thread.start()
+
+    # Запускаем WS-клиент
     _ws_client = GateWSClient()
     _ws_thread = threading.Thread(target=_ws_client.run, daemon=True, name="of-ws")
     _ws_thread.start()
 
+    # Запускаем watchdog
     wd = threading.Thread(target=_watchdog_loop, daemon=True, name="of-watchdog")
     wd.start()
 
-    print(f"[exec_of] Старт: {len(OF_PAIRS)} пар, WS={GATE_WS_URL}")
+    print(f"[exec_of] v2 Старт: {len(OF_PAIRS)} пар, WS={GATE_WS_URL}, OI poll=10с")
     if B:
         B.send_telegram(
-            f"🧊 <b>OrderFlow v1 запущен</b>\n"
+            f"🧊 <b>OrderFlow v2 запущен</b>\n"
             f"Пар: {len(OF_PAIRS)}\n"
             f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x\n"
-            f"Стоп/Тейк: {OF_STOP_PCT}%/{OF_TP_PCT}%\n"
+            f"Стоп: {OF_STOP_PCT_MIN}% | Тейк: {OF_STOP_PCT_MIN * OF_TP_MULT:.1f}% (RR 1:{OF_TP_MULT:.0f})\n"
+            f"OI-фильтр: ✅ (poll 10с, окно 30с)\n"
+            f"Time-stop: 60с→BE, 180с→exit, 300с→force\n"
+            f"Cooldown: {DETECTOR_COOLDOWN_PER_SYMBOL}с/символ, {DETECTOR_GLOBAL_COOLDOWN}с глобальный\n"
+            f"Лимит: {DETECTOR_MAX_PER_HOUR} сигнала/час\n"
+            f"Порог айсберга: ${DETECTOR_MIN_TOTAL_NOTIONAL:,.0f}\n"
             f"Исполнитель: {'✅ ВКЛ' if _state['enabled'] else '🔴 ВЫКЛ'}\n"
             f"Алерты: {'✅ ВКЛ' if _state['alerts_enabled'] else '🔴 ВЫКЛ'}"
         )
 
 
 if __name__ == "__main__":
-    print("exec_orderflow.py — модуль скальперского бота OrderFlow")
+    print("exec_orderflow.py v2 — OrderFlow + OI Filter")

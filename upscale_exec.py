@@ -807,6 +807,9 @@ class Executor:
         pos = self._wait_position(mid, side, before)
         if not pos:
             return "ордер отправлен, но позицию не нашёл (проверь терминал)"
+        # Регистрируем стратегию в реестре СРАЗУ (закрывает 15-сек окно где 4H-бот мог "украсть" OF-позицию)
+        pos_id = _pos_id(pos)
+        self._registry_set(pos_id, strategy)
         size = _pos_size(pos)
         size_base = Decimal(size) / FP
         notional = abs(from_fp9(pos["notional"])) if pos.get("notional") else Decimal(0)
