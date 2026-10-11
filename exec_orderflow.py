@@ -383,13 +383,14 @@ def _should_emit_signal(sym):
 def _record_signal(sym):
     ts = _now_ts()
     _state["last_signal_ts"][sym] = ts
-    now_min = str(int(ts / 60))
+    now_min_int = int(ts / 60)
+    now_min = str(now_min_int)
     if "signals_per_min" not in _state:
         _state["signals_per_min"] = {}
     _state["signals_per_min"][now_min] = _state["signals_per_min"].get(now_min, 0) + 1
     # Чистим старые минуты
     for k in list(_state["signals_per_min"].keys()):
-        if int(k) < now_min - 2:
+        if int(k) < now_min_int - 2:
             del _state["signals_per_min"][k]
 
 
