@@ -99,7 +99,7 @@ DETECTOR_PERCENTILE          = 95
 DETECTOR_PERCENTILE_WINDOW   = 1800  # 30 мин
 
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
-GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/usdt"
 GATE_REST   = "https://api.gateio.ws/api/v4/futures/usdt"
 
 # --- Файлы состояния ────────────────────────────────────────────────────────
@@ -754,9 +754,13 @@ class GateWSClient:
                 sym = contract[:-5]
                 if sym not in OF_PAIRS:
                     continue
-                size = trade.get("size", "0")
-                price = trade.get("price", "0")
-                ts_ms = int(trade.get("create_time_ms", 0))
+                # Gate.io присылает size/price/ts как строки — строго конвертируем в числа
+                try:
+                    size = float(trade.get("size", 0) or 0)
+                    price = float(trade.get("price", 0) or 0)
+                    ts_ms = int(float(trade.get("create_time_ms", 0) or 0))
+                except (ValueError, TypeError):
+                    continue
                 ts = ts_ms / 1000 if ts_ms else _now_ts()
                 _process_trade(sym, size, price, ts)
         except Exception as e:
