@@ -9,7 +9,7 @@ exec_orderflow.py — Скальперский бот OrderFlow (Iceberg Detecto
 Изолирован через strategy_registry (тег "orderflow_v1").
 
 Параметры сделок:
-  - Маржа: $50 (notional $250-500 при 5-10x)
+  - Маржа: $50 (notional $250 при 5x)
   - Стоп: 0.5% (сразу со входом)
   - Тейк: 0.5% (через 65 сек по правилу Upscale)
   - Force close: через 300 сек (5 мин), если ни стоп, ни тейк не сработали
@@ -76,7 +76,7 @@ OF_PAIRS = [p.strip() for p in os.environ.get("OF_PAIRS", ",".join(OF_PAIRS_DEFA
 
 # --- Параметры сделок ────────────────────────────────────────────────────────
 OF_MARGIN_USD    = float(os.environ.get("OF_MARGIN_USD", "50"))
-OF_LEVERAGE      = int(os.environ.get("OF_LEVERAGE", "10"))
+OF_LEVERAGE      = int(os.environ.get("OF_LEVERAGE", "5"))
 OF_STOP_PCT      = float(os.environ.get("OF_STOP_PCT", "0.5"))   # 0.5%
 OF_TP_PCT        = float(os.environ.get("OF_TP_PCT", "0.5"))     # 0.5%
 OF_MAX_OPEN      = int(os.environ.get("OF_MAX_OPEN", "5"))
@@ -95,12 +95,9 @@ DETECTOR_MIN_IMBALANCE_RATIO = 3.0
 DETECTOR_COOLDOWN_PER_SYMBOL = 120
 DETECTOR_MAX_SIGNALS_PER_MIN = 3
 DETECTOR_MIN_NOTIONAL_ABS    = 500.0
-DETECTOR_PERCENTILE          = 95
-DETECTOR_PERCENTILE_WINDOW   = 1800  # 30 мин
 
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
-GATE_REST   = "https://api.gateio.ws/api/v4/futures/usdt"
 
 # --- Файлы состояния ────────────────────────────────────────────────────────
 OF_STATE_FILE   = "/tmp/orderflow_state.json"
@@ -111,21 +108,19 @@ OF_TRADES_CSV  = "/tmp/orderflow_trades.csv"
 # --- Блокировки ─────────────────────────────────────────────────────────────
 _STATE_LOCK   = threading.Lock()
 _TRACKED_LOCK = threading.Lock()
-_SIGNALS_LOCK = threading.Lock()
 
 # --- Глобальное состояние ────────────────────────────────────────────────────
 _ws_thread = None
 _ws_client = None
 _state = {
-    "enabled": False,         # исполнитель вкл/выкл
-    "alerts_enabled": True,  # алерты вкл/выкл
+    "enabled": False,
+    "alerts_enabled": True,
     "ws_connected": False,
     "last_signal_ts": {},
     "signals_today": 0,
     "signals_today_date": "",
     "new_today": 0,
     "new_today_date": "",
-    "consec_losses": 0,
     "cooldown_until": 0,
 }
 
@@ -179,13 +174,6 @@ def _median(values):
         return (s[n//2 - 1] + s[n//2]) / 2
     return s[n//2]
 
-def _percentile(values, p):
-    if not values: return 0.0
-    s = sorted(values)
-    k = int(len(s) * p / 100)
-    if k >= len(s): k = len(s) - 1
-    return s[k]
-
 
 # =====================================================================
 #  STATE MANAGEMENT
@@ -197,7 +185,7 @@ def _save_state():
             "enabled": _state["enabled"],
             "alerts_enabled": _state["alerts_enabled"],
             "cooldown_until": _state["cooldown_until"],
-            "consec_losses": _stats["consec_losses"],  # из _stats, не из _state
+            "consec_losses": _stats["consec_losses"],
             "signals_today": _state.get("signals_today", 0),
             "new_today": _state.get("new_today", 0),
             "signals_today_date": _state.get("signals_today_date", ""),
@@ -213,7 +201,7 @@ def _load_state():
             _state["enabled"] = saved.get("enabled", False)
             _state["alerts_enabled"] = saved.get("alerts_enabled", True)
             _state["cooldown_until"] = saved.get("cooldown_until", 0)
-            _stats["consec_losses"] = saved.get("consec_losses", 0)  # в _stats, не в _state
+            _stats["consec_losses"] = saved.get("consec_losses", 0)
             _state["signals_today"] = saved.get("signals_today", 0)
             _state["new_today"] = saved.get("new_today", 0)
             _state["signals_today_date"] = saved.get("signals_today_date", _today_utc_str())
@@ -278,7 +266,6 @@ def _has_position_for_sym(sym):
 # =====================================================================
 
 def _fetch_quanto_multipliers():
-    """Загружает quanto_multiplier для всех пар с Gate.io REST API."""
     global _quanto_cache
     if not B:
         return
@@ -297,12 +284,10 @@ def _fetch_quanto_multipliers():
         print(f"[exec_of] Ошибка загрузки quanto: {e}")
 
 def _size_to_usd(sym, size_contracts, price):
-    """Переводит размер в контрактах в USD notional."""
     qm = _quanto_cache.get(sym, 1.0)
     return abs(float(size_contracts)) * qm * float(price)
 
 def _get_side(size):
-    """В Gate.io futures: size > 0 = buy (long), size < 0 = sell (short)."""
     return "buy" if float(size) > 0 else "sell"
 
 
@@ -311,9 +296,6 @@ def _get_side(size):
 # =====================================================================
 
 def _detect_iceberg(sym, side, size_usd, ts):
-    """Проверяет, является ли новая сделка частью айсберга.
-    Возвращает dict с сигналом или None."""
-    # Жёсткая конвертация
     try:
         ts = float(ts)
         size_usd = float(size_usd)
@@ -322,17 +304,14 @@ def _detect_iceberg(sym, side, size_usd, ts):
 
     buf = _trade_buffer[sym]
 
-    # Чистим старые
     while buf and float(buf[0].get("ts", 0)) < ts - DETECTOR_WINDOW_SEC:
         buf.popleft()
 
-    # Разделяем на buy/sell
     buys = [t for t in buf if t.get("side") == "buy"]
     sells = [t for t in buf if t.get("side") == "sell"]
     buy_vol = sum(float(t.get("size", 0)) for t in buys)
     sell_vol = sum(float(t.get("size", 0)) for t in sells)
 
-    # Определяем доминирующую сторону
     if buy_vol >= sell_vol * DETECTOR_MIN_IMBALANCE_RATIO:
         dom_side, dom_trades = "buy", buys
     elif sell_vol >= buy_vol * DETECTOR_MIN_IMBALANCE_RATIO:
@@ -343,7 +322,6 @@ def _detect_iceberg(sym, side, size_usd, ts):
     if len(dom_trades) < DETECTOR_MIN_TRADES:
         return None
 
-    # Кластеризация по размеру
     sizes = sorted([float(t.get("size", 0)) for t in dom_trades])
     for i in range(len(sizes) - DETECTOR_MIN_TRADES + 1):
         window = sizes[i:i + DETECTOR_MIN_TRADES]
@@ -364,20 +342,14 @@ def _detect_iceberg(sym, side, size_usd, ts):
     return None
 
 def _should_emit_signal(sym):
-    """Проверяет cooldown и флуд-лимиты."""
     ts = _now_ts()
-
-    # Cooldown по символу
     last = _state["last_signal_ts"].get(sym, 0)
     if ts - last < DETECTOR_COOLDOWN_PER_SYMBOL:
         return False
-
-    # Флуд-лимит: max 3 сигнала в минуту
     now_min = int(ts / 60)
     signals_this_min = _state.get("signals_per_min", {}).get(str(now_min), 0)
     if signals_this_min >= DETECTOR_MAX_SIGNALS_PER_MIN:
         return False
-
     return True
 
 def _record_signal(sym):
@@ -388,7 +360,6 @@ def _record_signal(sym):
     if "signals_per_min" not in _state:
         _state["signals_per_min"] = {}
     _state["signals_per_min"][now_min] = _state["signals_per_min"].get(now_min, 0) + 1
-    # Чистим старые минуты
     for k in list(_state["signals_per_min"].keys()):
         if int(k) < now_min_int - 2:
             del _state["signals_per_min"][k]
@@ -399,10 +370,8 @@ def _record_signal(sym):
 # =====================================================================
 
 def _process_trade(sym, size_contracts, price, ts):
-    """Обрабатывает одну сделку из WebSocket."""
     global _state
 
-    # Жёсткая конвертация всех входных данных в числа
     try:
         size_contracts = float(size_contracts)
         price = float(price)
@@ -417,23 +386,19 @@ def _process_trade(sym, size_contracts, price, ts):
     side = _get_side(size_contracts)
 
     # Фильтр: работаем ТОЛЬКО в Long (покупки).
-    # Игнорируем все sell-сделки для детектора айсбергов.
     if side != "buy":
         return
 
-    # Добавляем в буфер
     _trade_buffer[sym].append({
         "ts": ts,
         "side": side,
         "size": size_usd,
     })
 
-    # Проверяем детектор
     signal = _detect_iceberg(sym, side, size_usd, ts)
     if not signal:
         return
 
-    # Проверяем cooldown и флуд-лимиты
     if not _should_emit_signal(sym):
         _stats["signals_suppressed"] += 1
         return
@@ -442,10 +407,8 @@ def _process_trade(sym, size_contracts, price, ts):
     _stats["signals_total"] += 1
     _state["signals_today"] += 1
 
-    # Записываем в CSV
     _log_signal(signal)
 
-    # Алерт в Telegram
     if _state["alerts_enabled"]:
         side_emoji = "🟢 BUY" if signal["side"] == "buy" else "🔴 SELL"
         sym_str = signal["sym"]
@@ -457,42 +420,34 @@ def _process_trade(sym, size_contracts, price, ts):
                 f"Цена: {price}"
             )
 
-    # Если исполнитель выключен — не торгуем
     if not _state["enabled"]:
         return
 
-    # Проверяем cooldown после серии убытков
     if _now_ts() < _state.get("cooldown_until", 0):
         if B:
             B.send_telegram(f"⏸️ OrderFlow cooldown (consec losses). Пропуск сигнала {sym_str}.")
         return
 
-    # Проверяем, что 4H-бот не в Daily Stop
     if B and hasattr(B, "EXECUTOR"):
         if B.EXECUTOR.halted:
             return
 
-    # Проверяем изоляцию: если по символу уже есть позиция (любая стратегия)
     if _has_position_for_sym(sym):
         return
 
-    # Проверяем лимиты
     if _get_open_count() >= OF_MAX_OPEN:
         return
     signal_side_str = "long" if signal["side"] == "buy" else "short"
     if _get_same_side_count(signal_side_str) >= OF_MAX_SAME_SIDE:
         return
 
-    # Проверяем дневной лимит
     _reset_daily_counters()
     if _state["new_today"] >= OF_MAX_NEW_PER_DAY:
         return
 
-    # Открываем сделку
     _execute_signal(signal, price)
 
 def _execute_signal(signal, price):
-    """Открывает сделку на Upscale."""
     if not B or not hasattr(B, "EXECUTOR"):
         return
     executor = B.EXECUTOR
@@ -507,9 +462,6 @@ def _execute_signal(signal, price):
     stop = entry * (1 - s * OF_STOP_PCT / 100)
     tp = entry * (1 + s * OF_TP_PCT / 100)
 
-    # Формируем сигнал для EXECUTOR
-    # risk_usd = то, что мы готовы потерять = маржа × стоп% = $50 × 0.5% = $0.25
-    # max_pos_usd = максимальный notional = маржа × плечо = $50 × 10 = $500
     sig = {
         "symbol": sym,
         "side": side_str,
@@ -518,8 +470,8 @@ def _execute_signal(signal, price):
         "stop_pct": OF_STOP_PCT,
         "tp1_price": tp,
         "exit_mode": "tp_ladder",
-        "risk_usd": OF_MARGIN_USD * OF_STOP_PCT / 100,   # $0.25 — риск по стопу
-        "max_pos_usd": OF_MARGIN_USD * OF_LEVERAGE,        # $500 — потолок notional
+        "risk_usd": OF_MARGIN_USD * OF_STOP_PCT / 100,
+        "max_pos_usd": OF_MARGIN_USD * OF_LEVERAGE,
         "max_same_side": OF_MAX_SAME_SIDE,
         "strategy": STRATEGY_TAG,
         "leverage_override": OF_LEVERAGE,
@@ -538,15 +490,10 @@ def _execute_signal(signal, price):
                 f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x"
             )
 
-        # Инкрементируем счётчики ПОСЛЕ on_signal (ордер уйдёт асинхронно)
-        # Если ордер отклонён — _handle() запишет skip в CSV, но счётчик уже инкрементирован.
-        # Это приемлемый компромисс: 1-2 ложных инкремента не сломают лимит 20/день.
         _state["new_today"] += 1
         _stats["trades_opened"] += 1
         _save_state()
 
-        # Записываем в tracked. pos_id обновится в _manage_positions,
-        # когда найдём реальную позицию на Upscale.
         _add_tracked(f"pending_{sym}_{int(_now_ts())}", sym, side_str, entry, stop, tp, _now_ts())
 
     except Exception as e:
@@ -554,7 +501,6 @@ def _execute_signal(signal, price):
             B.send_telegram(f"⚠️ OF {sym}: ошибка входа — {e}")
 
 def _log_signal(signal):
-    """Записывает сигнал в CSV."""
     try:
         import csv
         row = {
@@ -582,7 +528,6 @@ def _log_signal(signal):
         print(f"[exec_of] CSV error: {e}")
 
 def _log_trade(sym, side, entry, exit_price, pnl, reason, hold_sec):
-    """Записывает закрытую сделку в CSV."""
     try:
         import csv
         row = {
@@ -612,13 +557,10 @@ def _log_trade(sym, side, entry, exit_price, pnl, reason, hold_sec):
 
 
 # =====================================================================
-#  POSITION MANAGEMENT (проверка закрытий и force-close)
+#  POSITION MANAGEMENT
 # =====================================================================
 
 def _manage_positions():
-    """Периодически проверяет открытые OF-позиции:
-    - Если исчезла → записать PnL, удалить из tracked
-    - Если открыта > FORCE_CLOSE_SEC → закрыть по рынку"""
     if not B or not hasattr(B, "EXECUTOR"):
         return
     executor = B.EXECUTOR
@@ -650,7 +592,6 @@ def _manage_positions():
             continue
 
         if pos_id not in live_ids:
-            # Позиция закрылась (стоп, тейк, или force-close)
             entry = rec.get("entry", 0)
             exit_price = rec.get("tp", entry)
             hold_sec = int(now - rec.get("opened_ts", now))
@@ -681,12 +622,13 @@ def _manage_positions():
             del tracked[pos_id]
             changed = True
         else:
-            # Проверяем force-close
             if now - rec.get("opened_ts", now) > OF_FORCE_CLOSE_SEC:
-                # Закрываем по рынку
                 pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
                 if pos:
-                    info = {"id": pos_id, "mid": UE._pos_market(pos), "dir": UE._pos_dir(pos)}
+                    mid = UE._pos_market(pos)
+                    if not mid:
+                        continue
+                    info = {"id": pos_id, "mid": mid, "dir": UE._pos_dir(pos)}
                     try:
                         res = executor.close_position(info, reason=f"OF_TIMEOUT_{OF_FORCE_CLOSE_SEC}s")
                         if B:
@@ -699,7 +641,6 @@ def _manage_positions():
             _save_tracked(tracked)
 
 def _fetch_realized_pnl(executor, sym, since_ts):
-    """Берёт realizedPnl из orders_history."""
     try:
         m = executor._mk.get(sym) if executor._mk else None
         if not m:
@@ -731,7 +672,7 @@ def _fetch_realized_pnl(executor, sym, since_ts):
                 if t and t not in ("None", "null"):
                     try:
                         if "." in t or "e" in t.lower():
-                            v = float(Decimal(t))
+                            v = float(t)
                         else:
                             v = float(UE.from_fp9(t))
                     except Exception:
@@ -777,7 +718,6 @@ class GateWSClient:
                 sym = contract[:-5]
                 if sym not in OF_PAIRS:
                     continue
-                # Gate.io присылает size/price/ts как строки — строго конвертируем в числа
                 try:
                     size = float(trade.get("size", 0) or 0)
                     price = float(trade.get("price", 0) or 0)
@@ -803,7 +743,6 @@ class GateWSClient:
         print("[exec_of] WS connected, subscribing...")
         _state["ws_connected"] = True
         self.reconnect_delay = 1
-        # Подписка на сделки
         payload = [f"{p}_USDT" for p in OF_PAIRS]
         sub_msg = {
             "time": int(_now_ts()),
@@ -833,7 +772,6 @@ class GateWSClient:
             if not self.running:
                 break
 
-            # Exponential backoff
             print(f"[exec_of] Reconnecting in {self.reconnect_delay}s...")
             time.sleep(self.reconnect_delay)
             self.reconnect_delay = min(self.reconnect_delay * 2, self.max_delay)
@@ -845,24 +783,19 @@ class GateWSClient:
 
 
 # =====================================================================
-#  WATCHDOG (мониторинг и управление)
+#  WATCHDOG
 # =====================================================================
 
 def _watchdog_loop():
-    """Проверяет здоровье WS и управляет позициями."""
     while True:
         try:
-            # Проверяем, что WS жив (last_msg < 120 сек назад)
             if _state["ws_connected"] and _now_ts() - _ws_client.last_msg_ts > 120:
                 print("[exec_of] WS stale (no msgs 120s), forcing reconnect...")
                 _state["ws_connected"] = False
                 if _ws_client.ws:
                     _ws_client.ws.close()
 
-            # Управление позициями
             _manage_positions()
-
-            # Сброс дневных счётчиков
             _reset_daily_counters()
 
         except Exception as e:
@@ -876,8 +809,6 @@ def _watchdog_loop():
 
 def status_report():
     lines = ["", "━━━ OrderFlow v1 ━━━"]
-
-    # Состояние
     enabled = _state.get("enabled", False)
     alerts = _state.get("alerts_enabled", True)
     ws_ok = _state.get("ws_connected", False)
@@ -885,23 +816,19 @@ def status_report():
     lines.append(f"Алерты: {'✅ ВКЛ' if alerts else '🔴 ВЫКЛ'}")
     lines.append(f"WebSocket: {'✅ подключён' if ws_ok else '🔴 отключён'}")
 
-    # Cooldown
     cd_until = _state.get("cooldown_until", 0)
     if _now_ts() < cd_until:
         remaining = int((cd_until - _now_ts()) / 60)
         lines.append(f"Cooldown: 🔴 ещё {remaining} мин")
 
-    # Пары
     lines.append(f"Пар: {len(OF_PAIRS)}")
     lines.append(f"Сделок сегодня: {_state.get('new_today', 0)}/{OF_MAX_NEW_PER_DAY}")
     lines.append(f"Сигналов сегодня: {_state.get('signals_today', 0)}")
 
-    # Открытые позиции
     tracked = _load_tracked()
     open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
     lines.append(f"Открыто: {open_count}/{OF_MAX_OPEN}")
 
-    # Статистика
     lines.append(f"Всего сигналов: {_stats['signals_total']} (подавлено: {_stats['signals_suppressed']})")
     lines.append(f"Сделок: {_stats['trades_opened']} открыто / {_stats['trades_closed']} закрыто")
     if _stats['trades_closed'] > 0:
@@ -936,7 +863,6 @@ def cmd_pairs():
     return "\n".join(lines)
 
 def cmd_log():
-    """Присылает CSV файл."""
     if not B:
         return "⚠️ bot.py недоступен"
     sent = 0
@@ -971,7 +897,6 @@ def cmd_stats():
 # =====================================================================
 
 def start():
-    """Запускает OrderFlow сканер (WebSocket + watchdog)."""
     global _ws_thread, _ws_client
 
     if websocket is None:
@@ -979,16 +904,12 @@ def start():
         return
 
     _load_state()
-
-    # Загружаем quanto multipliers
     _fetch_quanto_multipliers()
 
-    # Запускаем WS-клиент в отдельном потоке
     _ws_client = GateWSClient()
     _ws_thread = threading.Thread(target=_ws_client.run, daemon=True, name="of-ws")
     _ws_thread.start()
 
-    # Запускаем watchdog
     wd = threading.Thread(target=_watchdog_loop, daemon=True, name="of-watchdog")
     wd.start()
 
@@ -1004,18 +925,5 @@ def start():
         )
 
 
-# =====================================================================
-#  ТОЧКА ВХОДА
-# =====================================================================
-
 if __name__ == "__main__":
     print("exec_orderflow.py — модуль скальперского бота OrderFlow")
-    print()
-    print("Функции для bot.py:")
-    print("  start()                — запустить WS + watchdog")
-    print("  status_report()        — статус для /of")
-    print("  cmd_on() / cmd_off()   — вкл/выкл исполнитель")
-    print("  cmd_alerts_toggle()    — вкл/выкл алерты")
-    print("  cmd_pairs()            — список пар")
-    print("  cmd_log()              — прислать CSV журналы")
-    print("  cmd_stats()             — статистика winrate/pnl")
