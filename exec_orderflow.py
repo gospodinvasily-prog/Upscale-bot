@@ -77,12 +77,12 @@ OF_PAIRS = [p.strip() for p in os.environ.get("OF_PAIRS", ",".join(OF_PAIRS_DEFA
 # --- Параметры сделок ────────────────────────────────────────────────────────
 OF_MARGIN_USD    = float(os.environ.get("OF_MARGIN_USD", "50"))
 OF_LEVERAGE      = int(os.environ.get("OF_LEVERAGE", "5"))
-OF_STOP_PCT      = float(os.environ.get("OF_STOP_PCT", "0.5"))   # 0.5%
+OF_STOP_PCT      = float(os.environ.get("OF_STOP_PCT", "0.1"))   # 0.1% — очень тесный стоп
 OF_TP_PCT        = float(os.environ.get("OF_TP_PCT", "0.5"))     # 0.5%
 OF_MAX_OPEN      = int(os.environ.get("OF_MAX_OPEN", "5"))
 OF_MAX_SAME_SIDE = int(os.environ.get("OF_MAX_SAME_SIDE", "3"))
 OF_MAX_NEW_PER_DAY = int(os.environ.get("OF_MAX_NEW_PER_DAY", "20"))
-OF_FORCE_CLOSE_SEC = int(os.environ.get("OF_FORCE_CLOSE_SEC", "300"))
+OF_FORCE_CLOSE_SEC = int(os.environ.get("OF_FORCE_CLOSE_SEC", "86400"))  # 24 часа — фактически выключено
 OF_COOLDOWN_LOSSES = int(os.environ.get("OF_COOLDOWN_LOSSES", "4"))
 OF_COOLDOWN_MIN    = int(os.environ.get("OF_COOLDOWN_MIN", "60"))
 
@@ -90,7 +90,7 @@ OF_COOLDOWN_MIN    = int(os.environ.get("OF_COOLDOWN_MIN", "60"))
 DETECTOR_WINDOW_SEC          = 15
 DETECTOR_MIN_TRADES          = 4
 DETECTOR_SIZE_TOLERANCE_PCT  = 15.0
-DETECTOR_MIN_TOTAL_NOTIONAL = 50000.0
+DETECTOR_MIN_TOTAL_NOTIONAL = 100000.0
 DETECTOR_MIN_IMBALANCE_RATIO = 3.0
 DETECTOR_COOLDOWN_PER_SYMBOL = 120
 DETECTOR_MAX_SIGNALS_PER_MIN = 3
@@ -126,6 +126,7 @@ _state = {
 
 # --- Буферы сделок (in-memory) ─────────────────────────────────────────────
 _trade_buffer = defaultdict(lambda: deque(maxlen=200))
+_used_trade_ids = set()  # ID сделок, которые уже вошли в сигнал (чтобы не брать повторно)
 _quanto_cache = {}
 
 # --- Статистика ─────────────────────────────────────────────────────────────
@@ -307,8 +308,8 @@ def _detect_iceberg(sym, side, size_usd, ts):
     while buf and float(buf[0].get("ts", 0)) < ts - DETECTOR_WINDOW_SEC:
         buf.popleft()
 
-    buys = [t for t in buf if t.get("side") == "buy"]
-    sells = [t for t in buf if t.get("side") == "sell"]
+    buys = [t for t in buf if t.get("side") == "buy" and t.get("id") not in _used_trade_ids]
+    sells = [t for t in buf if t.get("side") == "sell" and t.get("id") not in _used_trade_ids]
     buy_vol = sum(float(t.get("size", 0)) for t in buys)
     sell_vol = sum(float(t.get("size", 0)) for t in sells)
 
@@ -322,21 +323,32 @@ def _detect_iceberg(sym, side, size_usd, ts):
     if len(dom_trades) < DETECTOR_MIN_TRADES:
         return None
 
-    sizes = sorted([float(t.get("size", 0)) for t in dom_trades])
+    # Получаем объекты сделок (не только размеры), отсортированные по размеру
+    trade_objs = sorted(dom_trades, key=lambda t: float(t.get("size", 0)))
+    sizes = [float(t.get("size", 0)) for t in trade_objs]
     for i in range(len(sizes) - DETECTOR_MIN_TRADES + 1):
-        window = sizes[i:i + DETECTOR_MIN_TRADES]
-        med = _median(window)
+        window_sizes = sizes[i:i + DETECTOR_MIN_TRADES]
+        window_objs = trade_objs[i:i + DETECTOR_MIN_TRADES]
+        med = _median(window_sizes)
         if med <= 0:
             continue
-        if all(abs(float(s) - med) / med <= DETECTOR_SIZE_TOLERANCE_PCT / 100 for s in window):
-            cluster_total = sum(window)
+        if all(abs(float(s) - med) / med <= DETECTOR_SIZE_TOLERANCE_PCT / 100 for s in window_sizes):
+            cluster_total = sum(window_sizes)
             if cluster_total >= DETECTOR_MIN_TOTAL_NOTIONAL:
+                # Помечаем сделки как использованные (чтобы не взять повторно)
+                for obj in window_objs:
+                    trade_id = obj.get("id")
+                    if trade_id:
+                        _used_trade_ids.add(trade_id)
+                # Чистим старые ID (не храним бесконечно)
+                if len(_used_trade_ids) > 1000:
+                    _used_trade_ids.clear()
                 return {
                     "sym": sym,
                     "side": dom_side,
                     "total_usd": cluster_total,
                     "avg_size": med,
-                    "num_trades": len(window),
+                    "num_trades": len(window_sizes),
                     "ts": ts,
                 }
     return None
@@ -393,6 +405,7 @@ def _process_trade(sym, size_contracts, price, ts):
         "ts": ts,
         "side": side,
         "size": size_usd,
+        "id": f"{ts}_{size_contracts}_{price}",  # уникальный ID сделки
     })
 
     signal = _detect_iceberg(sym, side, size_usd, ts)
