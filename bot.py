@@ -50,6 +50,12 @@ import json
 import requests
 import upscale_exec
 import exec_donchian_4h_v22 as DR42
+try:
+    import exec_orderflow as OF
+    _OF_IMPORT_ERR = None
+except Exception as e:
+    OF = None
+    _OF_IMPORT_ERR = str(e)
 from datetime import datetime, timezone, timedelta
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -433,6 +439,14 @@ HELP_TEXT = (
     "/daily — P&L дня (сегодня, вчера) с разбивкой по причинам выхода\n"
     "\n<b>📒 ЖУРНАЛЫ</b>\n"
     "/log — прислать журнал авто-слоя (CSV) прямо сейчас — только по вызову\n"
+    "\n<b>🧊 ORDERFLOW (Скальпер)</b>\n"
+    "/of — статус OrderFlow (WS, пары, статистика)\n"
+    "/of_on — включить исполнитель (бот открывает сделки)\n"
+    "/of_off — выключить исполнитель (только алерты)\n"
+    "/of_alerts — вкл/выкл алерты в чате\n"
+    "/of_pairs — список пар и размер буфера\n"
+    "/of_log — прислать CSV журналы сигналов и сделок\n"
+    "/of_stats — winrate, PnL, consec losses\n"
     "\nСтратегия: <b>donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая. "
     "Сканирует каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, "
     "16:05, 20:05 UTC). Два контура защиты: стратегийный -$350 today-only + Upscale "
@@ -490,6 +504,35 @@ def handle_command(text: str) -> str:
         return f"📒 Отправлено файлов: {sent}" if sent else "📒 Журналы пока пустые."
     if cmd == "/dr42":
         return DR42.status_report()
+    # ─── OrderFlow команды ──────────────────────────────────────────────────
+    if cmd == "/of":
+        if OF is None:
+            return f"⚠️ OrderFlow модуль не загружен: {_OF_IMPORT_ERR}"
+        return OF.status_report()
+    if cmd == "/of_on":
+        if OF is None:
+            return "⚠️ OrderFlow не загружен"
+        return OF.cmd_on()
+    if cmd == "/of_off":
+        if OF is None:
+            return "⚠️ OrderFlow не загружен"
+        return OF.cmd_off()
+    if cmd == "/of_alerts":
+        if OF is None:
+            return "⚠️ OrderFlow не загружен"
+        return OF.cmd_alerts_toggle()
+    if cmd == "/of_pairs":
+        if OF is None:
+            return "⚠️ OrderFlow не загружен"
+        return OF.cmd_pairs()
+    if cmd == "/of_log":
+        if OF is None:
+            return "⚠️ OrderFlow не загружен"
+        return OF.cmd_log()
+    if cmd == "/of_stats":
+        if OF is None:
+            return "⚠️ OrderFlow не загружен"
+        return OF.cmd_stats()
     if cmd in ("/help", "/start"):
         return HELP_TEXT
     return ""
@@ -720,6 +763,17 @@ def main():
     # Баланс Upscale нужен donchian для compound sizing — обновляется в фоне
     # каждые 5 минут и принудительно перед каждым сканом сигналов.
     DR42.start_balance_updater()
+
+    # ── Запуск OrderFlow сканера (если модуль загружен) ─────────────────────
+    if OF is not None:
+        try:
+            OF.start()
+        except Exception as e:
+            print(f"[OF] ошибка запуска: {e}")
+            traceback.print_exc()
+            send_telegram(f"⚠️ OrderFlow не запустился: {esc(str(e))}")
+    else:
+        print(f"[OF] модуль не загружен: {_OF_IMPORT_ERR}")
 
     # Команды в чате — в отдельном потоке, не дожидаясь скана. Скан ~100 пар
     # с лимитом 12 запросов/сек может идти ощутимо долго; раньше poll_commands()

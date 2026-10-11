@@ -1313,8 +1313,19 @@ def _check_signals_impl():
         return
 
     pairs_set = set(pairs)
-    open_long_dr42  = {s for s in open_long  if s in pairs_set}
-    open_short_dr42 = {s for s in open_short if s in pairs_set}
+    # Фильтруем позиции: только те, что принадлежат нашей стратегии (4H),
+    # пропускаем OrderFlow-позиции (они изолированы через strategy_registry)
+    def _is_4h_position(pos_dict):
+        """Проверяет, принадлежит ли позиция 4H-стратегии через реестр EXECUTOR."""
+        try:
+            pos_id = UE._pos_id(pos_dict)
+            strategy = executor._registry_get(pos_id)
+            return strategy in ("donchian_4h_v22", "unknown")  # unknown = до внедрения реестра
+        except Exception:
+            return True  # если реестр недоступен, считаем своей (обратно-совместимо)
+
+    open_long_dr42  = {s for s in open_long  if s in pairs_set and _is_4h_position(pos_by_sym.get(s, {}))}
+    open_short_dr42 = {s for s in open_short if s in pairs_set and _is_4h_position(pos_by_sym.get(s, {}))}
     open_syms = open_long | open_short
 
     try:
@@ -1324,7 +1335,7 @@ def _check_signals_impl():
 
     # ── 3. Ведём открытые позиции (trailing, partial TP, выходы) ──
     try:
-        pos_by_sym_dr42 = {s: p for s, p in pos_by_sym.items() if s in pairs_set}
+        pos_by_sym_dr42 = {s: p for s, p in pos_by_sym.items() if s in pairs_set and _is_4h_position(p)}
         _manage_open_positions(executor, pos_by_sym_dr42)
     except Exception as e:
         print(f"[exec_dr22] manage_open_positions: {e}")

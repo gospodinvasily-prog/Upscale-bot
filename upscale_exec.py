@@ -415,9 +415,30 @@ class Executor:
         self._day = {"date": "", "n": 0}
         self._lock = threading.Lock()
         self._pending_lock = threading.Lock()   # сериализует запись PENDING_TP_FILE
+        self._open_lock = threading.Lock()       # сериализует критическую секцию _execute (защита от race между стратегиями)
         self._watching_be = set()               # id позиций, за которыми уже следит поток _watch_breakeven
+        self._strategy_registry = {}            # {pos_id: "strategy_name"} — для изоляции стратегий
+        self._registry_lock = threading.Lock()
         if self.mode == "demo" and self.client:
             threading.Thread(target=self._watchdog, daemon=True).start()
+
+    # -- реестр стратегий (для изоляции 4H и OrderFlow) --
+    def _registry_set(self, pos_id, strategy_name):
+        with self._registry_lock:
+            self._strategy_registry[pos_id] = strategy_name
+
+    def _registry_get(self, pos_id):
+        with self._registry_lock:
+            return self._strategy_registry.get(pos_id, "unknown")
+
+    def _registry_del(self, pos_id):
+        with self._registry_lock:
+            self._strategy_registry.pop(pos_id, None)
+
+    def _registry_has_sym(self, sym):
+        """Проверяет, есть ли позиция по символу в реестре."""
+        with self._registry_lock:
+            return any(v == sym for v in self._strategy_registry.values())
 
     # -- персистентность TP/безубытка (переживает перезапуск процесса) --
     def _pending_set(self, info, stage, due_ts=None):
@@ -738,51 +759,54 @@ class Executor:
 
     def _execute(self, b, plan, market) -> str:
         sym, side, mid, acc = b["symbol"], b["side"], str(market["id"]), self.account_id
-        pos_now = self._positions()
-        if MAX_OPEN and len(pos_now) >= MAX_OPEN:
-            return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
-        if any(_pos_market(p) == mid for p in pos_now):
-            return "пропуск: по монете уже есть позиция"
-        # same_side_limit можно переопределить В СИГНАЛЕ (поле max_same_side) —
-        # так стратегия (donchian) передаёт свой риск-зависимый лимит, и он не
-        # расходится со статичным MAX_SAME_SIDE_OPEN (который иначе был бы
-        # вторым, независимым источником правды с похожим именем и риском
-        # разъехаться, если риск на сделку когда-нибудь изменится).
-        same_side_limit = b.get("max_same_side", MAX_SAME_SIDE_OPEN)
-        if same_side_limit:
-            same = sum(1 for p in pos_now if _pos_dir(p) == side)
-            if same >= same_side_limit:
-                return (f"пропуск: уже {same} открытых позиций в {side} "
-                        f"(лимит {same_side_limit}) — не набираем одну ставку")
-        before = {_pos_id(p) for p in pos_now}
-        # _open_risk читается/пишется из нескольких потоков одновременно —
-        # on_signal() запускает КАЖДЫЙ сигнал в своём потоке (специально, чтобы
-        # несколько входов за один скан не блокировали друг друга), поэтому без
-        # self._lock здесь была гонка: поток A может переписать весь словарь
-        # (оставив только "live" на момент СВОЕГО старта) уже ПОСЛЕ того, как
-        # поток B успел добавить туда риск своей только что открытой позиции —
-        # запись B стирается, и следующая проверка риска считает открытый риск
-        # заниженным именно в момент, когда одновременно открывается несколько
-        # позиций и риск-контроль нужнее всего.
-        with self._lock:
-            live = set(before)
-            self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
-        snap = self._snapshot()
-        if snap is None:
-            return f"пропуск: не смог прочитать risk-status ({self._snap_err})"
-        why = self._guard_skip(snap, plan["real_risk_usd"])
-        if why:
-            return "пропуск: " + why
-        body = open_body(acc, mid, side, plan["margin_usd"], plan["leverage"], stop=b["stop"])
-        try:
-            self.client.order(body)
-        except UpscaleError as e:
-            return f"ордер отклонён: {e}"
-        with self._lock:
-            self._day["n"] += 1
+        strategy = b.get("strategy", "donchian_4h_v22")  # тег стратегии для изоляции
+        leverage_override = b.get("leverage_override")     # OrderFlow может хотеть 10x
+        with self._open_lock:  # сериализуем критическую секцию (защита от race между стратегиями)
+            pos_now = self._positions()
+            if MAX_OPEN and len(pos_now) >= MAX_OPEN:
+                return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
+            # Per-strategy dedup: пропускаем только если позиция по этому символу уже открыта ЭТОЙ ЖЕ стратегией
+            has_same_strategy = False
+            for p in pos_now:
+                if _pos_market(p) == mid:
+                    pos_id = _pos_id(p)
+                    pos_strategy = self._registry_get(pos_id)
+                    if pos_strategy == strategy:
+                        has_same_strategy = True
+                        break
+            if has_same_strategy:
+                return f"пропуск: по монете уже есть позиция ({strategy})"
+            # same_side_limit можно переопределить В СИГНАЛЕ (поле max_same_side)
+            same_side_limit = b.get("max_same_side", MAX_SAME_SIDE_OPEN)
+            if same_side_limit:
+                same = sum(1 for p in pos_now if _pos_dir(p) == side)
+                if same >= same_side_limit:
+                    return (f"пропуск: уже {same} открытых позиций в {side} "
+                            f"(лимит {same_side_limit}) — не набираем одну ставку")
+            before = {_pos_id(p) for p in pos_now}
+            with self._lock:
+                live = set(before)
+                self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
+            snap = self._snapshot()
+            if snap is None:
+                return f"пропуск: не смог прочитать risk-status ({self._snap_err})"
+            why = self._guard_skip(snap, plan["real_risk_usd"])
+            if why:
+                return "пропуск: " + why
+            body = open_body(acc, mid, side, plan["margin_usd"], lev, stop=b["stop"])
+            try:
+                self.client.order(body)
+            except UpscaleError as e:
+                return f"ордер отклонён: {e}"
+            with self._lock:
+                self._day["n"] += 1
+        # _wait_position ВНЕ _open_lock — не блокируем другие стратегии
         pos = self._wait_position(mid, side, before)
         if not pos:
             return "ордер отправлен, но позицию не нашёл (проверь терминал)"
+        # Регистрируем стратегию в реестре
+        pos_id = _pos_id(pos)
+        self._registry_set(pos_id, strategy)
         size = _pos_size(pos)
         size_base = Decimal(size) / FP
         notional = abs(from_fp9(pos["notional"])) if pos.get("notional") else Decimal(0)
