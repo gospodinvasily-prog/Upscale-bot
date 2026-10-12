@@ -127,12 +127,23 @@ OI_STALE_SEC        = 40     # если OI не обновлялся >40с → s
 #   STALE   → нет данных, выходим (безопасный вариант)
 # Safety net OF_CVD_HARD_LIMIT_SEC — если позиция прожила дольше этого
 # времени, закрываем принудительно (safety net, не «жёсткий» таймер).
-OF_CVD_WINDOW_SEC       = int(os.environ.get("OF_CVD_WINDOW_SEC", "90"))      # окно CVD (увелич. для сглаживания)
+OF_CVD_WINDOW_SEC       = int(os.environ.get("OF_CVD_WINDOW_SEC", "90"))      # окно CVD (для выхода по time-stop)
 OF_CVD_FALL_THRESHOLD   = float(os.environ.get("OF_CVD_FALL_THRESHOLD", "0.35"))  # 35% дисбаланс = FALLING (было 20% — слишком чувствительно)
-OF_CVD_MIN_VOL_USD      = float(os.environ.get("OF_CVD_MIN_VOL_USD", "50000"))   # мин объём за окно
+OF_CVD_MIN_VOL_USD      = float(os.environ.get("OF_CVD_MIN_VOL_USD", "50000"))   # мин объём за окно (для time-stop CVD)
 OF_CVD_RESET_SEC        = int(os.environ.get("OF_CVD_RESET_SEC", "90"))         # +90с за продление (было 60)
 OF_CVD_HARD_LIMIT_SEC   = int(os.environ.get("OF_CVD_HARD_LIMIT_SEC", "3600"))  # safety net 60 мин (было 30)
 OF_CVD_TRAIL_TP_PCT     = float(os.environ.get("OF_CVD_TRAIL_TP_PCT", "0.30"))  # +0.3% над ценой при трейлинге
+
+# --- 15m CVD momentum фильтр (для ВХОДА в сделку) ─────────────────────────────
+# Идея: если CVD за 15 минут растёт (был -100 → стал 0, или был 0 → стал +50)
+# значит моментум в нашу сторону → можно входить.
+# Если CVD падает (был +50 → стал -20) → продавцы перехватили → пропускаем.
+# Это НЕ заменяет 90s CVD для time-stop, это отдельный фильтр на вход.
+OF_CVD_15M_FILTER_ENABLED = os.environ.get("OF_CVD_15M_FILTER_ENABLED", "1") == "1"
+OF_CVD_15M_WINDOW_SEC      = int(os.environ.get("OF_CVD_15M_WINDOW_SEC", "900"))   # 15 минут
+OF_CVD_15M_MIN_MOMENTUM    = float(os.environ.get("OF_CVD_15M_MIN_MOMENTUM", "0"))  # 0 = любой рост CVD (даже +$1)
+OF_CVD_15M_MIN_VOL_USD     = float(os.environ.get("OF_CVD_15M_MIN_VOL_USD", "100000"))  # мин объём за 15 минут
+OF_CVD_15M_MIN_DATA_SEC    = int(os.environ.get("OF_CVD_15M_MIN_DATA_SEC", "300"))  # мин 5 минут данных, иначе STALE
 
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
@@ -183,7 +194,7 @@ _trade_buffer = defaultdict(lambda: deque(maxlen=200))
 _used_trade_ids = set()
 _quanto_cache = {}
 _oi_cache = defaultdict(lambda: deque(maxlen=6))   # {sym: [(ts, oi_usd), ...]}
-_cvd_buffer  = defaultdict(lambda: deque(maxlen=500))  # {sym: [{ts, side, size}, ...]} — CVD
+_cvd_buffer  = defaultdict(lambda: deque(maxlen=3000))  # {sym: [{ts, side, size}, ...]} — CVD (15m окно при ~3 сделки/сек)
 _cvd_lock    = threading.Lock()
 
 # --- Статистика ─────────────────────────────────────────────────────────────
@@ -492,6 +503,78 @@ def _check_cvd_for_exit(sym):
 
 
 # =====================================================================
+#  15m CVD MOMENTUM (для фильтра ВХОДА в сделку)
+# =====================================================================
+
+def _check_cvd_15m_momentum(sym):
+    """Фильтр входа: растёт ли CVD за последние 15 минут?
+
+    Логика:
+      momentum_15m = CVD_сейчас - CVD_15m_назад
+
+      Если momentum_15m > OF_CVD_15M_MIN_MOMENTUM → RISING (можно входить)
+      Если momentum_15m ≤ 0 → FALLING (CVD падает, пропускаем)
+      Если данных мало / мало объёма → STALE (пропускаем, чтобы не входить без подтверждения)
+
+    Возвращает словарь:
+      {
+        "status": "RISING"|"FALLING"|"STALE",
+        "momentum": float,   # CVD_сейчас - CVD_15m_назад (USD)
+        "cvd_now": float,    # текущий CVD за 15m окно
+        "cvd_15m_ago": float, # CVD 15 минут назад (точнее: CVD с начала окна)
+        "total_vol": float,  # суммарный объём за 15 минут
+      }
+    """
+    result = {"status": "STALE", "momentum": 0.0, "cvd_now": 0.0, "cvd_15m_ago": 0.0, "total_vol": 0.0}
+
+    with _cvd_lock:
+        buf = list(_cvd_buffer.get(sym, deque()))
+
+    if len(buf) < 5:
+        return result
+
+    now = _now_ts()
+    # Данные за последние 15 минут
+    recent_15m = [t for t in buf if now - t["ts"] <= OF_CVD_15M_WINDOW_SEC]
+    # Данные за последние 30 минут (чтобы взять "старую половину")
+    recent_30m = [t for t in buf if now - t["ts"] <= OF_CVD_15M_WINDOW_SEC * 2]
+
+    if len(recent_15m) < 5:
+        return result
+
+    # Проверяем что данных достаточно по времени
+    oldest_ts = recent_15m[0]["ts"]
+    if now - oldest_ts < OF_CVD_15M_MIN_DATA_SEC:
+        return result  # меньше 5 минут данных → STALE
+
+    # Делим окно 30 минут на две половины по 15 минут
+    # "15m назад" = сделки в окне [30m назад, 15m назад]
+    # "сейчас" = сделки в окне [15m назад, сейчас]
+    cutoff_15m = now - OF_CVD_15M_WINDOW_SEC
+
+    cvd_first_half  = sum(t["size"] if t["side"] == "buy"  else -t["size"] for t in recent_30m if t["ts"] <= cutoff_15m)
+    cvd_second_half = sum(t["size"] if t["side"] == "buy"  else -t["size"] for t in recent_15m)
+
+    total_vol_15m = sum(t["size"] for t in recent_15m)
+    result["cvd_now"] = cvd_second_half
+    result["cvd_15m_ago"] = cvd_first_half
+    result["momentum"] = cvd_second_half - cvd_first_half
+    result["total_vol"] = total_vol_15m
+
+    # Проверка на минимальный объём
+    if total_vol_15m < OF_CVD_15M_MIN_VOL_USD:
+        return result  # STALE — мало объёма для значимой оценки
+
+    # Проверка momentum
+    if result["momentum"] > OF_CVD_15M_MIN_MOMENTUM:
+        result["status"] = "RISING"
+    else:
+        result["status"] = "FALLING"
+
+    return result
+
+
+# =====================================================================
 #  ICEBERG DETECTOR
 # =====================================================================
 
@@ -696,9 +779,31 @@ def _process_trade(sym, size_contracts, price, ts):
     if _get_same_side_count("long") >= OF_MAX_SAME_SIDE:
         return
 
-    _execute_signal(signal, price, half_size)
+    # === 15m CVD MOMENTUM ФИЛЬТР (для входа) ===
+    # Проверяем что CVD за 15 минут растёт (был -100 → стал 0, или был 0 → стал +50)
+    # Если CVD падает (был +50 → стал -20) → пропускаем, не входить против тренда
+    cvd_15m_info = None
+    if OF_CVD_15M_FILTER_ENABLED:
+        cvd_15m_info = _check_cvd_15m_momentum(sym)
+        cvd_15m_status = cvd_15m_info["status"]
+        if cvd_15m_status == "FALLING":
+            _stats["signals_suppressed"] += 1
+            print(f"[exec_of] {sym}: CVD 15m FALLING (momentum=${cvd_15m_info['momentum']:.0f}) — пропуск входа")
+            if _state["alerts_enabled"] and B:
+                B.send_telegram(
+                    f"🧊 <b>ICEBERG {sym} 🟢 BUY</b> ✅ OI↑\n"
+                    f"⚠️ CVD 15m: FALLING (momentum ${cvd_15m_info['momentum']:.0f})\n"
+                    f"Текущий CVD: ${cvd_15m_info['cvd_now']:.0f} | 15m назад: ${cvd_15m_info['cvd_15m_ago']:.0f}\n"
+                    f"→ пропускаем вход (CVD 15m падает, не входить против тренда)"
+                )
+            return
+        # STALE и RISING → пропускаем дальше (STALE = мало данных, не блокируем)
+        if cvd_15m_status == "RISING":
+            print(f"[exec_of] {sym}: CVD 15m RISING (momentum=${cvd_15m_info['momentum']:.0f}) — OK для входа")
 
-def _execute_signal(signal, price, half_size=False):
+    _execute_signal(signal, price, half_size, cvd_15m_info)
+
+def _execute_signal(signal, price, half_size=False, cvd_15m_info=None):
     if not B or not hasattr(B, "EXECUTOR"):
         return
     executor = B.EXECUTOR
@@ -741,14 +846,23 @@ def _execute_signal(signal, price, half_size=False):
         executor.on_signal(sig, score)
 
         size_str = f"${margin:.0f}" + (" (½)" if half_size else "")
+        # Формируем строку с 15m CVD если есть данные
+        cvd_15m_line = ""
+        if cvd_15m_info and cvd_15m_info.get("status") == "RISING":
+            cvd_15m_line = (
+                f"\n📊 <b>CVD 15m: RISING</b> momentum ${cvd_15m_info['momentum']:.0f}\n"
+                f"   сейчас: ${cvd_15m_info['cvd_now']:.0f} | 15m назад: ${cvd_15m_info['cvd_15m_ago']:.0f}"
+            )
+        elif cvd_15m_info and cvd_15m_info.get("status") == "STALE":
+            cvd_15m_line = "\n📊 CVD 15m: STALE (мало данных, фильтр пропущен)"
         if B:
             B.send_telegram(
                 f"🧊 <b>OF ВХОД {sym} LONG</b>\n"
                 f"Вход: ${entry:.6g} | Стоп: ${stop:.6g} ({stop_pct}%)\n"
                 f"Тейк: ${tp:.6g} ({tp_pct:.1f}%)\n"
-                f"Маржа: {size_str} × {OF_LEVERAGE}x\n"
+                f"Маржа: {size_str} × {OF_LEVERAGE}x"
+                f"{cvd_15m_line}\n"
                 f"Time-stop: 60с→BE, 240с→CVD-чек (каждые 90с)\n"
-                f"  RISING→+90с+trail TP, NEUTRAL→+90с, FALLING/STALE→выход\n"
                 f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с ({OF_CVD_HARD_LIMIT_SEC//60} мин)"
             )
 
@@ -1348,12 +1462,18 @@ def start():
 
     print(f"[exec_of] v2 Старт: {len(OF_PAIRS)} пар, WS={GATE_WS_URL}, OI poll=10с")
     if B:
+        # Статус 15m CVD фильтра
+        cvd_15m_filter_line = (
+            f"✅ ВКЛ (окно {OF_CVD_15M_WINDOW_SEC//60}мин, min momentum ${OF_CVD_15M_MIN_MOMENTUM:.0f})"
+            if OF_CVD_15M_FILTER_ENABLED else "🔴 ВЫКЛ"
+        )
         B.send_telegram(
             f"🧊 <b>OrderFlow v2.2 запущен</b>\n"
             f"Пар: {len(OF_PAIRS)}\n"
             f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x\n"
             f"Стоп: {OF_STOP_PCT_MIN}% | Тейк: {OF_STOP_PCT_MIN * OF_TP_MULT:.1f}% (RR 1:{OF_TP_MULT:.0f})\n"
             f"OI-фильтр: ✅ (poll 10с, окно 30с)\n"
+            f"Фильтр входа CVD 15m: {cvd_15m_filter_line}\n"
             f"Time-stop (CVD-aware): 60с→BE, 240с→CVD-чек каждые 90с\n"
             f"  RISING→+90с+trail TP, NEUTRAL→+90с, FALLING/STALE→выход\n"
             f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с (60 мин)\n"
