@@ -1328,20 +1328,26 @@ def start():
     wd = threading.Thread(target=_watchdog_loop, daemon=True, name="of-watchdog")
     wd.start()
 
+    # Проверяем где храним state (на Render должен быть /var/data)
+    _data_dir_actual = os.environ.get("BOT_DATA_DIR", "/tmp (default — НЕ персистентно!)")
+    _disk_ok = "✅ Persistent Disk" if _data_dir_actual != "/tmp (default — НЕ персистентно!)" else "⚠️ /tmp (стирается при деплое!)"
+
     print(f"[exec_of] v2 Старт: {len(OF_PAIRS)} пар, WS={GATE_WS_URL}, OI poll=10с")
     if B:
         B.send_telegram(
-            f"🧊 <b>OrderFlow v2 запущен</b>\n"
+            f"🧊 <b>OrderFlow v2.2 запущен</b>\n"
             f"Пар: {len(OF_PAIRS)}\n"
             f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x\n"
             f"Стоп: {OF_STOP_PCT_MIN}% | Тейк: {OF_STOP_PCT_MIN * OF_TP_MULT:.1f}% (RR 1:{OF_TP_MULT:.0f})\n"
             f"OI-фильтр: ✅ (poll 10с, окно 30с)\n"
-            f"Time-stop (CVD-aware v2.2): 60с→BE, 180с→CVD-чек каждые 60с\n"
+            f"Time-stop (CVD-aware): 60с→BE, 180с→CVD-чек каждые 60с\n"
             f"  RISING→+60с+trail TP, NEUTRAL→+60с, FALLING/STALE→выход\n"
             f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с (30 мин)\n"
             f"Cooldown: {DETECTOR_COOLDOWN_PER_SYMBOL}с/символ, {DETECTOR_GLOBAL_COOLDOWN}с глобальный\n"
             f"Лимит: {DETECTOR_MAX_PER_HOUR} сигнала/час\n"
             f"Порог айсберга: ${DETECTOR_MIN_TOTAL_NOTIONAL:,.0f}\n"
+            f"State dir: {_disk_ok}\n"
+            f"  → {_data_dir_actual}\n"
             f"Исполнитель: {'✅ ВКЛ' if _state['enabled'] else '🔴 ВЫКЛ'}\n"
             f"Алерты: {'✅ ВКЛ' if _state['alerts_enabled'] else '🔴 ВЫКЛ'}"
         )
