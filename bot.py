@@ -741,6 +741,10 @@ def main():
                 traceback.print_exc()
                 send_telegram(f"⚠️ Бэктест не отработал: {esc(str(e))}\nБот продолжает работу в обычном режиме.")
 
+    # Проверяем где храним state (на Render должен быть /var/data через BOT_DATA_DIR)
+    _data_dir_actual = os.environ.get("BOT_DATA_DIR", "/tmp")
+    _disk_ok = "✅ Persistent Disk" if _data_dir_actual != "/tmp" else "⚠️ /tmp (стирается при деплое!)"
+
     start_lines = [
         f"🚀 <b>Upscale Bot {BOT_VERSION}</b> | режим: <b>{EXECUTOR.mode}</b>"
         + {"dry": " (только сообщения)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""),
@@ -758,6 +762,8 @@ def main():
         f"   Exclude: {sorted(DR42.EXCLUDE_PAIRS)}",
         f"   Скан каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, 16:05, 20:05 UTC)",
         "   Аварийка Upscale (контур Upscale, отдельный от -$350): дневной $400 / общий $800 при $10k → close-all + halt",
+        f"💾 State: {_disk_ok}",
+        f"   → {_data_dir_actual}",
         "",
     ]
     if EXCLUDE_SYMBOLS:
