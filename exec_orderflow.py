@@ -145,6 +145,15 @@ OF_CVD_15M_MIN_MOMENTUM    = float(os.environ.get("OF_CVD_15M_MIN_MOMENTUM", "0"
 OF_CVD_15M_MIN_VOL_USD     = float(os.environ.get("OF_CVD_15M_MIN_VOL_USD", "100000"))  # мин объём за 15 минут
 OF_CVD_15M_MIN_DATA_SEC    = int(os.environ.get("OF_CVD_15M_MIN_DATA_SEC", "300"))  # мин 5 минут данных, иначе STALE
 
+# --- 5m CVD фильтр (для ВХОДА в сделку — простой и строгий) ──────────────────
+# Идея: если CVD за последние 5 минут ≥ 0 — покупателей не меньше продавцов → можно входить.
+# Если CVD < 0 — продавцы давят на 5m → пропускаем, не входить против краткосрочного давления.
+# Это проще и строже чем 15m momentum: проверяем только знак (≥0 или <0), не учитываем направление.
+OF_CVD_5M_FILTER_ENABLED = os.environ.get("OF_CVD_5M_FILTER_ENABLED", "1") == "1"
+OF_CVD_5M_WINDOW_SEC      = int(os.environ.get("OF_CVD_5M_WINDOW_SEC", "300"))     # 5 минут
+OF_CVD_5M_MIN_VOL_USD     = float(os.environ.get("OF_CVD_5M_MIN_VOL_USD", "30000"))  # мин $30K объёма за 5 минут
+OF_CVD_5M_MIN_DATA_SEC    = int(os.environ.get("OF_CVD_5M_MIN_DATA_SEC", "120"))  # мин 2 минуты данных
+
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 GATE_REST   = "https://api.gateio.ws/api/v4/futures/usdt"
@@ -575,6 +584,59 @@ def _check_cvd_15m_momentum(sym):
 
 
 # =====================================================================
+#  5m CVD (простой фильтр входа: CVD ≥ 0)
+# =====================================================================
+
+def _check_cvd_5m(sym):
+    """Простой фильтр входа: CVD за последние 5 минут ≥ 0?
+
+    Возвращает словарь:
+      {
+        "status": "POSITIVE"|"NEGATIVE"|"STALE",
+        "cvd_5m": float,    # CVD за 5 минут (USD): buy_vol - sell_vol
+        "total_vol": float, # суммарный объём за 5 минут
+      }
+    """
+    result = {"status": "STALE", "cvd_5m": 0.0, "total_vol": 0.0}
+
+    with _cvd_lock:
+        buf = list(_cvd_buffer.get(sym, deque()))
+
+    if len(buf) < 5:
+        return result
+
+    now = _now_ts()
+    # Данные за последние 5 минут
+    recent_5m = [t for t in buf if now - t["ts"] <= OF_CVD_5M_WINDOW_SEC]
+
+    if len(recent_5m) < 5:
+        return result
+
+    # Проверяем что данных достаточно по времени
+    oldest_ts = recent_5m[0]["ts"]
+    if now - oldest_ts < OF_CVD_5M_MIN_DATA_SEC:
+        return result  # меньше 2 минут данных → STALE
+
+    cvd_5m = sum(t["size"] if t["side"] == "buy"  else -t["size"] for t in recent_5m)
+    total_vol_5m = sum(t["size"] for t in recent_5m)
+
+    result["cvd_5m"] = cvd_5m
+    result["total_vol"] = total_vol_5m
+
+    # Проверка на минимальный объём
+    if total_vol_5m < OF_CVD_5M_MIN_VOL_USD:
+        return result  # STALE — мало объёма
+
+    # Простой знак: ≥ 0 → POSITIVE, < 0 → NEGATIVE
+    if cvd_5m >= 0:
+        result["status"] = "POSITIVE"
+    else:
+        result["status"] = "NEGATIVE"
+
+    return result
+
+
+# =====================================================================
 #  ICEBERG DETECTOR
 # =====================================================================
 
@@ -801,9 +863,31 @@ def _process_trade(sym, size_contracts, price, ts):
         if cvd_15m_status == "RISING":
             print(f"[exec_of] {sym}: CVD 15m RISING (momentum=${cvd_15m_info['momentum']:.0f}) — OK для входа")
 
-    _execute_signal(signal, price, half_size, cvd_15m_info)
+    # === 5m CVD ФИЛЬТР (для входа) ===
+    # Простой и строгий: CVD за последние 5 минут должен быть ≥ 0
+    # Если CVD < 0 — продавцы давят на 5m → пропускаем
+    cvd_5m_info = None
+    if OF_CVD_5M_FILTER_ENABLED:
+        cvd_5m_info = _check_cvd_5m(sym)
+        cvd_5m_status = cvd_5m_info["status"]
+        if cvd_5m_status == "NEGATIVE":
+            _stats["signals_suppressed"] += 1
+            print(f"[exec_of] {sym}: CVD 5m NEGATIVE (${cvd_5m_info['cvd_5m']:.0f}) — пропуск входа")
+            if _state["alerts_enabled"] and B:
+                B.send_telegram(
+                    f"🧊 <b>ICEBERG {sym} 🟢 BUY</b> ✅ OI↑\n"
+                    f"⚠️ CVD 5m: NEGATIVE (${cvd_5m_info['cvd_5m']:.0f})\n"
+                    f"Объём 5m: ${cvd_5m_info['total_vol']:.0f}\n"
+                    f"→ пропускаем вход (продавцы давят на 5m, не входить)"
+                )
+            return
+        # STALE и POSITIVE → пропускаем дальше
+        if cvd_5m_status == "POSITIVE":
+            print(f"[exec_of] {sym}: CVD 5m POSITIVE (${cvd_5m_info['cvd_5m']:.0f}) — OK для входа")
 
-def _execute_signal(signal, price, half_size=False, cvd_15m_info=None):
+    _execute_signal(signal, price, half_size, cvd_15m_info, cvd_5m_info)
+
+def _execute_signal(signal, price, half_size=False, cvd_15m_info=None, cvd_5m_info=None):
     if not B or not hasattr(B, "EXECUTOR"):
         return
     executor = B.EXECUTOR
@@ -855,13 +939,22 @@ def _execute_signal(signal, price, half_size=False, cvd_15m_info=None):
             )
         elif cvd_15m_info and cvd_15m_info.get("status") == "STALE":
             cvd_15m_line = "\n📊 CVD 15m: STALE (мало данных, фильтр пропущен)"
+        # Формируем строку с 5m CVD если есть данные
+        cvd_5m_line = ""
+        if cvd_5m_info and cvd_5m_info.get("status") == "POSITIVE":
+            cvd_5m_line = (
+                f"\n📊 <b>CVD 5m: POSITIVE</b> ${cvd_5m_info['cvd_5m']:.0f} (объём ${cvd_5m_info['total_vol']:.0f})"
+            )
+        elif cvd_5m_info and cvd_5m_info.get("status") == "STALE":
+            cvd_5m_line = "\n📊 CVD 5m: STALE (мало данных, фильтр пропущен)"
         if B:
             B.send_telegram(
                 f"🧊 <b>OF ВХОД {sym} LONG</b>\n"
                 f"Вход: ${entry:.6g} | Стоп: ${stop:.6g} ({stop_pct}%)\n"
                 f"Тейк: ${tp:.6g} ({tp_pct:.1f}%)\n"
                 f"Маржа: {size_str} × {OF_LEVERAGE}x"
-                f"{cvd_15m_line}\n"
+                f"{cvd_15m_line}"
+                f"{cvd_5m_line}\n"
                 f"Time-stop: 60с→BE, 240с→CVD-чек (каждые 90с)\n"
                 f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с ({OF_CVD_HARD_LIMIT_SEC//60} мин)"
             )
@@ -991,10 +1084,23 @@ def _manage_positions():
                     found_real = True
                     break
             if not found_real:
-                if now - rec.get("opened_ts", now) > 120:
-                    print(f"[exec_of] {sym_match}: pending истёк — удаляем")
+                # Pending истёк — сделка не открылась на Upscale (Daily Stop, лимит, и т.д.)
+                # Уменьшили с 120с до 30с — этого достаточно для реального открытия
+                if now - rec.get("opened_ts", now) > 30:
+                    print(f"[exec_of] {sym_match}: pending истёк — сделка отклонена Upscale, удаляем")
+                    # Откатываем счётчики
+                    if _state.get("new_today", 0) > 0:
+                        _state["new_today"] -= 1
+                    if _stats.get("trades_opened", 0) > 0:
+                        _stats["trades_opened"] -= 1
+                    _save_state()
                     del tracked[pos_id]
                     changed = True
+                    if B:
+                        B.send_telegram(
+                            f"⚠️ OF {sym_match}: позиция не открылась (отклонена Upscale — лимит/Day Stop/risk)\n"
+                            f"Счётчики new_today/trades_opened откачены назад"
+                        )
             continue
 
         # Позиция закрылась (стоп, тейк, или time-stop)
@@ -1467,6 +1573,11 @@ def start():
             f"✅ ВКЛ (окно {OF_CVD_15M_WINDOW_SEC//60}мин, min momentum ${OF_CVD_15M_MIN_MOMENTUM:.0f})"
             if OF_CVD_15M_FILTER_ENABLED else "🔴 ВЫКЛ"
         )
+        # Статус 5m CVD фильтра
+        cvd_5m_filter_line = (
+            f"✅ ВКЛ (окно {OF_CVD_5M_WINDOW_SEC//60}мин, требование CVD ≥ 0)"
+            if OF_CVD_5M_FILTER_ENABLED else "🔴 ВЫКЛ"
+        )
         B.send_telegram(
             f"🧊 <b>OrderFlow v2.2 запущен</b>\n"
             f"Пар: {len(OF_PAIRS)}\n"
@@ -1474,6 +1585,7 @@ def start():
             f"Стоп: {OF_STOP_PCT_MIN}% | Тейк: {OF_STOP_PCT_MIN * OF_TP_MULT:.1f}% (RR 1:{OF_TP_MULT:.0f})\n"
             f"OI-фильтр: ✅ (poll 10с, окно 30с)\n"
             f"Фильтр входа CVD 15m: {cvd_15m_filter_line}\n"
+            f"Фильтр входа CVD 5m:  {cvd_5m_filter_line}\n"
             f"Time-stop (CVD-aware): 60с→BE, 240с→CVD-чек каждые 90с\n"
             f"  RISING→+90с+trail TP, NEUTRAL→+90с, FALLING/STALE→выход\n"
             f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с (60 мин)\n"
