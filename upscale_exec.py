@@ -729,24 +729,17 @@ class Executor:
                 plan = build_plan(b["price"], b["stop_pct"], side, b["stop"],
                                   b.get("tp1_price", b["price"]), b.get("tp2_price", b.get("tp1_price", b["price"])),
                                   risk_usd, max_pos_usd)
-            # === СЕРИАЛИЗУЕМ критическую секцию: guard_skip → execute → update_risk ===
+            # === СЕРИАЛИЗУЕМ критическую секцию через _execute (внутри берёт _open_lock) ===
             # Раньше _execute был под _open_lock, но _guard_skip вызывался ДО блокировки.
             # Из-за этого 6 сигналов почти одновременно проходили _guard_skip с одним
             # и тем же снапшотом _open_risk, и все 6 открывались (даже если лимит risk
-            # уже превышен). Теперь вся последовательность под одним локом.
+            # уже превышен). Теперь _execute ВЕСЬ под одним локом (guard_skip + order + update_risk).
             if not skip and self.mode == "demo":
-                with self._open_lock:
-                    skip = self._real_block()
-                    if not skip and MAX_TRADES_DAY and self._day_count() >= MAX_TRADES_DAY:
-                        skip = f"лимит {MAX_TRADES_DAY} входов за сутки UTC"
-                    if not skip:
-                        # Повторная проверка guard_skip ПОД локом — с актуальным _open_risk
-                        snap = self._snapshot()
-                        if snap:
-                            new_risk = Decimal(str(risk_usd)) if risk_usd else Decimal("0")
-                            skip = self._guard_skip(snap, new_risk)
-                        if not skip:
-                            result = self._execute_locked(b, plan, market)
+                skip = self._real_block()
+                if not skip and MAX_TRADES_DAY and self._day_count() >= MAX_TRADES_DAY:
+                    skip = f"лимит {MAX_TRADES_DAY} входов за сутки UTC"
+                if not skip:
+                    result = self._execute(b, plan, market)
         except Exception as e:
             skip = f"ошибка: {e}"
             print(f"[EXEC] {sym}: {traceback.format_exc()}")
