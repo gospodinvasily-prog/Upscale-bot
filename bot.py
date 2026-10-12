@@ -497,6 +497,58 @@ def handle_command(text: str) -> str:
                 send_telegram(f"⚠️ /scan ошибка: {esc(str(e))}")
         threading.Thread(target=_run_scan, daemon=True, name="manual-scan").start()
         return "🔍 Запускаю ручной скан donchian_4h_v22 — результат будет в чате."
+    if cmd == "/cleanup":
+        # Ручная очистка ghost-позиций: сверяет tracked_positions с live_positions Upscale
+        # и удаляет те которых нет на Upscale (ghost'ы после отклонённых ордеров)
+        def _run_cleanup():
+            try:
+                # 1. Получаем live позиции с Upscale
+                EXECUTOR._ensure_account()
+                if not EXECUTOR.client or not EXECUTOR.account_id:
+                    send_telegram("⚠️ /cleanup: нет клиента Upscale")
+                    return
+                EXECUTOR._refresh_markets()
+                live_positions = upscale_exec._as_list(EXECUTOR.client.positions(EXECUTOR.account_id))
+                live_syms = set()
+                for p in live_positions:
+                    if not isinstance(p, dict):
+                        continue
+                    lp_mid = upscale_exec._pos_market(p)
+                    if EXECUTOR._mk:
+                        for s, m in EXECUTOR._mk.items():
+                            if str(m.get("id", "")) == lp_mid:
+                                live_syms.add(s)
+                                break
+                # 2. Читаем tracked_positions
+                tracked = DR42._load_tracked_positions() if hasattr(DR42, '_load_tracked_positions') else upscale_exec._load_json(DR42.OPEN_POS_FILE, {})
+                tracked_syms = set(tracked.keys())
+                # 3. Находим ghost'ы
+                ghosts = tracked_syms - live_syms
+                missing_real = live_syms - tracked_syms
+                # 4. Удаляем ghost'ы
+                if ghosts:
+                    for s in ghosts:
+                        del tracked[s]
+                    DR42._save_tracked_positions(tracked) if hasattr(DR42, '_save_tracked_positions') else upscale_exec._atomic_write_json(DR42.OPEN_POS_FILE, tracked)
+                    send_telegram(
+                        f"🧹 <b>/cleanup готово</b>\n"
+                        f"✅ Удалено ghost-позиций: {len(ghosts)}\n"
+                        f"   → {', '.join(sorted(ghosts))}\n"
+                        f"📊 Tracked: {len(tracked_syms)} → {len(tracked_syms - ghosts)}\n"
+                        f"📊 Live на Upscale: {len(live_syms)}\n"
+                        + (f"⚠️ Live без tracked: {', '.join(sorted(missing_real))}" if missing_real else "")
+                    )
+                else:
+                    send_telegram(
+                        f"🧹 <b>/cleanup готово</b>\n"
+                        f"Ghost-позиций не найдено ✅\n"
+                        f"📊 Tracked: {len(tracked_syms)} | Live: {len(live_syms)}\n"
+                        + (f"⚠️ Live без tracked: {', '.join(sorted(missing_real))}" if missing_real else "")
+                    )
+            except Exception as e:
+                send_telegram(f"⚠️ /cleanup ошибка: {esc(str(e))}")
+        threading.Thread(target=_run_cleanup, daemon=True, name="manual-cleanup").start()
+        return "🧹 Запускаю очистку ghost-позиций..."
     if cmd == "/state":
         return DR42.state_report()
     if cmd == "/trail":
@@ -770,7 +822,7 @@ def main():
         start_lines.append(f"🚫 Не торгуем (глобально): {', '.join(sorted(EXCLUDE_SYMBOLS))}")
     start_lines += [
         f"📊 Пар: {len(UPSCALE_PAIRS)}",
-        "💬 /help — все команды | /up статус | /halt пауза | /scan ручной скан | /state состояние",
+        "💬 /help — все команды | /up статус | /halt пауза | /scan ручной скан | /cleanup ghost-позиции | /state состояние",
     ]
     send_telegram("\n".join(start_lines))
 
