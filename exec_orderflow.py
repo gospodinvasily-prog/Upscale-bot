@@ -11,12 +11,12 @@ v2: Добавлен фильтр по Open Interest (OI) и time-stop 5 мин�
      - OI падает → закрытие шортов → ПРОПУСКАЕМ ❌
   3. Time-stop CVD-aware (v2.2 — без жёсткого FORCE CLOSE):
      - T+60с: подтянуть стоп в безубыток
-     - T+180с: CVD-чек (повторяется каждые 60с, пока позиция жива):
-       RISING  → продлить таймер +60с И поднять TP вверх (трейлинг)
-       NEUTRAL → продлить таймер +60с (без trail TP)
+     - T+240с: CVD-чек (повторяется каждые 90с, пока позиция жива):
+       RISING  → продлить таймер +90с И поднять TP вверх (трейлинг)
+       NEUTRAL → продлить таймер +90с (без trail TP)
        FALLING → выходим (продавцы давят)
        STALE   → выходим (мало данных, безопасный вариант)
-     - T+1800с: safety net (30 мин) — закрываем принудительно
+     - T+3600с: safety net (60 мин) — закрываем принудительно
        (только если CVD слишком долго не может дать сигнал)
   4. Cooldown 10 мин по символу, 3 мин глобальный, 3 сигнала/час
   5. Динамический стоп = max(0.3%, 1.5×ATR_1min), тейк = 2×стоп
@@ -96,7 +96,7 @@ OF_MAX_NEW_PER_DAY = int(os.environ.get("OF_MAX_NEW_PER_DAY", "20"))
 # (v2.2: жёсткий FORCE_CLOSE убран — теперь CVD сам управляет выходом;
 # safety net = OF_CVD_HARD_LIMIT_SEC, см. ниже в секции CVD)
 OF_BREAKEVEN_SEC = int(os.environ.get("OF_BREAKEVEN_SEC", "60"))       # 60с → безубыток
-OF_EXIT_SEC      = int(os.environ.get("OF_EXIT_SEC", "180"))           # 180с → первый CVD-чек
+OF_EXIT_SEC      = int(os.environ.get("OF_EXIT_SEC", "240"))           # 240с → первый CVD-чек (4 мин)
 OF_COOLDOWN_LOSSES = int(os.environ.get("OF_COOLDOWN_LOSSES", "4"))
 OF_COOLDOWN_MIN    = int(os.environ.get("OF_COOLDOWN_MIN", "20"))     # 20 мин после убытков
 
@@ -120,18 +120,18 @@ OI_STALE_SEC        = 40     # если OI не обновлялся >40с → s
 
 # --- CVD (Cumulative Volume Delta) для умного выхода по времени ──────────────
 # CVD = sum(buy_vol) - sum(sell_vol) за окно OF_CVD_WINDOW_SEC.
-# При срабатывании T+OF_EXIT_SEC проверяем CVD каждые 60с:
-#   RISING  → покупатели давят, продлеваем таймер +60с И поднимаем TP (trail)
+# При срабатывании T+OF_EXIT_SEC проверяем CVD каждые OF_CVD_RESET_SEC:
+#   RISING  → покупатели давят, продлеваем таймер +90с И поднимаем TP (trail)
 #   NEUTRAL → дисбаланс слабый, продлеваем (без trail TP)
 #   FALLING → продавцы давят, выходим
 #   STALE   → нет данных, выходим (безопасный вариант)
 # Safety net OF_CVD_HARD_LIMIT_SEC — если позиция прожила дольше этого
 # времени, закрываем принудительно (safety net, не «жёсткий» таймер).
-OF_CVD_WINDOW_SEC       = int(os.environ.get("OF_CVD_WINDOW_SEC", "60"))     # окно CVD
+OF_CVD_WINDOW_SEC       = int(os.environ.get("OF_CVD_WINDOW_SEC", "90"))      # окно CVD (увелич. для сглаживания)
 OF_CVD_FALL_THRESHOLD   = float(os.environ.get("OF_CVD_FALL_THRESHOLD", "0.20"))  # 20% дисбаланс = FALLING
 OF_CVD_MIN_VOL_USD      = float(os.environ.get("OF_CVD_MIN_VOL_USD", "50000"))   # мин объём за окно
-OF_CVD_RESET_SEC        = int(os.environ.get("OF_CVD_RESET_SEC", "60"))        # +60с за продление
-OF_CVD_HARD_LIMIT_SEC   = int(os.environ.get("OF_CVD_HARD_LIMIT_SEC", "1800"))   # safety net 30 мин
+OF_CVD_RESET_SEC        = int(os.environ.get("OF_CVD_RESET_SEC", "90"))         # +90с за продление (было 60)
+OF_CVD_HARD_LIMIT_SEC   = int(os.environ.get("OF_CVD_HARD_LIMIT_SEC", "3600"))  # safety net 60 мин (было 30)
 OF_CVD_TRAIL_TP_PCT     = float(os.environ.get("OF_CVD_TRAIL_TP_PCT", "0.30"))  # +0.3% над ценой при трейлинге
 
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
@@ -1340,9 +1340,9 @@ def start():
             f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x\n"
             f"Стоп: {OF_STOP_PCT_MIN}% | Тейк: {OF_STOP_PCT_MIN * OF_TP_MULT:.1f}% (RR 1:{OF_TP_MULT:.0f})\n"
             f"OI-фильтр: ✅ (poll 10с, окно 30с)\n"
-            f"Time-stop (CVD-aware): 60с→BE, 180с→CVD-чек каждые 60с\n"
-            f"  RISING→+60с+trail TP, NEUTRAL→+60с, FALLING/STALE→выход\n"
-            f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с (30 мин)\n"
+            f"Time-stop (CVD-aware): 60с→BE, 240с→CVD-чек каждые 90с\n"
+            f"  RISING→+90с+trail TP, NEUTRAL→+90с, FALLING/STALE→выход\n"
+            f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с (60 мин)\n"
             f"Cooldown: {DETECTOR_COOLDOWN_PER_SYMBOL}с/символ, {DETECTOR_GLOBAL_COOLDOWN}с глобальный\n"
             f"Лимит: {DETECTOR_MAX_PER_HOUR} сигнала/час\n"
             f"Порог айсберга: ${DETECTOR_MIN_TOTAL_NOTIONAL:,.0f}\n"
