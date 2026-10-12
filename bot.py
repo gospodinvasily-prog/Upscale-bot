@@ -87,13 +87,21 @@ VWAP_WINDOW_BARS    = 97      # ≈ сутки 15м свечей
 # чтобы при рестарте Render не отработать повторно за ту же свечу. ──
 SCAN_INTERVAL_SEC = 4 * 3600                  # 4H = 14400 сек
 SCAN_BUFFER_SEC    = int(os.environ.get("DR42_SCAN_BUFFER_SEC", "300"))
-SCAN_MARK_FILE     = os.path.join(os.environ.get("LOG_DIR", "."), "donchian_4h_last_scan.txt")
+# На Render — Persistent Disk через BOT_DATA_DIR=/var/data; локально — текущая папка
+_DEFAULT_DIR = os.environ.get("BOT_DATA_DIR", os.environ.get("LOG_DIR", "."))
+SCAN_MARK_FILE     = os.path.join(_DEFAULT_DIR, "donchian_4h_last_scan.txt")
 
 # ── Сеть ──
 API_RATE_PER_SEC = 12      # общий лимит запросов к Gate (с запасом к публичному лимиту)
 
 # ── Логирование авто-слоя ──
-LOG_DIR  = os.environ.get("LOG_DIR", ".")
+# LOG_DIR по умолчанию = BOT_DATA_DIR (на Render это /var/data)
+LOG_DIR  = os.environ.get("LOG_DIR", _DEFAULT_DIR)
+try:
+    import os as _os
+    _os.makedirs(LOG_DIR, exist_ok=True)
+except Exception:
+    pass
 EXEC_CSV = os.path.join(LOG_DIR, "exec_dry_v8.csv")    # что сделал (или бы сделал) авто-слой
 
 # ─── UPSCALE PAIRS ────────────────────────────────────────────────────────────

@@ -86,7 +86,10 @@ MARKETS_TTL   = 30 * 60
 # постановкой TP, позиция останется ТОЛЬКО со стопом навсегда, и ни один
 # код в системе не заметит и не исправит эту дыру. Персистентный файл ниже —
 # чтобы при перезапуске восстановить и доставить то, что не успело сработать.
-PENDING_TP_FILE = os.environ.get("EXEC_PENDING_TP_FILE", "/tmp/pending_tp_upscale_exec.json")
+PENDING_TP_FILE = os.environ.get(
+    "EXEC_PENDING_TP_FILE",
+    f"{os.environ.get('BOT_DATA_DIR', '/tmp')}/pending_tp_upscale_exec.json"
+)
 
 
 def _atomic_write_json(path: str, data) -> None:
@@ -1033,6 +1036,30 @@ class Executor:
             return f"ошибка: {_trunc(e, 250)}"
         except Exception as e:
             print(f"[EXEC] move_stop: {traceback.format_exc()}")
+            return f"ошибка: {e}"
+
+    def move_tp(self, info, new_price) -> str:
+        """Подтягивает тейк-профит к новой, более выгодной цене (трейлинг TP).
+        Приём тот же, что у move_stop: ставится ДОПОЛНИТЕЛЬНЫЙ take-ордер с
+        более близким triggerPrice; старый take-ордер остаётся неиспользуемым
+        «хвостом» и не мешает. Вызывающая сторона отвечает за то, чтобы new_price
+        было ВЫШЕ предыдущего TP (для long) — здесь это не проверяется.
+        Используется в OrderFlow v2.1 для трейлинга TP при CVD RISING."""
+        try:
+            if not self.client:
+                return "нет клиента"
+            cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
+            if not cur:
+                return "позиция уже закрыта"
+            size_now = _pos_size(cur)
+            if size_now <= 0:
+                return "позиция уже закрыта"
+            self._send_take(info, size_now, new_price)
+            return f"тейк → {float(new_price):.6g}"
+        except UpscaleError as e:
+            return f"ошибка: {_trunc(e, 250)}"
+        except Exception as e:
+            print(f"[EXEC] move_tp: {traceback.format_exc()}")
             return f"ошибка: {e}"
 
     def close_position(self, info, size=None, reason: str = "") -> str:

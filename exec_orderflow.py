@@ -4,17 +4,26 @@ exec_orderflow.py — Скальперский бот OrderFlow v2 (Iceberg Dete
 ================================================================================
 v2: Добавлен фильтр по Open Interest (OI) и time-stop 5 минут.
 
-Логика v2:
+Логика v2 + CVD-aware exit:
   1. Ловит "айсберги" через WebSocket (4+ одинаковых сделки за 15с, $100K+)
-  2. НОВОЕ: Проверяет OI (Open Interest) через REST API каждые 10с
+  2. Проверяет OI (Open Interest) через REST API каждые 10с
      - OI растёт → реальные новые long-позиции → ВХОДИМ ✅
      - OI падает → закрытие шортов → ПРОПУСКАЕМ ❌
-  3. НОВОЕ: Time-stop 5 минут вместо 24 часов
-     - T+60с: подтянуть стоп в безубыток если цена не растёт
-     - T+180с: закрыть если тейк не достигнут
-     - T+300с: жёсткое закрытие
-  4. НОВОЕ: Cooldown 10 мин по символу, 3 мин глобальный, 3 сигнала/час
-  5. НОВОЕ: Динамический стоп = max(0.3%, 1.5×ATR_1min), тейк = 2×стоп
+  3. Time-stop CVD-aware (v2.2 — без жёсткого FORCE CLOSE):
+     - T+60с: подтянуть стоп в безубыток
+     - T+180с: CVD-чек (повторяется каждые 60с, пока позиция жива):
+       RISING  → продлить таймер +60с И поднять TP вверх (трейлинг)
+       NEUTRAL → продлить таймер +60с (без trail TP)
+       FALLING → выходим (продавцы давят)
+       STALE   → выходим (мало данных, безопасный вариант)
+     - T+1800с: safety net (30 мин) — закрываем принудительно
+       (только если CVD слишком долго не может дать сигнал)
+  4. Cooldown 10 мин по символу, 3 мин глобальный, 3 сигнала/час
+  5. Динамический стоп = max(0.3%, 1.5×ATR_1min), тейк = 2×стоп
+
+  CVD (Cumulative Volume Delta) = sum(buy_vol) - sum(sell_vol) за окно.
+  Если CVD падает → продавцы давят → выходим.
+  Если CVD растёт/нейтрально → даём позиции ещё шанс.
 
 Управление через Telegram:
   /of         — статус
@@ -84,9 +93,10 @@ OF_TP_MULT       = float(os.environ.get("OF_TP_MULT", "2.0"))        # тейк 
 OF_MAX_OPEN      = int(os.environ.get("OF_MAX_OPEN", "5"))
 OF_MAX_SAME_SIDE = int(os.environ.get("OF_MAX_SAME_SIDE", "3"))
 OF_MAX_NEW_PER_DAY = int(os.environ.get("OF_MAX_NEW_PER_DAY", "20"))
-OF_FORCE_CLOSE_SEC = int(os.environ.get("OF_FORCE_CLOSE_SEC", "300"))  # 5 минут
+# (v2.2: жёсткий FORCE_CLOSE убран — теперь CVD сам управляет выходом;
+# safety net = OF_CVD_HARD_LIMIT_SEC, см. ниже в секции CVD)
 OF_BREAKEVEN_SEC = int(os.environ.get("OF_BREAKEVEN_SEC", "60"))       # 60с → безубыток
-OF_EXIT_SEC      = int(os.environ.get("OF_EXIT_SEC", "180"))           # 180с → выход
+OF_EXIT_SEC      = int(os.environ.get("OF_EXIT_SEC", "180"))           # 180с → первый CVD-чек
 OF_COOLDOWN_LOSSES = int(os.environ.get("OF_COOLDOWN_LOSSES", "4"))
 OF_COOLDOWN_MIN    = int(os.environ.get("OF_COOLDOWN_MIN", "20"))     # 20 мин после убытков
 
@@ -108,15 +118,40 @@ OI_MIN_DELTA_PCT    = 0.20   # OI должен вырасти минимум н�
 OI_MIN_DELTA_USD    = 25000  # OI должен вырасти минимум на $25K
 OI_STALE_SEC        = 40     # если OI не обновлялся >40с → skip
 
+# --- CVD (Cumulative Volume Delta) для умного выхода по времени ──────────────
+# CVD = sum(buy_vol) - sum(sell_vol) за окно OF_CVD_WINDOW_SEC.
+# При срабатывании T+OF_EXIT_SEC проверяем CVD каждые 60с:
+#   RISING  → покупатели давят, продлеваем таймер +60с И поднимаем TP (trail)
+#   NEUTRAL → дисбаланс слабый, продлеваем (без trail TP)
+#   FALLING → продавцы давят, выходим
+#   STALE   → нет данных, выходим (безопасный вариант)
+# Safety net OF_CVD_HARD_LIMIT_SEC — если позиция прожила дольше этого
+# времени, закрываем принудительно (safety net, не «жёсткий» таймер).
+OF_CVD_WINDOW_SEC       = int(os.environ.get("OF_CVD_WINDOW_SEC", "60"))     # окно CVD
+OF_CVD_FALL_THRESHOLD   = float(os.environ.get("OF_CVD_FALL_THRESHOLD", "0.20"))  # 20% дисбаланс = FALLING
+OF_CVD_MIN_VOL_USD      = float(os.environ.get("OF_CVD_MIN_VOL_USD", "50000"))   # мин объём за окно
+OF_CVD_RESET_SEC        = int(os.environ.get("OF_CVD_RESET_SEC", "60"))        # +60с за продление
+OF_CVD_HARD_LIMIT_SEC   = int(os.environ.get("OF_CVD_HARD_LIMIT_SEC", "1800"))   # safety net 30 мин
+OF_CVD_TRAIL_TP_PCT     = float(os.environ.get("OF_CVD_TRAIL_TP_PCT", "0.30"))  # +0.3% над ценой при трейлинге
+
 # --- WebSocket Gate.io ───────────────────────────────────────────────────────
 GATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 GATE_REST   = "https://api.gateio.ws/api/v4/futures/usdt"
 
 # --- Файлы состояния ────────────────────────────────────────────────────────
-OF_STATE_FILE   = "/tmp/orderflow_state.json"
-OF_TRACKED_FILE = "/tmp/orderflow_tracked.json"
-OF_SIGNALS_CSV  = "/tmp/orderflow_signals.csv"
-OF_TRADES_CSV  = "/tmp/orderflow_trades.csv"
+# На Render — монтируем Persistent Disk и через env-var BOT_DATA_DIR=/var/data
+# Локально — дефолт /tmp (старое поведение, ничего не ломаем)
+_DATA_DIR = os.environ.get("BOT_DATA_DIR", "/tmp")
+# Создаём папку если её нет (на Render диск пустой при первом запуске)
+try:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
+OF_STATE_FILE   = f"{_DATA_DIR}/orderflow_state.json"
+OF_TRACKED_FILE = f"{_DATA_DIR}/orderflow_tracked.json"
+OF_SIGNALS_CSV  = f"{_DATA_DIR}/orderflow_signals.csv"
+OF_TRADES_CSV   = f"{_DATA_DIR}/orderflow_trades.csv"
 
 # --- Блокировки ─────────────────────────────────────────────────────────────
 _STATE_LOCK   = threading.Lock()
@@ -147,7 +182,9 @@ _state = {
 _trade_buffer = defaultdict(lambda: deque(maxlen=200))
 _used_trade_ids = set()
 _quanto_cache = {}
-_oi_cache = defaultdict(lambda: deque(maxlen=6))  # {sym: [(ts, oi_usd), ...]}
+_oi_cache = defaultdict(lambda: deque(maxlen=6))   # {sym: [(ts, oi_usd), ...]}
+_cvd_buffer  = defaultdict(lambda: deque(maxlen=500))  # {sym: [{ts, side, size}, ...]} — CVD
+_cvd_lock    = threading.Lock()
 
 # --- Статистика ─────────────────────────────────────────────────────────────
 _stats = {
@@ -398,6 +435,63 @@ def _check_oi_filter(sym, iceberg_notional):
 
 
 # =====================================================================
+#  CVD (Cumulative Volume Delta) — для умного time-stop
+# =====================================================================
+
+def _update_cvd_buffer(sym, side, size_usd, ts):
+    """Обновляет буфер CVD. Вызывается для КАЖДОЙ сделки (buy+sell), до фильтра по side."""
+    try:
+        with _cvd_lock:
+            _cvd_buffer[sym].append({
+                "ts": float(ts),
+                "side": side,        # 'buy' или 'sell'
+                "size": float(size_usd),
+            })
+    except Exception:
+        pass
+
+def _check_cvd_for_exit(sym):
+    """Решает: продлевать таймер выхода или закрывать позицию.
+
+    Считаем суммарный CVD за всё окно OF_CVD_WINDOW_SEC:
+      total_cvd = sum(buy_vol) - sum(sell_vol)
+      total_vol = sum(buy_vol) + sum(sell_vol)
+
+    Логика:
+      - total_cvd > 0 → покупатели доминировали за окно → RISING → ПРОДЛЕВАЕМ
+      - total_cvd < 0, |total_cvd|/total_vol < OF_CVD_FALL_THRESHOLD → NEUTRAL → ПРОДЛЕВАЕМ
+      - total_cvd < 0, |total_cvd|/total_vol >= OF_CVD_FALL_THRESHOLD → FALLING → ВЫХОДИМ
+      - Недостаточно данных / мало объёма → STALE → ВЫХОДИМ (безопасный)
+    """
+    with _cvd_lock:
+        buf = list(_cvd_buffer.get(sym, deque()))
+
+    if len(buf) < 5:
+        return "STALE"
+
+    now = _now_ts()
+    recent = [t for t in buf if now - t["ts"] <= OF_CVD_WINDOW_SEC]
+    if len(recent) < 5:
+        return "STALE"
+
+    # Суммарный CVD за всё окно (направление, не acceleration)
+    total_cvd = sum(t["size"] if t["side"] == "buy"  else -t["size"] for t in recent)
+    total_vol = sum(t["size"] for t in recent)
+
+    if total_vol < OF_CVD_MIN_VOL_USD:
+        return "STALE"
+
+    if total_cvd > 0:
+        return "RISING"
+
+    # total_cvd <= 0 → sellers dominate. Насколько сильно?
+    ratio = abs(total_cvd) / total_vol if total_vol > 0 else 0
+    if ratio < OF_CVD_FALL_THRESHOLD:
+        return "NEUTRAL"  # слабый дисбаланс в сторону sells (даже немного просел → продлеваем)
+    return "FALLING"
+
+
+# =====================================================================
 #  ICEBERG DETECTOR
 # =====================================================================
 
@@ -498,6 +592,12 @@ def _process_trade(sym, size_contracts, price, ts):
         return
 
     side = _get_side(size_contracts)
+
+    # === CVD: обновляем для КАЖДОЙ сделки (buy+sell) ДО фильтра по side ===
+    # Это нужно, чтобы CVD-буфер собирал и buys и sells.
+    _update_cvd_buffer(sym, side, size_usd, ts)
+
+    # Дальше — только long-сигналы (детектор айсбергов заточен под long)
     if side != "buy":
         return
 
@@ -793,8 +893,10 @@ def _manage_positions():
             del tracked[pos_id]
             changed = True
         else:
-            # === TIME-STOP ЛОГИКА (НОВОЕ v2) ===
+            # === TIME-STOP ЛОГИКА (CVD-aware v2.2 — без жёсткого FORCE CLOSE) ===
             hold_sec = now - rec.get("opened_ts", now)
+            exit_extension = rec.get("exit_extension_sec", 0)
+            cvd_resets     = rec.get("cvd_resets", 0)
 
             # T+60с: подтянуть стоп в безубыток (если ещё не сделано)
             if hold_sec >= OF_BREAKEVEN_SEC and not rec.get("be_done", False):
@@ -814,35 +916,113 @@ def _manage_positions():
                         except Exception as e:
                             print(f"[exec_of] BE move error: {e}")
 
-            # T+180с: закрыть если тейк не достигнут (один раз!)
-            if hold_sec >= OF_EXIT_SEC and not rec.get("exit_done", False):
+            # Safety net: T+OF_CVD_HARD_LIMIT_SEC (30 мин) — закрываем принудительно
+            # (safety net, не «жёсткий» таймер — срабатывает только если CVD
+            # слишком долго не может дать сигнал)
+            if hold_sec >= OF_CVD_HARD_LIMIT_SEC and not rec.get("exit_done", False):
                 pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
                 if pos:
                     mid = UE._pos_market(pos)
                     if mid:
                         info = {"id": pos_id, "mid": mid, "dir": "long"}
                         try:
-                            res = executor.close_position(info, reason=f"OF_EXIT_{OF_EXIT_SEC}s")
+                            res = executor.close_position(info, reason=f"OF_HARD_LIMIT_{OF_CVD_HARD_LIMIT_SEC}s")
                             rec["exit_done"] = True
                             changed = True
                             if B:
-                                B.send_telegram(f"⏱️ OF {rec['sym']}: выход по времени T+{int(hold_sec)}с ({res})")
+                                B.send_telegram(
+                                    f"⏱️ OF {rec['sym']}: safety-net выход T+{int(hold_sec)}с\n"
+                                    f"Лимит времени {OF_CVD_HARD_LIMIT_SEC}с ({res})"
+                                )
                         except Exception as e:
-                            print(f"[exec_of] exit close error: {e}")
+                            print(f"[exec_of] hard-limit close error: {e}")
 
-            # T+300с: жёсткое закрытие (тоже один раз!)
-            if hold_sec >= OF_FORCE_CLOSE_SEC and not rec.get("exit_done", False):
-                pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
-                if pos:
-                    mid = UE._pos_market(pos)
-                    if mid:
-                        info = {"id": pos_id, "mid": mid, "dir": "long"}
-                        try:
-                            res = executor.close_position(info, reason=f"OF_FORCE_{OF_FORCE_CLOSE_SEC}s")
-                            if B:
-                                B.send_telegram(f"🛑 OF {rec['sym']}: FORCE CLOSE T+{int(hold_sec)}с ({res})")
-                        except Exception as e:
-                            print(f"[exec_of] force close error: {e}")
+            # CVD-чек: T+(OF_EXIT_SEC + exit_extension) — повторяется каждые 60с
+            # пока позиция жива. Без max_resets — пусть продлевается сколько нужно.
+            next_exit_at = OF_EXIT_SEC + exit_extension
+            if hold_sec >= next_exit_at and not rec.get("exit_done", False):
+                cvd_status = _check_cvd_for_exit(rec["sym"])
+
+                if cvd_status == "RISING":
+                    # ✅ Продлеваем таймер И поднимаем TP (трейлинг)
+                    pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
+                    tp_trail_msg = ""
+                    if pos:
+                        mid = UE._pos_market(pos)
+                        if mid:
+                            info = {"id": pos_id, "mid": mid, "dir": "long"}
+                            # Получаем текущую цену из OI-кеша (или last price из tracked)
+                            try:
+                                tickers = B.api_get("tickers", []) if B else []
+                                cur_price = None
+                                for t in tickers:
+                                    if isinstance(t, dict) and t.get("contract") == f"{rec['sym']}_USDT":
+                                        cur_price = float(t.get("last", 0))
+                                        break
+                                if cur_price and cur_price > 0:
+                                    new_tp = cur_price * (1 + OF_CVD_TRAIL_TP_PCT / 100)
+                                    old_tp = rec.get("tp", 0)
+                                    if new_tp > old_tp:
+                                        try:
+                                            tp_res = executor.move_tp(info, new_tp)
+                                            rec["tp"] = new_tp
+                                            rec["tp_trail_count"] = rec.get("tp_trail_count", 0) + 1
+                                            rec["cvd_last_status"] = cvd_status
+                                            changed = True
+                                            tp_trail_msg = f" | TP ${old_tp:.6g}→${new_tp:.6g}"
+                                            print(f"[exec_of] {rec['sym']}: TP trail @ T+{int(hold_sec)}с: ${old_tp:.6g}→${new_tp:.6g}")
+                                        except Exception as e:
+                                            print(f"[exec_of] move_tp error: {e}")
+                            except Exception as e:
+                                print(f"[exec_of] price fetch for trail error: {e}")
+
+                    # Продлеваем таймер
+                    rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
+                    rec["cvd_resets"]         = cvd_resets + 1
+                    rec["cvd_last_status"]    = cvd_status
+                    changed = True
+                    new_total = rec["exit_extension_sec"]
+                    print(f"[exec_of] {rec['sym']}: CVD=RISING → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с){tp_trail_msg}")
+                    if B:
+                        B.send_telegram(
+                            f"📊 <b>OF {rec['sym']}: CVD=RISING</b>\n"
+                            f"Продлеваем: +{OF_CVD_RESET_SEC}с (всего +{new_total}с)\n"
+                            f"Сброс {cvd_resets+1} | T+{int(hold_sec)}с{tp_trail_msg}"
+                        )
+
+                elif cvd_status == "NEUTRAL":
+                    # ⚠️ Продлеваем таймер (без trail TP)
+                    rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
+                    rec["cvd_resets"]         = cvd_resets + 1
+                    rec["cvd_last_status"]    = cvd_status
+                    changed = True
+                    new_total = rec["exit_extension_sec"]
+                    print(f"[exec_of] {rec['sym']}: CVD=NEUTRAL → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с)")
+                    if B:
+                        B.send_telegram(
+                            f"📊 OF {rec['sym']}: CVD=NEUTRAL\n"
+                            f"Продлеваем: +{OF_CVD_RESET_SEC}с (всего +{new_total}с)\n"
+                            f"Сброс {cvd_resets+1} | T+{int(hold_sec)}с (без trail TP)"
+                        )
+
+                else:
+                    # ❌ CVD FALLING или STALE → выходим
+                    pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
+                    if pos:
+                        mid = UE._pos_market(pos)
+                        if mid:
+                            info = {"id": pos_id, "mid": mid, "dir": "long"}
+                            try:
+                                res = executor.close_position(info, reason=f"OF_EXIT_CVD_{cvd_status}")
+                                rec["exit_done"] = True
+                                changed = True
+                                if B:
+                                    B.send_telegram(
+                                        f"⏱️ OF {rec['sym']}: выход T+{int(hold_sec)}с\n"
+                                        f"CVD={cvd_status} ({res})"
+                                    )
+                            except Exception as e:
+                                print(f"[exec_of] exit close error: {e}")
 
     if changed:
         with _TRACKED_LOCK:
@@ -1035,6 +1215,22 @@ def status_report():
 
     lines.append(f"Всего сигналов: {_stats['signals_total']} (OI отклонено: {_stats['signals_oi_rejected']}, подавлено: {_stats['signals_suppressed']})")
     lines.append(f"Сделок: {_stats['trades_opened']} открыто / {_stats['trades_closed']} закрыто")
+
+    # CVD-статусы по открытым позициям
+    tracked = _load_tracked()
+    open_recs = [(pid, v) for pid, v in tracked.items() if v.get("status") == "open" and not pid.startswith("pending_")]
+    if open_recs:
+        lines.append("")
+        lines.append("━━ CVD по открытым ━━")
+        for pid, v in open_recs:
+            sym = v.get("sym", "?")
+            cvd_status = _check_cvd_for_exit(sym)
+            resets = v.get("cvd_resets", 0)
+            ext = v.get("exit_extension_sec", 0)
+            trail_count = v.get("tp_trail_count", 0)
+            tp = v.get("tp", 0)
+            emoji = {"RISING": "🟢", "NEUTRAL": "🟡", "FALLING": "🔴", "STALE": "⚪"}.get(cvd_status, "?")
+            lines.append(f"  {sym}: {emoji} {cvd_status} | ext +{ext}с | trail TP ×{trail_count} | TP ${tp:.6g}")
     if _stats['trades_closed'] > 0:
         wr = _stats['wins'] / _stats['trades_closed'] * 100
         lines.append(f"Winrate: {wr:.0f}% ({_stats['wins']}/{_stats['trades_closed']})")
@@ -1140,7 +1336,9 @@ def start():
             f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x\n"
             f"Стоп: {OF_STOP_PCT_MIN}% | Тейк: {OF_STOP_PCT_MIN * OF_TP_MULT:.1f}% (RR 1:{OF_TP_MULT:.0f})\n"
             f"OI-фильтр: ✅ (poll 10с, окно 30с)\n"
-            f"Time-stop: 60с→BE, 180с→exit, 300с→force\n"
+            f"Time-stop (CVD-aware v2.2): 60с→BE, 180с→CVD-чек каждые 60с\n"
+            f"  RISING→+60с+trail TP, NEUTRAL→+60с, FALLING/STALE→выход\n"
+            f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с (30 мин)\n"
             f"Cooldown: {DETECTOR_COOLDOWN_PER_SYMBOL}с/символ, {DETECTOR_GLOBAL_COOLDOWN}с глобальный\n"
             f"Лимит: {DETECTOR_MAX_PER_HOUR} сигнала/час\n"
             f"Порог айсберга: ${DETECTOR_MIN_TOTAL_NOTIONAL:,.0f}\n"

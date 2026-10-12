@@ -142,17 +142,23 @@ BTC_CONTRACT = "BTC_USDT"
 BALANCE_TTL_SEC   = 300             # 5 минут кеш
 BALANCE_FORCE_ON_SCAN = True        # перед каждым check_signals() — принудительное обновление
 
-# --- Файлы персистентного состояния (на диске Render — стираются при деплое)
-# --- Но это ОК: tracked_positions восстанавливается при первом скане из
-# --- открытых на Upscale позиций; cooldown теряется (сознательный компромисс)-
-COOLDOWN_FILE     = "/tmp/cooldown_donchian_4h_v22.json"
-TRADE_STATE_FILE  = "/tmp/trade_state_donchian_4h_v22.json"   # consec_losses по парам
-OPEN_POS_FILE     = "/tmp/open_positions_donchian_4h_v22.json" # tracked {sym: {opened_ts, side, entry, atr, trail_stop, max_fav, hold_days, partial_taken}}
-PEAK_FILE         = "/tmp/peak_equity_donchian_4h_v22.json"   # пик equity (для DD brake)
-TODAY_REALIZED_FILE = "/tmp/today_realized_donchian_4h_v22.json"  # {date, realized} — Daily Stop today-only
-DAY_STOP_FILE     = "/tmp/day_stop_donchian_4h_v22.json"      # {date, active} — блокировка входов до 00:00 UTC
-PREV_DAY_FILE     = "/tmp/prev_day_donchian_4h_v22.json"      # {date, day_start_equity} — для CONSEC
-NEW_TODAY_FILE    = "/tmp/new_today_donchian_4h_v22.json"     # {date, count} — счётчик новых входов за сутки (MAX_NEW_PER_DAY)
+# --- Файлы персистентного состояния ─────────────────────────────────────────
+# На Render — монтируем Persistent Disk и через env-var BOT_DATA_DIR=/var/data
+# Локально — дефолт /tmp (старое поведение)
+_DATA_DIR = os.environ.get("BOT_DATA_DIR", "/tmp")
+try:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
+COOLDOWN_FILE       = f"{_DATA_DIR}/cooldown_donchian_4h_v22.json"
+TRADE_STATE_FILE    = f"{_DATA_DIR}/trade_state_donchian_4h_v22.json"   # consec_losses по парам
+OPEN_POS_FILE       = f"{_DATA_DIR}/open_positions_donchian_4h_v22.json" # tracked {sym: {opened_ts, side, entry, atr, trail_stop, max_fav, hold_days, partial_taken}}
+PEAK_FILE           = f"{_DATA_DIR}/peak_equity_donchian_4h_v22.json"   # пик equity (для DD brake)
+TODAY_REALIZED_FILE = f"{_DATA_DIR}/today_realized_donchian_4h_v22.json"  # {date, realized} — Daily Stop today-only
+DAY_STOP_FILE       = f"{_DATA_DIR}/day_stop_donchian_4h_v22.json"      # {date, active} — блокировка входов до 00:00 UTC
+PREV_DAY_FILE       = f"{_DATA_DIR}/prev_day_donchian_4h_v22.json"      # {date, day_start_equity} — для CONSEC
+NEW_TODAY_FILE      = f"{_DATA_DIR}/new_today_donchian_4h_v22.json"     # {date, count} — счётчик новых входов за сутки (MAX_NEW_PER_DAY)
 
 
 # =====================================================================
