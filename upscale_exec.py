@@ -729,12 +729,24 @@ class Executor:
                 plan = build_plan(b["price"], b["stop_pct"], side, b["stop"],
                                   b.get("tp1_price", b["price"]), b.get("tp2_price", b.get("tp1_price", b["price"])),
                                   risk_usd, max_pos_usd)
+            # === СЕРИАЛИЗУЕМ критическую секцию: guard_skip → execute → update_risk ===
+            # Раньше _execute был под _open_lock, но _guard_skip вызывался ДО блокировки.
+            # Из-за этого 6 сигналов почти одновременно проходили _guard_skip с одним
+            # и тем же снапшотом _open_risk, и все 6 открывались (даже если лимит risk
+            # уже превышен). Теперь вся последовательность под одним локом.
             if not skip and self.mode == "demo":
-                skip = self._real_block()
-                if not skip and MAX_TRADES_DAY and self._day_count() >= MAX_TRADES_DAY:
-                    skip = f"лимит {MAX_TRADES_DAY} входов за сутки UTC"
-                if not skip:
-                    result = self._execute(b, plan, market)
+                with self._open_lock:
+                    skip = self._real_block()
+                    if not skip and MAX_TRADES_DAY and self._day_count() >= MAX_TRADES_DAY:
+                        skip = f"лимит {MAX_TRADES_DAY} входов за сутки UTC"
+                    if not skip:
+                        # Повторная проверка guard_skip ПОД локом — с актуальным _open_risk
+                        snap = self._snapshot()
+                        if snap:
+                            new_risk = Decimal(str(risk_usd)) if risk_usd else Decimal("0")
+                            skip = self._guard_skip(snap, new_risk)
+                        if not skip:
+                            result = self._execute_locked(b, plan, market)
         except Exception as e:
             skip = f"ошибка: {e}"
             print(f"[EXEC] {sym}: {traceback.format_exc()}")
@@ -759,62 +771,55 @@ class Executor:
         sym, side, mid, acc = b["symbol"], b["side"], str(market["id"]), self.account_id
         strategy = b.get("strategy", "donchian_4h_v22")
         leverage_override = b.get("leverage_override")
+        # === СЕРИАЛИЗУЕМ критическую секцию: positions → guard_skip → order → register_risk ===
+        # v2.2: ранее _open_lock брался только вокруг self._positions(), а _guard_skip
+        # вызывался уже ПОСЛЕ освобождения локов. Из-за этого 6 сигналов почти
+        # одновременно проходили _guard_skip с одним и тем же _open_risk, и
+        # все 6 открывались (даже если лимит risk уже превышен).
+        # Теперь ВЕС блок от чтения позиций до обновления _open_risk — под одним локом.
         with self._open_lock:
             pos_now = self._positions()
-        if MAX_OPEN and len(pos_now) >= MAX_OPEN:
-            return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
-        if any(_pos_market(p) == mid for p in pos_now):
-            return "пропуск: по монете уже есть позиция"
-        # same_side_limit можно переопределить В СИГНАЛЕ (поле max_same_side) —
-        # так стратегия (donchian) передаёт свой риск-зависимый лимит, и он не
-        # расходится со статичным MAX_SAME_SIDE_OPEN (который иначе был бы
-        # вторым, независимым источником правды с похожим именем и риском
-        # разъехаться, если риск на сделку когда-нибудь изменится).
-        same_side_limit = b.get("max_same_side", MAX_SAME_SIDE_OPEN)
-        if same_side_limit:
-            # Per-strategy подсчёт: считаем только позиции текущей стратегии через реестр
-            same = sum(1 for p in pos_now 
-                       if _pos_dir(p) == side 
-                       and self._registry_get(_pos_id(p)) == strategy)
-            if same >= same_side_limit:
-                return (f"пропуск: уже {same} открытых позиций в {side} "
-                        f"(лимит {same_side_limit}) — не набираем одну ставку")
-        before = {_pos_id(p) for p in pos_now}
-        # _open_risk читается/пишется из нескольких потоков одновременно —
-        # on_signal() запускает КАЖДЫЙ сигнал в своём потоке (специально, чтобы
-        # несколько входов за один скан не блокировали друг друга), поэтому без
-        # self._lock здесь была гонка: поток A может переписать весь словарь
-        # (оставив только "live" на момент СВОЕГО старта) уже ПОСЛЕ того, как
-        # поток B успел добавить туда риск своей только что открытой позиции —
-        # запись B стирается, и следующая проверка риска считает открытый риск
-        # заниженным именно в момент, когда одновременно открывается несколько
-        # позиций и риск-контроль нужнее всего.
-        with self._lock:
-            live = set(before)
-            self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
-        snap = self._snapshot()
-        if snap is None:
-            return f"пропуск: не смог прочитать risk-status ({self._snap_err})"
-        why = self._guard_skip(snap, plan["real_risk_usd"])
-        if why:
-            return "пропуск: " + why
-        # Используем leverage_override если передан, иначе дефолтный LEVERAGE
-        lev = Decimal(str(leverage_override)) if leverage_override else plan["leverage"]
-        body = open_body(acc, mid, side, plan["margin_usd"], lev, stop=b["stop"])
-        try:
-            self.client.order(body)
-        except UpscaleError as e:
-            return f"ордер отклонён: {e}"
-        with self._lock:
-            self._day["n"] += 1
-        pos = self._wait_position(mid, side, before)
-        if not pos:
-            return "ордер отправлен, но позицию не нашёл (проверь терминал)"
-        # Регистрируем стратегию в реестре СРАЗУ (закрывает 15-сек окно где 4H-бот мог "украсть" OF-позицию)
-        pos_id = _pos_id(pos)
-        self._registry_set(pos_id, strategy)
-        size = _pos_size(pos)
-        size_base = Decimal(size) / FP
+            if MAX_OPEN and len(pos_now) >= MAX_OPEN:
+                return f"пропуск: уже {len(pos_now)} открытых позиций (лимит {MAX_OPEN})"
+            if any(_pos_market(p) == mid for p in pos_now):
+                return "пропуск: по монете уже есть позиция"
+            same_side_limit = b.get("max_same_side", MAX_SAME_SIDE_OPEN)
+            if same_side_limit:
+                same = sum(1 for p in pos_now 
+                           if _pos_dir(p) == side 
+                           and self._registry_get(_pos_id(p)) == strategy)
+                if same >= same_side_limit:
+                    return (f"пропуск: уже {same} открытых позиций в {side} "
+                            f"(лимит {same_side_limit}) — не набираем одну ставку")
+            before = {_pos_id(p) for p in pos_now}
+            with self._lock:
+                live = set(before)
+                self._open_risk = {k: v for k, v in self._open_risk.items() if k in live}
+            # === ПРОВЕРКА РИСКА ПОД ЛОКОМ — видит актуальный _open_risk от предыдущих сигналов ===
+            snap = self._snapshot()
+            if snap is None:
+                return f"пропуск: не смог прочитать risk-status ({self._snap_err})"
+            why = self._guard_skip(snap, plan["real_risk_usd"])
+            if why:
+                return "пропуск: " + why
+            # Используем leverage_override если передан, иначе дефолтный LEVERAGE
+            lev = Decimal(str(leverage_override)) if leverage_override else plan["leverage"]
+            body = open_body(acc, mid, side, plan["margin_usd"], lev, stop=b["stop"])
+            try:
+                self.client.order(body)
+            except UpscaleError as e:
+                return f"ордер отклонён: {e}"
+            with self._lock:
+                self._day["n"] += 1
+            pos = self._wait_position(mid, side, before)
+            if not pos:
+                return "ордер отправлен, но позицию не нашёл (проверь терминал)"
+            # Регистрируем стратегию в реестре СРАЗУ
+            pos_id = _pos_id(pos)
+            self._registry_set(pos_id, strategy)
+            size = _pos_size(pos)
+            size_base = Decimal(size) / FP
+        # === _open_lock освобождён — ордер уже отправлен, позиция уже зарегистрирована ===
         notional = abs(from_fp9(pos["notional"])) if pos.get("notional") else Decimal(0)
         if notional <= 0:                                        # нет поля или мусор
             notional = size_base * Decimal(str(b["price"]))
