@@ -128,7 +128,7 @@ OI_STALE_SEC        = 40     # если OI не обновлялся >40с → s
 # Safety net OF_CVD_HARD_LIMIT_SEC — если позиция прожила дольше этого
 # времени, закрываем принудительно (safety net, не «жёсткий» таймер).
 OF_CVD_WINDOW_SEC       = int(os.environ.get("OF_CVD_WINDOW_SEC", "90"))      # окно CVD (увелич. для сглаживания)
-OF_CVD_FALL_THRESHOLD   = float(os.environ.get("OF_CVD_FALL_THRESHOLD", "0.20"))  # 20% дисбаланс = FALLING
+OF_CVD_FALL_THRESHOLD   = float(os.environ.get("OF_CVD_FALL_THRESHOLD", "0.35"))  # 35% дисбаланс = FALLING (было 20% — слишком чувствительно)
 OF_CVD_MIN_VOL_USD      = float(os.environ.get("OF_CVD_MIN_VOL_USD", "50000"))   # мин объём за окно
 OF_CVD_RESET_SEC        = int(os.environ.get("OF_CVD_RESET_SEC", "90"))         # +90с за продление (было 60)
 OF_CVD_HARD_LIMIT_SEC   = int(os.environ.get("OF_CVD_HARD_LIMIT_SEC", "3600"))  # safety net 60 мин (было 30)
@@ -616,7 +616,7 @@ def _process_trade(sym, size_contracts, price, ts):
         _stats["signals_suppressed"] += 1
         return
 
-    # === OI-ФИЛЬТР (НОВОЕ v2) ===
+    # === OI-ФИЛЬТР (v2.2: YELLOW → только алерт, без входа) ===
     oi_status = _check_oi_filter(sym, signal["total_usd"])
 
     if oi_status == "RED":
@@ -630,8 +630,32 @@ def _process_trade(sym, size_contracts, price, ts):
         print(f"[exec_of] {sym}: OI STALE — пропуск (нет данных)")
         return
 
-    # YELLOW → разрешаем с половинным размером
-    half_size = (oi_status == "YELLOW")
+    # v2.2: YELLOW → больше не входит, только алерт.
+    # Если хочешь возвращать half_size вход — поменяй env OF_ALLOW_YELLOW=1
+    _allow_yellow = os.environ.get("OF_ALLOW_YELLOW", "0") == "1"
+    if oi_status == "YELLOW" and not _allow_yellow:
+        _stats["signals_oi_rejected"] += 1
+        _stats["signals_suppressed"] += 1
+        print(f"[exec_of] {sym}: OI YELLOW — пропуск (только алерт, без входа)")
+        # Алерт всё равно отправится ниже, но без исполнения
+        half_size = True
+        _record_signal(sym)
+        _stats["signals_total"] += 1
+        _state["signals_today"] += 1
+        _log_signal(signal, oi_status)
+        if _state["alerts_enabled"] and B:
+            oi_emoji = "⚠️ OI~"
+            B.send_telegram(
+                f"🧊 <b>ICEBERG {sym} 🟢 BUY</b> {oi_emoji}\n"
+                f"За {DETECTOR_WINDOW_SEC}с: {signal['num_trades']} сделок по ~${signal['avg_size']:.0f}\n"
+                f"Суммарно: ${signal['total_usd']:.0f}\n"
+                f"Цена: {price}\n"
+                f"OI: {oi_status} — ⚠️ без входа (только GREEN)"
+            )
+        return
+
+    # GREEN → полный размер
+    half_size = (oi_status == "YELLOW")  # сработает только если OF_ALLOW_YELLOW=1
 
     _record_signal(sym)
     _stats["signals_total"] += 1
@@ -721,9 +745,11 @@ def _execute_signal(signal, price, half_size=False):
             B.send_telegram(
                 f"🧊 <b>OF ВХОД {sym} LONG</b>\n"
                 f"Вход: ${entry:.6g} | Стоп: ${stop:.6g} ({stop_pct}%)\n"
-                f"Тейк (через 65с): ${tp:.6g} ({tp_pct:.1f}%)\n"
+                f"Тейк: ${tp:.6g} ({tp_pct:.1f}%)\n"
                 f"Маржа: {size_str} × {OF_LEVERAGE}x\n"
-                f"Time-stop: 60с→BE, 180с→выход, 300с→force"
+                f"Time-stop: 60с→BE, 240с→CVD-чек (каждые 90с)\n"
+                f"  RISING→+90с+trail TP, NEUTRAL→+90с, FALLING/STALE→выход\n"
+                f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с ({OF_CVD_HARD_LIMIT_SEC//60} мин)"
             )
 
         _state["new_today"] += 1
@@ -944,14 +970,13 @@ def _manage_positions():
                 cvd_status = _check_cvd_for_exit(rec["sym"])
 
                 if cvd_status == "RISING":
-                    # ✅ Продлеваем таймер И поднимаем TP (трейлинг)
+                    # ✅ Продлеваем таймер И поднимаем TP (трейлинг) — молча, без TG
                     pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
-                    tp_trail_msg = ""
                     if pos:
                         mid = UE._pos_market(pos)
                         if mid:
                             info = {"id": pos_id, "mid": mid, "dir": "long"}
-                            # Получаем текущую цену из OI-кеша (или last price из tracked)
+                            # Получаем текущую цену из tickers
                             try:
                                 tickers = B.api_get("tickers", []) if B else []
                                 cur_price = None
@@ -969,44 +994,31 @@ def _manage_positions():
                                             rec["tp_trail_count"] = rec.get("tp_trail_count", 0) + 1
                                             rec["cvd_last_status"] = cvd_status
                                             changed = True
-                                            tp_trail_msg = f" | TP ${old_tp:.6g}→${new_tp:.6g}"
                                             print(f"[exec_of] {rec['sym']}: TP trail @ T+{int(hold_sec)}с: ${old_tp:.6g}→${new_tp:.6g}")
                                         except Exception as e:
                                             print(f"[exec_of] move_tp error: {e}")
                             except Exception as e:
                                 print(f"[exec_of] price fetch for trail error: {e}")
 
-                    # Продлеваем таймер
+                    # Продлеваем таймер (молча, без Telegram-сообщения)
                     rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
                     rec["cvd_resets"]         = cvd_resets + 1
                     rec["cvd_last_status"]    = cvd_status
                     changed = True
                     new_total = rec["exit_extension_sec"]
-                    print(f"[exec_of] {rec['sym']}: CVD=RISING → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с){tp_trail_msg}")
-                    if B:
-                        B.send_telegram(
-                            f"📊 <b>OF {rec['sym']}: CVD=RISING</b>\n"
-                            f"Продлеваем: +{OF_CVD_RESET_SEC}с (всего +{new_total}с)\n"
-                            f"Сброс {cvd_resets+1} | T+{int(hold_sec)}с{tp_trail_msg}"
-                        )
+                    print(f"[exec_of] {rec['sym']}: CVD=RISING → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с)")
 
                 elif cvd_status == "NEUTRAL":
-                    # ⚠️ Продлеваем таймер (без trail TP)
+                    # ⚠️ Продлеваем таймер (молча, без trail TP и без TG)
                     rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
                     rec["cvd_resets"]         = cvd_resets + 1
                     rec["cvd_last_status"]    = cvd_status
                     changed = True
                     new_total = rec["exit_extension_sec"]
                     print(f"[exec_of] {rec['sym']}: CVD=NEUTRAL → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с)")
-                    if B:
-                        B.send_telegram(
-                            f"📊 OF {rec['sym']}: CVD=NEUTRAL\n"
-                            f"Продлеваем: +{OF_CVD_RESET_SEC}с (всего +{new_total}с)\n"
-                            f"Сброс {cvd_resets+1} | T+{int(hold_sec)}с (без trail TP)"
-                        )
 
                 else:
-                    # ❌ CVD FALLING или STALE → выходим
+                    # ❌ CVD FALLING или STALE → выходим (с сообщением в TG)
                     pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
                     if pos:
                         mid = UE._pos_market(pos)
@@ -1016,10 +1028,12 @@ def _manage_positions():
                                 res = executor.close_position(info, reason=f"OF_EXIT_CVD_{cvd_status}")
                                 rec["exit_done"] = True
                                 changed = True
+                                trail_count = rec.get("tp_trail_count", 0)
+                                final_tp = rec.get("tp", 0)
                                 if B:
                                     B.send_telegram(
                                         f"⏱️ OF {rec['sym']}: выход T+{int(hold_sec)}с\n"
-                                        f"CVD={cvd_status} ({res})"
+                                        f"CVD={cvd_status} | продлений: {cvd_resets} | TP trail ×{trail_count} ({res})"
                                     )
                             except Exception as e:
                                 print(f"[exec_of] exit close error: {e}")
