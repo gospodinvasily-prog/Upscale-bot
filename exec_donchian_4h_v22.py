@@ -1607,10 +1607,60 @@ def _check_signals_impl():
                             entry=sig["price"], atr=sig["atr"], stop=sig["stop"],
                             price_correction=1.0)
         # S16: обновляем price_correction после реального входа (асинхронно,
-        # в отдельном потоке — позиция может появиться не сразу)
-        def _update_correction_async(s=sym, p=sig["price"]):
-            time.sleep(3)   # даём ордеру исполниться
+        # в отдельном потоке — позиция может появиться не сразу).
+        # S17 (NEW): проверяем что позиция реально открылась — если нет (Day Stop / risk limit /
+        # монитор Upscale отклонил), удаляем её из tracked_positions и откатываем счётчики.
+        def _update_correction_async(s=sym, p=sig["price"], side=sig["side"]):
+            time.sleep(5)   # даём ордеру исполниться (увеличили с 3с до 5с)
             try:
+                # Проверяем — позиция реально открылась на Upscale?
+                pos_found = False
+                try:
+                    executor._ensure_account()
+                    if executor.client and executor.account_id:
+                        live_positions = UE._as_list(executor.client.positions(executor.account_id))
+                        for lp in live_positions:
+                            if not isinstance(lp, dict):
+                                continue
+                            lp_mid = UE._pos_market(lp)
+                            lp_sym = None
+                            if executor._mk:
+                                for _s, _m in executor._mk.items():
+                                    if str(_m.get("id", "")) == lp_mid:
+                                        lp_sym = _s
+                                        break
+                            if lp_sym == s:
+                                pos_found = True
+                                break
+                except Exception as e:
+                    print(f"[exec_dr22] position check {s}: {e}")
+                    # Если не можем проверить — оставляем как есть (безопаснее)
+                    pos_found = True
+
+                if not pos_found:
+                    # Позиция не открылась — отклонена Upscale (Day Stop / risk / лимит)
+                    print(f"[exec_dr22] {s}: позиция не открылась на Upscale — откатываем tracked_positions")
+                    with _TRACKED_LOCK:
+                        tracked = _load_json(OPEN_POS_FILE, {})
+                        if s in tracked:
+                            del tracked[s]
+                            _atomic_write_json(OPEN_POS_FILE, tracked)
+                    # Откатываем счётчик new_today
+                    try:
+                        prev = _load_json(NEW_TODAY_FILE, {"count": 0, "date": _today_utc_str()})
+                        if prev.get("count", 0) > 0:
+                            prev["count"] = prev["count"] - 1
+                            _atomic_write_json(NEW_TODAY_FILE, prev)
+                    except Exception as e:
+                        print(f"[exec_dr22] new_today rollback {s}: {e}")
+                    # Уведомляем пользователя
+                    if B:
+                        B.send_telegram(
+                            f"⚠️ {s}: позиция не открылась (отклонена Upscale — Day Stop/risk/лимит)\n"
+                            f"Удалена из tracked_positions, счётчик new_today откатан"
+                        )
+                    return  # не обновляем price_correction — позиции нет
+                # Позиция открылась — обновляем price_correction как раньше
                 _update_price_correction(executor, s, p)
             except Exception as e:
                 print(f"[exec_dr22] price_correction {s}: {e}")
