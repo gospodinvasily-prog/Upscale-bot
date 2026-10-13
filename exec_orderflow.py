@@ -85,8 +85,18 @@ OF_PAIRS = [p.strip() for p in os.environ.get("OF_PAIRS", ",".join(OF_PAIRS_DEFA
 # --- Параметры сделок ────────────────────────────────────────────────────────
 OF_MARGIN_USD    = float(os.environ.get("OF_MARGIN_USD", "50"))
 OF_LEVERAGE      = int(os.environ.get("OF_LEVERAGE", "5"))
-OF_STOP_PCT_MIN  = float(os.environ.get("OF_STOP_PCT_MIN", "0.3"))   # мин стоп 0.3%
-OF_TP_MULT       = float(os.environ.get("OF_TP_MULT", "2.0"))        # тейк = 2× стоп
+OF_STOP_PCT_MIN  = float(os.environ.get("OF_STOP_PCT_MIN", "0.3"))   # мин стоп 0.3% (fallback)
+OF_TP_MULT       = float(os.environ.get("OF_TP_MULT", "2.0"))        # тейк = 2× стоп (fallback)
+
+# === ATR-based стоп/тейк (v2.3 — адаптивные к волатильности) ===
+# Стоп = max(0.15%, 1×ATR_5m)
+# Тейк = max(0.30%, 2×ATR_5m)
+# RR ≈ 1:2 во всех сценариях
+OF_ATR_PERIOD       = int(os.environ.get("OF_ATR_PERIOD", "12"))        # 12 свечей 5m = 1 час
+OF_ATR_STOP_MULT     = float(os.environ.get("OF_ATR_STOP_MULT", "1.0")) # стоп = 1×ATR_5m
+OF_ATR_TP_MULT       = float(os.environ.get("OF_ATR_TP_MULT", "2.0"))    # тейк = 2×ATR_5m
+OF_ATR_STOP_MIN_PCT  = float(os.environ.get("OF_ATR_STOP_MIN_PCT", "0.15"))  # минимум 0.15% стоп
+OF_ATR_TP_MIN_PCT    = float(os.environ.get("OF_ATR_TP_MIN_PCT", "0.30"))    # минимум 0.30% тейк
 OF_MAX_OPEN      = int(os.environ.get("OF_MAX_OPEN", "5"))
 OF_MAX_SAME_SIDE = int(os.environ.get("OF_MAX_SAME_SIDE", "3"))
 OF_MAX_NEW_PER_DAY = int(os.environ.get("OF_MAX_NEW_PER_DAY", "20"))
@@ -378,6 +388,103 @@ def _size_to_usd(sym, size_contracts, price):
 
 def _get_side(size):
     return "buy" if float(size) > 0 else "sell"
+
+
+# =====================================================================
+#  ATR_5m — для расчёта стопа и тейка (адаптивные к волатильности)
+# =====================================================================
+
+# Кеш: {sym: (ts, atr_value)} — обновляем раз в 60 сек
+_atr_cache = {}
+_atr_lock = threading.Lock()
+
+def _fetch_atr_5m(sym, period=12):
+    """Получает ATR_5m (средний истинный диапазон за period 5-минутных свечей).
+    period=12 → 1 час данных.
+    Возвращает ATR в долларах (средний ход цены за 5 минут)."""
+    # Кеш на 60 секунд
+    with _atr_lock:
+        cached = _atr_cache.get(sym)
+        if cached:
+            ts, atr_val = cached
+            if _now_ts() - ts < 60 and atr_val > 0:
+                return atr_val
+
+    try:
+        import requests
+        url = f"{GATE_REST}/candles"
+        params = {
+            "contract": f"{sym}_USDT",
+            "interval": "5m",
+            "limit": str(period + 1),  # +1 для расчёта первого TR
+        }
+        r = requests.get(url, params=params, timeout=10)
+        if not r.ok:
+            print(f"[exec_of] ATR fetch {sym}: {r.status_code}")
+            return 0.0
+        candles = r.json()
+        if not isinstance(candles, list) or len(candles) < period:
+            return 0.0
+        # Формат Gate.io: [t, vol, close, high, low, open, name]
+        # Считаем True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+        trs = []
+        prev_close = None
+        for c in candles:
+            if len(c) < 6:
+                continue
+            try:
+                high = float(c[3])
+                low = float(c[4])
+                close = float(c[2])
+                if prev_close is not None:
+                    tr = max(
+                        high - low,
+                        abs(high - prev_close),
+                        abs(low - prev_close),
+                    )
+                    trs.append(tr)
+                prev_close = close
+            except (ValueError, TypeError):
+                continue
+        if not trs:
+            return 0.0
+        atr = sum(trs) / len(trs)
+        with _atr_lock:
+            _atr_cache[sym] = (_now_ts(), atr)
+        return atr
+    except Exception as e:
+        print(f"[exec_of] ATR fetch {sym} error: {e}")
+        return 0.0
+
+
+def _calc_atr_based_levels(sym, entry):
+    """Считает стоп и тейк на основе ATR_5m.
+    Возвращает (stop, tp, stop_pct, tp_pct, atr_5m).
+
+    Логика:
+      stop_pct = max(0.15%, ATR_5m/price × 100)
+      tp_pct   = max(0.30%, 2×ATR_5m/price × 100)
+      RR ≈ 1:2
+
+    Если ATR недоступен → дефолт 0.3% стоп / 0.6% тейк (как раньше).
+    """
+    atr_5m = _fetch_atr_5m(sym)
+    if atr_5m <= 0 or entry <= 0:
+        # Fallback на старые значения
+        return None, None, OF_STOP_PCT_MIN, OF_STOP_PCT_MIN * OF_TP_MULT, 0.0
+
+    # Считаем проценты от ATR
+    atr_pct = (atr_5m / entry) * 100
+    stop_pct = max(OF_ATR_STOP_MIN_PCT, OF_ATR_STOP_MULT * atr_pct)
+    tp_pct   = max(OF_ATR_TP_MIN_PCT,   OF_ATR_TP_MULT   * atr_pct)
+
+    # Гарантируем RR ≥ 1.5 (если стоп получился больше тейка/1.5 — корректируем)
+    if tp_pct < stop_pct * 1.5:
+        tp_pct = stop_pct * 1.5
+
+    stop = entry * (1 - stop_pct / 100)
+    tp   = entry * (1 + tp_pct   / 100)
+    return stop, tp, stop_pct, tp_pct, atr_5m
 
 
 # =====================================================================
@@ -918,16 +1025,23 @@ def _execute_signal(signal, price, half_size=False, cvd_15m_info=None, cvd_5m_in
     entry = float(price)
     s = 1  # long only
 
-    # Динамический стоп: max(0.3%, 1.5×ATR_1min)
-    # Упрощённо: используем 0.3% (ATR расчёт можно добавить позже)
-    stop_pct = OF_STOP_PCT_MIN
-    tp_pct = stop_pct * OF_TP_MULT
+    # === ATR-based стоп и тейк (v2.3 — адаптивные к волатильности) ===
+    # Стоп = max(0.15%, 1×ATR_5m)
+    # Тейк = max(0.30%, 2×ATR_5m)
+    # RR ≈ 1:2 во всех сценариях
+    stop, tp, stop_pct, tp_pct, atr_5m = _calc_atr_based_levels(sym, entry)
+    if stop is None or tp is None:
+        # Fallback на старые значения
+        stop_pct = OF_STOP_PCT_MIN
+        tp_pct = stop_pct * OF_TP_MULT
+        stop = entry * (1 - s * stop_pct / 100)
+        tp = entry * (1 + s * tp_pct / 100)
+        print(f"[exec_of] {sym}: ATR недоступен, fallback на стоп {stop_pct}% / тейк {tp_pct}%")
+    else:
+        print(f"[exec_of] {sym}: ATR_5m=${atr_5m:.2f} → стоп {stop_pct:.3f}% / тейк {tp_pct:.3f}% (RR 1:{tp_pct/stop_pct:.1f})")
 
     # Если YELLOW — половинный размер
     margin = OF_MARGIN_USD * (0.5 if half_size else 1.0)
-
-    stop = entry * (1 - s * stop_pct / 100)
-    tp = entry * (1 + s * tp_pct / 100)
 
     sig = {
         "symbol": sym,
@@ -942,7 +1056,7 @@ def _execute_signal(signal, price, half_size=False, cvd_15m_info=None, cvd_5m_in
         "max_same_side": OF_MAX_SAME_SIDE,
         "strategy": STRATEGY_TAG,
         "leverage_override": OF_LEVERAGE,
-        "ext_atr": 0.0,
+        "ext_atr": float(atr_5m) if atr_5m else 0.0,
     }
 
     try:
@@ -968,14 +1082,22 @@ def _execute_signal(signal, price, half_size=False, cvd_15m_info=None, cvd_5m_in
         elif cvd_5m_info and cvd_5m_info.get("status") == "STALE":
             cvd_5m_line = "\n📊 CVD 5m: STALE (мало данных, фильтр пропущен)"
         if B:
+            # ATR-информация (если есть)
+            atr_line = ""
+            if atr_5m:
+                rr = tp_pct / stop_pct if stop_pct > 0 else 0
+                atr_line = (
+                    f"\n📈 ATR_5m: ${atr_5m:.2f} → RR 1:{rr:.1f}"
+                )
             B.send_telegram(
                 f"🧊 <b>OF ВХОД {sym} LONG</b>\n"
-                f"Вход: ${entry:.6g} | Стоп: ${stop:.6g} ({stop_pct}%)\n"
-                f"Тейк: ${tp:.6g} ({tp_pct:.1f}%)\n"
+                f"Вход: ${entry:.6g} | Стоп: ${stop:.6g} ({stop_pct:.3f}%)\n"
+                f"Тейк: ${tp:.6g} ({tp_pct:.3f}%)"
+                f"{atr_line}\n"
                 f"Маржа: {size_str} × {OF_LEVERAGE}x"
                 f"{cvd_15m_line}"
                 f"{cvd_5m_line}\n"
-                f"Time-stop: 60с→BE, 240с→CVD-чек (каждые 90с)\n"
+                f"Управление: 60с→BE, дальше МЁРТВАЯ ЗОНА (ждём TP/стоп/safety-net)\n"
                 f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с ({OF_CVD_HARD_LIMIT_SEC//60} мин)"
             )
 
@@ -1203,129 +1325,27 @@ def _manage_positions():
                         except Exception as e:
                             print(f"[exec_of] hard-limit close error: {e}")
 
-            # CVD-чек: T+(OF_EXIT_SEC + exit_extension) — повторяется каждые 60с
-            # пока позиция жива. Без max_resets — пусть продлевается сколько нужно.
-            next_exit_at = OF_EXIT_SEC + exit_extension
-            if hold_sec >= next_exit_at and not rec.get("exit_done", False):
-                cvd_status = _check_cvd_for_exit(rec["sym"])
-
-                if cvd_status == "RISING":
-                    # ✅ Продлеваем таймер И поднимаем TP (трейлинг) — молча, без TG
-                    pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
-                    if pos:
-                        mid = UE._pos_market(pos)
-                        if mid:
-                            info = {"id": pos_id, "mid": mid, "dir": "long"}
-                            # Получаем текущую цену из tickers
-                            try:
-                                tickers = B.api_get("tickers", []) if B else []
-                                cur_price = None
-                                for t in tickers:
-                                    if isinstance(t, dict) and t.get("contract") == f"{rec['sym']}_USDT":
-                                        cur_price = float(t.get("last", 0))
-                                        break
-                                if cur_price and cur_price > 0:
-                                    new_tp = cur_price * (1 + OF_CVD_TRAIL_TP_PCT / 100)
-                                    old_tp = rec.get("tp", 0)
-                                    if new_tp > old_tp:
-                                        try:
-                                            tp_res = executor.move_tp(info, new_tp)
-                                            rec["tp"] = new_tp
-                                            rec["tp_trail_count"] = rec.get("tp_trail_count", 0) + 1
-                                            rec["cvd_last_status"] = cvd_status
-                                            changed = True
-                                            print(f"[exec_of] {rec['sym']}: TP trail @ T+{int(hold_sec)}с: ${old_tp:.6g}→${new_tp:.6g}")
-                                        except Exception as e:
-                                            print(f"[exec_of] move_tp error: {e}")
-                            except Exception as e:
-                                print(f"[exec_of] price fetch for trail error: {e}")
-
-                    # Продлеваем таймер (молча, без Telegram-сообщения)
-                    rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
-                    rec["cvd_resets"]         = cvd_resets + 1
-                    rec["cvd_last_status"]    = cvd_status
-                    changed = True
-                    new_total = rec["exit_extension_sec"]
-                    print(f"[exec_of] {rec['sym']}: CVD=RISING → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с)")
-
-                elif cvd_status == "NEUTRAL":
-                    # ⚠️ Продлеваем таймер (молча, без trail TP и без TG)
-                    rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
-                    rec["cvd_resets"]         = cvd_resets + 1
-                    rec["cvd_last_status"]    = cvd_status
-                    changed = True
-                    new_total = rec["exit_extension_sec"]
-                    print(f"[exec_of] {rec['sym']}: CVD=NEUTRAL → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с)")
-
-                else:
-                    # ❌ CVD FALLING или STALE
-                    # FALLING: НЕ выходим, а переставляем стоп на 0.1% от текущей цены (tighten).
-                    #   Продолжаем контролить по CVD. Если цена пойдёт вниз — сработает стоп.
-                    #   Если вверх — снова RISING, продолжаем держать.
-                    # STALE: выходим (мало данных, безопасный вариант).
-                    pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
-                    if pos:
-                        mid = UE._pos_market(pos)
-                        if mid:
-                            info = {"id": pos_id, "mid": mid, "dir": "long"}
-                            if cvd_status == "STALE":
-                                # STALE → выходим (безопасно, мало данных)
-                                try:
-                                    res = executor.close_position(info, reason=f"OF_EXIT_CVD_{cvd_status}")
-                                    rec["exit_done"] = True
-                                    changed = True
-                                    trail_count = rec.get("tp_trail_count", 0)
-                                    if B:
-                                        B.send_telegram(
-                                            f"⏱️ OF {rec['sym']}: выход T+{int(hold_sec)}с\n"
-                                            f"CVD={cvd_status} (мало данных) | продлений: {cvd_resets} | TP trail ×{trail_count} ({res})"
-                                        )
-                                except Exception as e:
-                                    print(f"[exec_of] exit close error: {e}")
-                            else:
-                                # FALLING → переставляем стоп на 0.1% от текущей цены
-                                _tighten_done = False
-                                try:
-                                    tickers = B.api_get("tickers", []) if B else []
-                                    cur_price = None
-                                    for t in tickers:
-                                        if isinstance(t, dict) and t.get("contract") == f"{rec['sym']}_USDT":
-                                            cur_price = float(t.get("last", 0))
-                                            break
-                                    if cur_price and cur_price > 0:
-                                        new_stop = cur_price * (1 - OF_CVD_FALLING_STOP_PCT / 100)
-                                        old_stop = rec.get("stop", 0)
-                                        if new_stop > old_stop:
-                                            try:
-                                                res = executor.move_stop(info, new_stop)
-                                                rec["stop"] = new_stop
-                                                rec["cvd_last_status"] = cvd_status
-                                                rec["falling_stops"] = rec.get("falling_stops", 0) + 1
-                                                changed = True
-                                                _tighten_done = True
-                                                print(f"[exec_of] {rec['sym']}: CVD FALLING → tighten stop @ T+{int(hold_sec)}с: ${old_stop:.6g}→${new_stop:.6g} (cur=${cur_price:.6g})")
-                                                if B:
-                                                    B.send_telegram(
-                                                        f"🔻 OF {rec['sym']}: CVD FALLING — стоп подтянут\n"
-                                                        f"Цена: ${cur_price:.6g} | Стоп: ${old_stop:.6g}→${new_stop:.6g} ({OF_CVD_FALLING_STOP_PCT}% от цены)\n"
-                                                        f"T+{int(hold_sec)}с | продлеваем (стоп не сработал → контролим дальше)"
-                                                    )
-                                            except Exception as e:
-                                                print(f"[exec_of] move_stop error: {e}")
-                                        else:
-                                            print(f"[exec_of] {rec['sym']}: tighten не нужен (new_stop ${new_stop:.6g} ≤ old ${old_stop:.6g})")
-                                    else:
-                                        print(f"[exec_of] {rec['sym']}: нет цены для tighten stop")
-                                except Exception as e:
-                                    print(f"[exec_of] price fetch for tighten stop error: {e}")
-
-                                # Продлеваем таймер в любом случае (стоп не сработал → контролим дальше)
-                                rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
-                                rec["cvd_resets"]         = cvd_resets + 1
-                                rec["cvd_last_status"]    = cvd_status
-                                changed = True
-                                new_total = rec["exit_extension_sec"]
-                                print(f"[exec_of] {rec['sym']}: CVD=FALLING → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с) — стоп подтянут={_tighten_done}, контролим дальше")
+            # === МЁРТВАЯ ЗОНА (v2.3) ===
+            # После T+60с (BE move) — позиция управляется только стопом и тейком.
+            # CVD-чек больше НЕ используется для выхода или tighten stop.
+            # CVD использовался только для ВХОДА (фильтры 15m momentum + 5m ≥ 0).
+            # Теперь бот просто ждёт:
+            #   - TP сработает (по рынку) → позиция закрыта с прибылью
+            #   - Стоп сработает (на BE после T+60с) → позиция закрыта в безубытке
+            #   - Safety-net (60 мин) → принудительный выход
+            #
+            # Это позволяет избежать ложных выходов на мелких колебаниях CVD.
+            # Философия: если айсберг сработал (крупный игрок вошёл) — даём позиции
+            # время дойти до TP, не дёргаемся на каждом скачке CVD.
+            next_check_at = OF_EXIT_SEC + exit_extension
+            if hold_sec >= next_check_at and not rec.get("exit_done", False):
+                # Просто продлеваем таймер (молча, без TG-сообщений)
+                # CVD не проверяем — мёртвая зона
+                rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
+                rec["cvd_resets"]         = cvd_resets + 1
+                changed = True
+                if cvd_resets % 5 == 0:  # Логируем каждое 5-е продление (раз в ~7-8 мин)
+                    print(f"[exec_of] {rec['sym']}: МЁРТВАЯ ЗОНА — продление {cvd_resets+1} (T+{int(hold_sec)}с, ждём TP/стоп/safety-net)")
 
     if changed:
         with _TRACKED_LOCK:
@@ -1524,16 +1544,15 @@ def status_report():
     open_recs = [(pid, v) for pid, v in tracked.items() if v.get("status") == "open" and not pid.startswith("pending_")]
     if open_recs:
         lines.append("")
-        lines.append("━━ CVD по открытым ━━")
+        lines.append("━━ Открытые позиции ━━")
         for pid, v in open_recs:
             sym = v.get("sym", "?")
-            cvd_status = _check_cvd_for_exit(sym)
-            resets = v.get("cvd_resets", 0)
-            ext = v.get("exit_extension_sec", 0)
-            trail_count = v.get("tp_trail_count", 0)
+            entry = v.get("entry", 0)
+            stop = v.get("stop", 0)
             tp = v.get("tp", 0)
-            emoji = {"RISING": "🟢", "NEUTRAL": "🟡", "FALLING": "🔴", "STALE": "⚪"}.get(cvd_status, "?")
-            lines.append(f"  {sym}: {emoji} {cvd_status} | ext +{ext}с | trail TP ×{trail_count} | TP ${tp:.6g}")
+            resets = v.get("cvd_resets", 0)
+            be_done = "✅BE" if v.get("be_done") else "🔴"
+            lines.append(f"  {sym}: entry ${entry:.4g} | stop ${stop:.4g} | TP ${tp:.4g} | {be_done} | продл {resets}")
     if _stats['trades_closed'] > 0:
         wr = _stats['wins'] / _stats['trades_closed'] * 100
         lines.append(f"Winrate: {wr:.0f}% ({_stats['wins']}/{_stats['trades_closed']})")
@@ -1648,16 +1667,20 @@ def start():
             if OF_CVD_5M_FILTER_ENABLED else "🔴 ВЫКЛ"
         )
         B.send_telegram(
-            f"🧊 <b>OrderFlow v2.2 запущен</b>\n"
-            f"Пар: {len(OF_PAIRS)}\n"
+            f"🧊 <b>OrderFlow v2.3 запущен</b>\n"
+            f"Пар: {len(OF_PAIRS)} (только BTC)\n"
             f"Маржа: ${OF_MARGIN_USD} × {OF_LEVERAGE}x\n"
-            f"Стоп: {OF_STOP_PCT_MIN}% | Тейк: {OF_STOP_PCT_MIN * OF_TP_MULT:.1f}% (RR 1:{OF_TP_MULT:.0f})\n"
+            f"📈 ATR-based уровни (адаптивные):\n"
+            f"   Стоп = max(0.15%, 1×ATR_5m)\n"
+            f"   Тейк = max(0.30%, 2×ATR_5m)\n"
+            f"   RR ≈ 1:2 (адаптируется к волатильности)\n"
             f"OI-фильтр: ✅ (poll 10с, окно 30с)\n"
             f"Фильтр входа CVD 15m: {cvd_15m_filter_line}\n"
             f"Фильтр входа CVD 5m:  {cvd_5m_filter_line}\n"
-            f"Time-stop (CVD-aware): 60с→BE, 240с→CVD-чек каждые 90с\n"
-            f"  RISING→+90с+trail TP, NEUTRAL→+90с, FALLING/STALE→выход\n"
-            f"  Safety net: {OF_CVD_HARD_LIMIT_SEC}с (60 мин)\n"
+            f"Управление: T+60с→BE, дальше МЁРТВАЯ ЗОНА\n"
+            f"  CVD только для входа, НЕ для выхода\n"
+            f"  Ждём: TP / стоп / safety-net (60 мин)\n"
+            f"Тихий час: 00-10 мин каждого часа (не мешает 4H-скану)\n"
             f"Cooldown: {DETECTOR_COOLDOWN_PER_SYMBOL}с/символ, {DETECTOR_GLOBAL_COOLDOWN}с глобальный\n"
             f"Лимит: {DETECTOR_MAX_PER_HOUR} сигнала/час\n"
             f"Порог айсберга: ${DETECTOR_MIN_TOTAL_NOTIONAL:,.0f}\n"
