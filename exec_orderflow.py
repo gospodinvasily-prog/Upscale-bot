@@ -77,12 +77,9 @@ STRATEGY_NAME = "OrderFlow v2"
 STRATEGY_TAG  = "orderflow_v2"
 
 # --- Список пар ─────────────────────────────────────────────────────────────
-OF_PAIRS_DEFAULT = [
-    "BTC", "ETH", "SOL", "XRP", "LINK", "TRX", "DOT", "LTC", "BCH",
-    "AVAX", "NEAR", "UNI", "APT", "FIL", "ATOM", "ARB", "OP", "INJ",
-    "AAVE", "ALGO", "ETC", "XLM", "HBAR", "ICP", "STX", "SUI", "SEI",
-    "TIA", "RUNE", "ENA"
-]
+# v2.2: только BTC по умолчанию (остальные убраны — потом решим какие добавить)
+# Через env OF_PAIRS можно задать свой список.
+OF_PAIRS_DEFAULT = ["BTC"]
 OF_PAIRS = [p.strip() for p in os.environ.get("OF_PAIRS", ",".join(OF_PAIRS_DEFAULT)).split(",") if p.strip()]
 
 # --- Параметры сделок ────────────────────────────────────────────────────────
@@ -133,6 +130,14 @@ OF_CVD_MIN_VOL_USD      = float(os.environ.get("OF_CVD_MIN_VOL_USD", "50000"))  
 OF_CVD_RESET_SEC        = int(os.environ.get("OF_CVD_RESET_SEC", "90"))         # +90с за продление (было 60)
 OF_CVD_HARD_LIMIT_SEC   = int(os.environ.get("OF_CVD_HARD_LIMIT_SEC", "3600"))  # safety net 60 мин (было 30)
 OF_CVD_TRAIL_TP_PCT     = float(os.environ.get("OF_CVD_TRAIL_TP_PCT", "0.30"))  # +0.3% над ценой при трейлинге
+
+# === НОВАЯ ТЕХНИКА СТОПА (v2.3) ===
+# При CVD FALLING: НЕ выходим, а переставляем стоп на OF_CVD_FALLING_STOP_PCT
+# ниже текущей цены (0.1% = очень близко, почти касание).
+# Если цена пойдёт вниз — стоп сработает сразу.
+# Если вверх — CVD снова RISING, продолжаем держать.
+# Это позволяет "вырезать" убыток минимальным при развороте тренда.
+OF_CVD_FALLING_STOP_PCT = float(os.environ.get("OF_CVD_FALLING_STOP_PCT", "0.10"))  # 0.1% от текущей цены
 
 # --- 15m CVD momentum фильтр (для ВХОДА в сделку) ─────────────────────────────
 # Идея: если CVD за 15 минут растёт (был -100 → стал 0, или был 0 → стал +50)
@@ -732,6 +737,21 @@ def _process_trade(sym, size_contracts, price, ts):
     except (ValueError, TypeError):
         return
 
+    # === ТИХИЙ ЧАС: с 00 по 10 минуту каждого часа айсберг-бот не работает ===
+    # Это окно когда идёт 4H-скан (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC).
+    # Чтобы айсберг не мешал 4H-стратегии (не открывал позиции и не спамил TG).
+    # CVD-буфер всё равно обновляем (для фильтра на вход после 10-й минуты).
+    # Включается через env OF_QUIET_MINUTES (по умолчанию 10).
+    _quiet_min = int(os.environ.get("OF_QUIET_MINUTES", "10"))
+    if _quiet_min > 0:
+        _cur_min = dt.datetime.now(dt.timezone.utc).minute
+        if _cur_min < _quiet_min:
+            # Тихий час — обновляем CVD, но не запускаем детектор айсбергов
+            size_usd_quiet = _size_to_usd(sym, size_contracts, price)
+            side_quiet = _get_side(size_contracts)
+            _update_cvd_buffer(sym, side_quiet, size_usd_quiet, ts)
+            return
+
     size_usd = _size_to_usd(sym, size_contracts, price)
     if size_usd < DETECTOR_MAX_NOTIONAL_ABS:
         return
@@ -1238,25 +1258,74 @@ def _manage_positions():
                     print(f"[exec_of] {rec['sym']}: CVD=NEUTRAL → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с)")
 
                 else:
-                    # ❌ CVD FALLING или STALE → выходим (с сообщением в TG)
+                    # ❌ CVD FALLING или STALE
+                    # FALLING: НЕ выходим, а переставляем стоп на 0.1% от текущей цены (tighten).
+                    #   Продолжаем контролить по CVD. Если цена пойдёт вниз — сработает стоп.
+                    #   Если вверх — снова RISING, продолжаем держать.
+                    # STALE: выходим (мало данных, безопасный вариант).
                     pos = next((p for p in live_positions if UE._pos_id(p) == pos_id), None)
                     if pos:
                         mid = UE._pos_market(pos)
                         if mid:
                             info = {"id": pos_id, "mid": mid, "dir": "long"}
-                            try:
-                                res = executor.close_position(info, reason=f"OF_EXIT_CVD_{cvd_status}")
-                                rec["exit_done"] = True
+                            if cvd_status == "STALE":
+                                # STALE → выходим (безопасно, мало данных)
+                                try:
+                                    res = executor.close_position(info, reason=f"OF_EXIT_CVD_{cvd_status}")
+                                    rec["exit_done"] = True
+                                    changed = True
+                                    trail_count = rec.get("tp_trail_count", 0)
+                                    if B:
+                                        B.send_telegram(
+                                            f"⏱️ OF {rec['sym']}: выход T+{int(hold_sec)}с\n"
+                                            f"CVD={cvd_status} (мало данных) | продлений: {cvd_resets} | TP trail ×{trail_count} ({res})"
+                                        )
+                                except Exception as e:
+                                    print(f"[exec_of] exit close error: {e}")
+                            else:
+                                # FALLING → переставляем стоп на 0.1% от текущей цены
+                                _tighten_done = False
+                                try:
+                                    tickers = B.api_get("tickers", []) if B else []
+                                    cur_price = None
+                                    for t in tickers:
+                                        if isinstance(t, dict) and t.get("contract") == f"{rec['sym']}_USDT":
+                                            cur_price = float(t.get("last", 0))
+                                            break
+                                    if cur_price and cur_price > 0:
+                                        new_stop = cur_price * (1 - OF_CVD_FALLING_STOP_PCT / 100)
+                                        old_stop = rec.get("stop", 0)
+                                        if new_stop > old_stop:
+                                            try:
+                                                res = executor.move_stop(info, new_stop)
+                                                rec["stop"] = new_stop
+                                                rec["cvd_last_status"] = cvd_status
+                                                rec["falling_stops"] = rec.get("falling_stops", 0) + 1
+                                                changed = True
+                                                _tighten_done = True
+                                                print(f"[exec_of] {rec['sym']}: CVD FALLING → tighten stop @ T+{int(hold_sec)}с: ${old_stop:.6g}→${new_stop:.6g} (cur=${cur_price:.6g})")
+                                                if B:
+                                                    B.send_telegram(
+                                                        f"🔻 OF {rec['sym']}: CVD FALLING — стоп подтянут\n"
+                                                        f"Цена: ${cur_price:.6g} | Стоп: ${old_stop:.6g}→${new_stop:.6g} ({OF_CVD_FALLING_STOP_PCT}% от цены)\n"
+                                                        f"T+{int(hold_sec)}с | продлеваем (стоп не сработал → контролим дальше)"
+                                                    )
+                                            except Exception as e:
+                                                print(f"[exec_of] move_stop error: {e}")
+                                        else:
+                                            print(f"[exec_of] {rec['sym']}: tighten не нужен (new_stop ${new_stop:.6g} ≤ old ${old_stop:.6g})")
+                                    else:
+                                        print(f"[exec_of] {rec['sym']}: нет цены для tighten stop")
+                                except Exception as e:
+                                    print(f"[exec_of] price fetch for tighten stop error: {e}")
+
+                                # Продлеваем таймер в любом случае (стоп не сработал → контролим дальше)
+                                rec["exit_extension_sec"] = exit_extension + OF_CVD_RESET_SEC
+                                rec["cvd_resets"]         = cvd_resets + 1
+                                rec["cvd_last_status"]    = cvd_status
                                 changed = True
-                                trail_count = rec.get("tp_trail_count", 0)
-                                final_tp = rec.get("tp", 0)
-                                if B:
-                                    B.send_telegram(
-                                        f"⏱️ OF {rec['sym']}: выход T+{int(hold_sec)}с\n"
-                                        f"CVD={cvd_status} | продлений: {cvd_resets} | TP trail ×{trail_count} ({res})"
-                                    )
-                            except Exception as e:
-                                print(f"[exec_of] exit close error: {e}")
+                                new_total = rec["exit_extension_sec"]
+                                print(f"[exec_of] {rec['sym']}: CVD=FALLING → reset {cvd_resets+1} (+{OF_CVD_RESET_SEC}с, всего +{new_total}с) — стоп подтянут={_tighten_done}, контролим дальше")
 
     if changed:
         with _TRACKED_LOCK:

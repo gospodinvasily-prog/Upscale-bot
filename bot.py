@@ -56,6 +56,12 @@ try:
 except Exception as e:
     OF = None
     _OF_IMPORT_ERR = str(e)
+try:
+    import big_candle_scanner as BCS
+    _BCS_IMPORT_ERR = None
+except Exception as e:
+    BCS = None
+    _BCS_IMPORT_ERR = str(e)
 from datetime import datetime, timezone, timedelta
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -593,6 +599,10 @@ def handle_command(text: str) -> str:
         if OF is None:
             return "⚠️ OrderFlow не загружен"
         return OF.cmd_stats()
+    if cmd == "/bigcandle":
+        if BCS is None:
+            return "⚠️ Big Candle Scanner не загружен"
+        return BCS.status_report()
     if cmd in ("/help", "/start"):
         return HELP_TEXT
     return ""
@@ -840,6 +850,18 @@ def main():
             send_telegram(f"⚠️ OrderFlow не запустился: {esc(str(e))}")
     else:
         print(f"[OF] модуль не загружен: {_OF_IMPORT_ERR}")
+
+    # ── Запуск Big Candle Scanner (если модуль загружен) ───────────────────
+    # Сканер больших свечей BTC: с 12:00 до 13:00 МСК мониторит 5-минутные свечи.
+    # При свечах с аномальным объёмом — отправляет TG-сообщение (лонговая/шортовая).
+    if BCS is not None:
+        try:
+            BCS.start()
+        except Exception as e:
+            print(f"[BCS] ошибка запуска: {e}")
+            traceback.print_exc()
+    else:
+        print(f"[BCS] модуль не загружен: {_BCS_IMPORT_ERR}")
 
     # Команды в чате — в отдельном потоке, не дожидаясь скана. Скан ~100 пар
     # с лимитом 12 запросов/сек может идти ощутимо долго; раньше poll_commands()

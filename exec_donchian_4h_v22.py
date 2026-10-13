@@ -624,10 +624,44 @@ def _detect_closed_positions(executor, open_syms: set, universe: set = None):
     on_trade_closed(). Если позиция была открыта сегодня — добавляет PnL
     в today_realized (для триггера Daily Stop today-only).
     Позиции, помеченные `dstop_closed=True` (закрыты Daily Stop-ом в этом скане),
-    пропускаем — их PnL уже учтён в today_realized."""
+    пропускаем — их PnL уже учтён в today_realized.
+
+    S18 (NEW): Ghost-cleanup — если в tracked_positions есть позиция которой
+    НЕТ в open_syms И opened_ts < (now - 60с), это ghost (ордер был отклонён
+    Upscale но бот записал в tracked). Удаляем без PnL."""
     with _TRACKED_LOCK:
         tracked = _load_json(OPEN_POS_FILE, {})
         changed = False
+
+        # === GHOST CLEANUP: удаляем tracked-позиции которых нет в open_syms ===
+        # и которые "открыты" больше 60 секунд назад (значит точно ghost).
+        # Не считаем PnL — эта позиция никогда не открывалась на Upscale.
+        _now_ts = time.time()
+        _ghost_removed = []
+        for sym in list(tracked.keys()):
+            if sym in open_syms:
+                continue
+            rec = tracked[sym]
+            opened_ts = rec.get("opened_ts", _now_ts)
+            if _now_ts - opened_ts < 60:
+                # Меньше 60 секунд — возможно ещё открывается, не трогаем
+                continue
+            # Это ghost — удаляем без PnL
+            del tracked[sym]
+            changed = True
+            _ghost_removed.append(sym)
+
+        if _ghost_removed:
+            print(f"[exec_dr22] ghost cleanup: удалено tracked-позиций которых нет в live: {_ghost_removed}")
+            try:
+                if B:
+                    B.send_telegram(
+                        f"🧹 <b>Ghost cleanup перед сканом</b>\n"
+                        f"Удалено tracked-позиций которых нет на Upscale: {len(_ghost_removed)}\n"
+                        f"   → {', '.join(_ghost_removed)}"
+                    )
+            except Exception:
+                pass
 
         for sym in list(tracked.keys()):
             if sym in open_syms:
