@@ -92,9 +92,10 @@ BC_VOL_MULT         = float(os.environ.get("BIG_CANDLE_VOL_MULT", "2.0"))
 BC_USE_SMA50        = os.environ.get("BIG_CANDLE_USE_SMA50", "1") == "1"
 BC_ATR_STOP_MULT    = float(os.environ.get("BIG_CANDLE_ATR_STOP_MULT", "2.0"))
 BC_ATR_TP_MULT      = float(os.environ.get("BIG_CANDLE_ATR_TP_MULT", "4.0"))
-BC_ATR_PERIOD       = int(os.environ.get("BIG_CANDLE_ATR_PERIOD", "12"))
+BC_ATR_PERIOD       = int(os.environ.get("BIG_CANDLE_ATR_PERIOD", "4"))   # 4 свечи 15m = 1 час
 BC_ATR_STOP_MIN_PCT = float(os.environ.get("BIG_CANDLE_ATR_STOP_MIN_PCT", "0.30"))
 BC_ATR_TP_MIN_PCT   = float(os.environ.get("BIG_CANDLE_ATR_TP_MIN_PCT", "0.60"))
+BC_MAX_MARGIN       = float(os.environ.get("BIG_CANDLE_MAX_MARGIN", "3000"))  # cap маржи 30% от $10K
 
 # --- Окно сканирования ---
 BC_WINDOW_START_HOUR_MSK = int(os.environ.get("BIG_CANDLE_WINDOW_START_HOUR", "10"))  # 10:00
@@ -306,8 +307,8 @@ def _fetch_sma_1h(contract="BTC_USDT", period=50):
         return None
 
 
-def _calc_atr(candles, period=12):
-    """Считает ATR за period свечей (по умолчанию 12 = 1 час для 5m)."""
+def _calc_atr(candles, period=4):
+    """Считает ATR за period свечей 15m (по умолчанию 4 = 1 час)."""
     if len(candles) < 2:
         return 0
     trs = []
@@ -407,8 +408,8 @@ def _check_signal():
                     )
                 return None
 
-        # Считаем ATR по 15m свечам (последние 12 = 3 часа)
-        pre_candles = candles_15m[-13:]  # 13 свечей для расчёта 12 TR
+        # Считаем ATR по 15m свечам (последние 5 = 4 TR = 1 час)
+        pre_candles = candles_15m[-5:]  # 5 свечей для расчёта 4 TR
         atr_value = _calc_atr(pre_candles, period=BC_ATR_PERIOD)
 
         if atr_value <= 0:
@@ -466,11 +467,16 @@ def _execute_signal(signal):
     tp = signal["tp_price"]
     stop_pct = signal["stop_pct"]
 
-    # Размер позиции: risk_usd / stop_pct × 100
-    # При risk=$100, stop=0.3% → position = $33,333 (с плечом 5x = $6,667 маржа)
-    # Но ограничим маржу $1000 (5x = $5000 позиция)
-    margin = min(BC_RISK_USD / stop_pct * 100, 1000) / BC_LEVERAGE
-    margin = max(margin, 50)  # минимум $50 маржи
+    # === RISK MANAGEMENT как в 4H ===
+    # risk = $100, плечо 5x
+    # position_size = risk_usd / stop_pct × 100
+    # margin = position_size / leverage
+    # Cap маржи BC_MAX_MARGIN ($3000 = 30% от $10K депозита)
+    position_size = BC_RISK_USD / stop_pct * 100
+    margin = position_size / BC_LEVERAGE
+    if margin > BC_MAX_MARGIN:
+        margin = BC_MAX_MARGIN
+        position_size = margin * BC_LEVERAGE
 
     sig = {
         "symbol": sym,
@@ -838,7 +844,7 @@ def status_report():
     lines.append(f"Порог: ×{BC_VOL_MULT} от среднего (после {BC_EUROPEAN_START_HOUR}:00 МСК)")
     lines.append(f"Фильтр SMA50 1H: {'✅' if BC_USE_SMA50 else '🔴'}")
     lines.append(f"Уровни: стоп {BC_ATR_STOP_MULT}×ATR (мин {BC_ATR_STOP_MIN_PCT}%), TP {BC_ATR_TP_MULT}×ATR (мин {BC_ATR_TP_MIN_PCT}%)")
-    lines.append(f"Риск: ${BC_RISK_USD} | Плечо: {BC_LEVERAGE}x | Лимит: {BC_MAX_TRADES_DAY}/день")
+    lines.append(f"Риск: ${BC_RISK_USD} | Плечо: {BC_LEVERAGE}x | Cap маржи: ${BC_MAX_MARGIN:.0f} | Лимит: {BC_MAX_TRADES_DAY}/день")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}/{BC_MAX_TRADES_DAY}")
 
     tracked = _load_tracked()
@@ -965,10 +971,11 @@ def start():
         B.send_telegram(
             f"🚨 <b>{STRATEGY_NAME} запущен</b>\n"
             f"Пар: BTC only\n"
-            f"Маржа: ${BC_RISK_USD} риск × {BC_LEVERAGE}x плечо\n"
+            f"Маржа: ${BC_RISK_USD} риск × {BC_LEVERAGE}x плечо (cap ${BC_MAX_MARGIN:.0f})\n"
             f"Окно: {BC_WINDOW_START_HOUR_MSK}:00-{BC_WINDOW_END_HOUR_MSK}:{BC_WINDOW_END_MIN_MSK:02d} МСК\n"
             f"Порог: ×{BC_VOL_MULT} (среднее после {BC_EUROPEAN_START_HOUR}:00 МСК)\n"
             f"{sma_line}\n"
+            f"ATR_15m: {BC_ATR_PERIOD} свечи (1 час)\n"
             f"Стоп: {BC_ATR_STOP_MULT}×ATR (мин {BC_ATR_STOP_MIN_PCT}%) | TP: {BC_ATR_TP_MULT}×ATR (мин {BC_ATR_TP_MIN_PCT}%)\n"
             f"Max hold: {BC_MAX_HOLD_SEC//3600}ч safety-net | Лимит: {BC_MAX_TRADES_DAY}/день\n"
             f"Авто-торговля: {'✅ ВКЛ' if _state['enabled'] else '🔴 ВЫКЛ'}\n"
