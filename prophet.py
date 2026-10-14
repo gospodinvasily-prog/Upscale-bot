@@ -629,19 +629,25 @@ def _scanner_loop():
             _save()
             
             scan_dt_str = dt.datetime.now(MSK).strftime("%H:%M")
+            print(f"[prophet] запускаю скан в {scan_dt_str} МСК, режим={mode}, пар={len(PAIRS)}, открыто={open_count}/{MAX_OPEN}")
+            
             setup = do_scan(now_ts)
             
             if setup:
+                print(f"[prophet] скан {scan_dt_str}: лучший сигнал {setup['symbol']} LONG score={setup['score']:.0f}")
                 min_s = AUTO_SCORE if mode == "auto" else MIN_SCORE
                 if setup["score"] >= min_s:
                     _stats["signals"] += 1
+                    print(f"[prophet] сигнал {setup['symbol']} score={setup['score']:.0f} ≥ {min_s} → отправляю в Telegram")
                     send_signal(setup)
                 else:
-                    # Сигнал есть, но ниже порога
-                    if B and mode in ("auto", "single"):
+                    # Сигнал есть, но ниже порога — уведомляем во ВСЕХ режимах
+                    print(f"[prophet] сигнал {setup['symbol']} score={setup['score']:.0f} < порога {min_s} → пропуск")
+                    if B:
                         threshold_str = f"авто ≥{AUTO_SCORE}" if mode == "auto" else f"ручной ≥{MIN_SCORE}"
+                        mode_label = {"auto": "🤖 Авто", "continuous": "🔄 Непрерывный", "single": "🔍 Разовый"}.get(mode, mode)
                         B.send_telegram(
-                            f"🔮 Скан {scan_dt_str} МСК завершён\n"
+                            f"🔮 Скан {scan_dt_str} МСК завершён ({mode_label})\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
                             f"Проверено пар: {len(PAIRS)}\n"
                             f"Лучший сигнал: {setup['symbol']} LONG score={setup['score']:.0f}\n"
@@ -649,10 +655,12 @@ def _scanner_loop():
                             f"Открыто: {open_count}/{MAX_OPEN}"
                         )
             else:
-                # Сигналов вообще не найдено
-                if B and mode in ("auto", "single"):
+                # Сигналов вообще не найдено — уведомляем во ВСЕХ режимах
+                print(f"[prophet] скан {scan_dt_str}: сигналов не найдено")
+                if B:
+                    mode_label = {"auto": "🤖 Авто", "continuous": "🔄 Непрерывный", "single": "🔍 Разовый"}.get(mode, mode)
                     B.send_telegram(
-                        f"🔮 Скан {scan_dt_str} МСК завершён\n"
+                        f"🔮 Скан {scan_dt_str} МСК завершён ({mode_label})\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"Проверено пар: {len(PAIRS)}\n"
                         f"❌ Сигналов не найдено\n"
