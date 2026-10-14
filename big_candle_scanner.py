@@ -42,7 +42,7 @@ Backtest за 30 дней:
   BIG_CANDLE_LEVERAGE          (5)    — плечо
   BIG_CANDLE_WINDOW_START_HOUR (10)   — час начала окна МСК
   BIG_CANDLE_WINDOW_END_MIN    (15)   — минуты после конца часа (11:15 = 15)
-  BIG_CANDLE_MAX_HOLD_SEC      (21600) — safety-net 6 часов
+  BIG_CANDLE_MAX_HOLD_SEC      (172800) — safety-net 48 часов
 
 Запуск: автоматически из bot.py
 """
@@ -91,10 +91,10 @@ BC_LEVERAGE         = int(os.environ.get("BIG_CANDLE_LEVERAGE", "5"))
 BC_VOL_MULT         = float(os.environ.get("BIG_CANDLE_VOL_MULT", "2.0"))
 BC_USE_SMA50        = os.environ.get("BIG_CANDLE_USE_SMA50", "1") == "1"
 BC_ATR_STOP_MULT    = float(os.environ.get("BIG_CANDLE_ATR_STOP_MULT", "2.0"))
-BC_ATR_TP_MULT      = float(os.environ.get("BIG_CANDLE_ATR_TP_MULT", "4.0"))
+BC_ATR_TP_MULT      = float(os.environ.get("BIG_CANDLE_ATR_TP_MULT", "3.0"))   # 3×ATR (было 4.0 — оптимизатор показал что 3×ATR + hold 48ч = PF 2.30
 BC_ATR_PERIOD       = int(os.environ.get("BIG_CANDLE_ATR_PERIOD", "4"))   # 4 свечи 15m = 1 час
 BC_ATR_STOP_MIN_PCT = float(os.environ.get("BIG_CANDLE_ATR_STOP_MIN_PCT", "0.30"))
-BC_ATR_TP_MIN_PCT   = float(os.environ.get("BIG_CANDLE_ATR_TP_MIN_PCT", "0.60"))
+BC_ATR_TP_MIN_PCT   = float(os.environ.get("BIG_CANDLE_ATR_TP_MIN_PCT", "0.45"))  # мин 0.45% тейк (было 0.60, уменьшен т.к. TP=3×ATR
 BC_MAX_MARGIN       = float(os.environ.get("BIG_CANDLE_MAX_MARGIN", "3000"))  # cap маржи 30% от $10K
 
 # --- Окно сканирования ---
@@ -104,7 +104,7 @@ BC_WINDOW_END_MIN_MSK    = int(os.environ.get("BIG_CANDLE_WINDOW_END_MIN", "15")
 BC_EUROPEAN_START_HOUR   = int(os.environ.get("BIG_CANDLE_EUROPEAN_START_HOUR", "9"))  # с 9:00 среднее
 
 # --- Safety net ---
-BC_MAX_HOLD_SEC      = int(os.environ.get("BIG_CANDLE_MAX_HOLD_SEC", "21600"))  # 6 часов
+BC_MAX_HOLD_SEC      = int(os.environ.get("BIG_CANDLE_MAX_HOLD_SEC", "172800"))  # 48 часов (было 6ч — оптимизатор показал что hold 48ч = TP1 hit 42% vs 4%
 BC_CHECK_INTERVAL    = int(os.environ.get("BIG_CANDLE_CHECK_INTERVAL", "60"))   # проверка каждые 60с
 
 # --- API ---
