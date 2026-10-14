@@ -484,6 +484,7 @@ HELP_TEXT = (
     "/prophet_auto on — авто (11:00/15:00 МСК)\n"
     "/prophet_auto off — остановить\n"
     "/prophet_close — закрыть позицию\n"
+    "/prophet_clean — ручной cleaner зависших позиций\n"
     "/prophet_stats — статистика\n"
     "\nСтратегия: <b>donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая. "
     "Сканирует каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, "
@@ -641,6 +642,9 @@ def handle_command(text: str) -> str:
     if cmd == "/prophet_close":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_close()
+    if cmd == "/prophet_clean":
+        if PP is None: return "⚠️ Prophet не загружен"
+        return PP.cmd_clean()
     if cmd == "/prophet_stats":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_stats()

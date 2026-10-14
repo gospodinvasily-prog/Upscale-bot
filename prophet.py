@@ -33,7 +33,19 @@ STRATEGY_TAG = "prophet_v2"
 GATE_API = "https://api.gateio.ws/api/v4/spot"
 MSK = dt.timezone(dt.timedelta(hours=3))
 
-PAIRS = ["BTC","ETH","SOL","XRP","LINK","TRX","DOT","LTC","BCH","AVAX","NEAR","UNI","APT","FIL","ATOM","ARB","OP","INJ","AAVE","ALGO","ETC","XLM","HBAR","ICP","STX","SUI","SEI","TIA","RUNE","ENA"]
+PAIRS = [
+    "BTC","ETH","BNB","XRP","SOL","AAVE","ADA","AERO","ALGO","APT","ARB",
+    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BONK","BRETT","BSV",
+    "CAKE","CHZ","CRO","CRV","DASH","DATA","DEEP","DEXE","DOGE","DOT",
+    "DYDX","EIGEN","ENA","ENS","ETC","FARTCOIN","FET","FIL","FLOKI",
+    "GALA","GRAM","GRASS","GRT","HBAR","HYPE","ICP","IMX","INJ","IOTA",
+    "JASMY","JTO","JUP","KAIA","KAITO","KAS","LDO","LINEA","LINK","LTC",
+    "MANA","MNT","MORPHO","MOVE","NEAR","ONDO","OP","ORDI","PENDLE",
+    "PENGU","PEPE","PNUT","POL","POPCAT","PUMP","PYTH","QNT","RAY",
+    "RENDER","RUNE","S","SAND","SEI","SHIB","SKY","STRK","STX","SUI",
+    "TAO","TIA","TRUMP","TRX","TURBO","UNI","VET","VIRTUAL","WAL",
+    "WIF","WLD","XLM","XMR","XTZ","ZEC","ZRO","0G"
+]
 
 # Params
 RISK_USD = float(os.environ.get("PROPHET_RISK_USD", "100"))
@@ -42,11 +54,15 @@ TP_MULT = float(os.environ.get("PROPHET_TP_MULT", "3.0"))
 SL_MULT = float(os.environ.get("PROPHET_SL_MULT", "2.0"))
 MAX_HOLD = int(os.environ.get("PROPHET_MAX_HOLD_HOURS", "48")) * 3600
 MIN_SCORE = int(os.environ.get("PROPHET_MIN_SCORE", "70"))
-AUTO_SCORE = int(os.environ.get("PROPHET_AUTO_SCORE", "95"))
+AUTO_SCORE = int(os.environ.get("PROPHET_AUTO_SCORE", "90"))
 SCAN_INTERVAL = int(os.environ.get("PROPHET_SCAN_INTERVAL", "3600"))
 MAX_MARGIN = float(os.environ.get("PROPHET_MAX_MARGIN", "3000"))
-MAX_OPEN = int(os.environ.get("PROPHET_MAX_OPEN", "1"))
+MAX_OPEN = int(os.environ.get("PROPHET_MAX_OPEN", "2"))
 AUTO_HOURS_MSK = [int(x) for x in os.environ.get("PROPHET_AUTO_HOURS", "11,15").split(",")]
+# Cleaner: при auto-scan закрывает позиции старше MAX_HOLD (по умолчанию 48ч)
+CLEANER_ENABLED = os.environ.get("PROPHET_CLEANER", "1") == "1"
+# Дополнительный таймаут для cleaner: если позиция открыта дольше MAX_HOLD + GRACE, принудительно закрыть
+CLEANER_GRACE_HOURS = int(os.environ.get("PROPHET_CLEANER_GRACE_HOURS", "2"))
 
 _data_dir = os.environ.get("BOT_DATA_DIR", "/tmp")
 try: os.makedirs(_data_dir, exist_ok=True)
@@ -580,6 +596,27 @@ def _scanner_loop():
                 _state["trades_today"] = 0
                 _state["trades_today_date"] = _today()
             
+            # === CLEANER: перед каждым сканом проверяем зависшие позиции ===
+            # В auto-режиме — всегда; в continuous — каждые 6 часов
+            do_clean = False
+            if mode == "auto":
+                do_clean = True
+            elif mode == "continuous":
+                last_clean = _state.get("last_clean_ts", 0)
+                if _now() - last_clean > 6 * 3600:
+                    do_clean = True
+            
+            if do_clean:
+                try:
+                    closed_n, _ = run_cleaner(reason=f"PRE_SCAN_{mode.upper()}")
+                    _state["last_clean_ts"] = _now()
+                    _save()
+                    if closed_n > 0 and B:
+                        # После cleaner'а перечитываем tracked — слотов могло освободиться
+                        tracked = _load_tracked()
+                except Exception as e:
+                    print(f"[prophet] cleaner error in scanner loop: {e}")
+            
             # Уже есть открытая позиция?
             tracked = _load_tracked()
             open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
@@ -591,6 +628,7 @@ def _scanner_loop():
             _stats["scans"] += 1
             _save()
             
+            scan_dt_str = dt.datetime.now(MSK).strftime("%H:%M")
             setup = do_scan(now_ts)
             
             if setup:
@@ -598,12 +636,27 @@ def _scanner_loop():
                 if setup["score"] >= min_s:
                     _stats["signals"] += 1
                     send_signal(setup)
-                elif mode == "single" and B:
-                    # В ручном режиме показываем даже если < порога auto
+                else:
+                    # Сигнал есть, но ниже порога
+                    if B and mode in ("auto", "single"):
+                        threshold_str = f"авто ≥{AUTO_SCORE}" if mode == "auto" else f"ручной ≥{MIN_SCORE}"
+                        B.send_telegram(
+                            f"🔮 Скан {scan_dt_str} МСК завершён\n"
+                            f"━━━━━━━━━━━━━━━━━━\n"
+                            f"Проверено пар: {len(PAIRS)}\n"
+                            f"Лучший сигнал: {setup['symbol']} LONG score={setup['score']:.0f}\n"
+                            f"⏸️ Ниже порога ({threshold_str}) — пропуск\n"
+                            f"Открыто: {open_count}/{MAX_OPEN}"
+                        )
+            else:
+                # Сигналов вообще не найдено
+                if B and mode in ("auto", "single"):
                     B.send_telegram(
-                        f"🔮 Скан завершён\n"
-                        f"Лучший: {setup['symbol']} LONG score={setup['score']:.0f}\n"
-                        f"Ниже порога {AUTO_SCORE if mode=='auto' else MIN_SCORE} — пропуск"
+                        f"🔮 Скан {scan_dt_str} МСК завершён\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"Проверено пар: {len(PAIRS)}\n"
+                        f"❌ Сигналов не найдено\n"
+                        f"Открыто: {open_count}/{MAX_OPEN}"
                     )
             
             time.sleep(30)
@@ -628,13 +681,15 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 Авто: Пт/Сб + Чт/Вс, 11:00/15:00 МСК")
+    lines.append(f"\n📅 Авто: 11:00/15:00 МСК | Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}")
     lines.append(f"TP={TP_MULT}×ATR | SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
+    lines.append(f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)")
     lines.append(f"\nКоманды:")
     lines.append(f"  /prophet_scan — один скан")
     lines.append(f"  /prophet_scan on — непрерывный")
     lines.append(f"  /prophet_auto on — авто по графику")
+    lines.append(f"  /prophet_clean — cleaner зависших")
     return "\n".join(lines)
 
 def cmd_scan(arg=""):
@@ -702,6 +757,106 @@ def cmd_close():
             print(f"[prophet] close error: {e}")
     return f"🛑 Закрыто: {closed}"
 
+def cmd_clean():
+    """Ручной запуск cleaner — закрыть зависшие позиции старше MAX_HOLD + GRACE."""
+    closed, msg = run_cleaner(reason="MANUAL_CLEAN")
+    return msg
+
+def run_cleaner(reason="AUTO_CLEAN"):
+    """
+    Cleaner: проверяет все открытые Prophet позиции и закрывает те, что:
+    - Открыты дольше MAX_HOLD + CLEANER_GRACE_HOURS (по умолчанию 48 + 2 = 50 часов)
+    - Или имеют статус "open" в tracked, но отсутствуют в live позициях Upscale (orphan)
+    
+    Возвращает (closed_count, message).
+    """
+    if not CLEANER_ENABLED:
+        return 0, "🧹 Cleaner выключен (PROPHET_CLEANER=0)"
+    
+    if not B or not hasattr(B, "EXECUTOR"):
+        return 0, "⚠️ Executor недоступен"
+    executor = B.EXECUTOR
+    if not executor or not executor.client:
+        return 0, "⚠️ Нет клиента Upscale"
+    
+    with _tracked_lock:
+        tracked = _load_tracked()
+    
+    open_recs = [(pid, v) for pid, v in tracked.items() 
+                 if v.get("status") == "open" and not pid.startswith("pending_")]
+    if not open_recs:
+        return 0, "🧹 Нет открытых позиций для проверки"
+    
+    # Получаем live позиции с Upscale
+    try:
+        executor._ensure_account()
+        if not executor.account_id:
+            return 0, "⚠️ Нет account_id"
+        live = UE._as_list(executor.client.positions(executor.account_id))
+        live_ids = {UE._pos_id(p) for p in live if isinstance(p, dict)}
+    except Exception as e:
+        return 0, f"⚠️ Ошибка получения позиций: {e}"
+    
+    now = _now()
+    max_hold_with_grace = MAX_HOLD + CLEANER_GRACE_HOURS * 3600
+    closed_count = 0
+    closed_list = []
+    
+    for pid, rec in open_recs:
+        opened_ts = rec.get("opened_ts", 0)
+        age_h = (now - opened_ts) / 3600 if opened_ts else 0
+        sym = rec.get("sym", "?")
+        
+        # Условие 1: позиция старше MAX_HOLD + GRACE
+        too_old = opened_ts and (now - opened_ts > max_hold_with_grace)
+        
+        # Условие 2: orphan — в tracked есть, в live нет
+        is_orphan = pid not in live_ids
+        
+        if too_old or is_orphan:
+            close_reason = []
+            if too_old:
+                close_reason.append(f"старая ({age_h:.1f}ч > {max_hold_with_grace/3600:.0f}ч)")
+            if is_orphan:
+                close_reason.append("orphan (нет в live)")
+            reason_str = ", ".join(close_reason)
+            
+            try:
+                # Найти live позицию для закрытия (если не orphan)
+                pos = next((p for p in live if UE._pos_id(p) == pid), None)
+                if pos:
+                    mid = UE._pos_market(pos)
+                    if mid:
+                        info = {"id": pid, "mid": mid, "dir": "long"}
+                        executor.close_position(info, reason=reason)
+                        closed_list.append(f"{sym} ({age_h:.0f}ч, {reason_str})")
+                        closed_count += 1
+                elif is_orphan:
+                    # Orphan — только обновляем tracked, в live нет
+                    closed_list.append(f"{sym} ({age_h:.0f}ч, orphan-уборка)")
+                    closed_count += 1
+                
+                with _tracked_lock:
+                    tr = _load_tracked()
+                    if pid in tr:
+                        tr[pid]["status"] = "closed"
+                        tr[pid]["close_reason"] = reason
+                        tr[pid]["closed_ts"] = now
+                        _save_tracked(tr)
+            except Exception as e:
+                print(f"[prophet] cleaner error for {sym} ({pid}): {e}")
+    
+    if closed_count > 0:
+        msg_lines = [f"🧹 Cleaner ({reason}): закрыто {closed_count} позиций:"]
+        for c in closed_list:
+            msg_lines.append(f"  • {c}")
+        msg = "\n".join(msg_lines)
+        if B:
+            B.send_telegram(msg)
+        return closed_count, msg
+    else:
+        return 0, f"🧹 Cleaner ({reason}): все открытые позиции в норме (проверено {len(open_recs)})"
+
 def cmd_stats():
     lines = ["", "━━━ 🔮 Пророк — Статистика ━━━"]
     lines.append(f"Сканирований: {_stats['scans']}")
@@ -725,9 +880,10 @@ def start():
     if B:
         B.send_telegram(
             f"🔮 <b>Пророк v2 запущен</b>\n"
+            f"Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
             f"TP={TP_MULT}×ATR | SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
-            f"Авто: {AUTO_HOURS_MSK} МСК\n"
-            f"Команды: /prophet /prophet_scan /prophet_auto /prophet_close"
+            f"Авто: {AUTO_HOURS_MSK} МСК | Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
+            f"Команды: /prophet /prophet_scan /prophet_auto /prophet_close /prophet_clean"
         )
