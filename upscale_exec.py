@@ -64,8 +64,8 @@ MAX_TRADES_DAY = int(os.environ.get("EXEC_MAX_TRADES_DAY", "0"))  # 0 = без �
 # этот — close-all ВСЕХ + halt бота).
 DAY_SOFT_FRAC = Decimal(os.environ.get("EXEC_DAY_SOFT_FRAC", "0.6"))
 DAY_HARD_FRAC = Decimal(os.environ.get("EXEC_DAY_HARD_FRAC", "0.8"))  # 80% от дневного лимита $500 = $400 при $10k (контур Upscale, отдельный от -$350 стратегии)
-TOT_SOFT_FRAC = Decimal(os.environ.get("EXEC_TOT_SOFT_FRAC", "0.6"))
-TOT_HARD_FRAC = Decimal(os.environ.get("EXEC_TOT_HARD_FRAC", "0.8"))   # 80% от общего лимита $1000 = $800 при $10k (close-all + halt, ручной /resume)
+TOT_SOFT_FRAC = Decimal(os.environ.get("EXEC_TOT_SOFT_FRAC", "0.9"))   # 90% от общего лимита $1000 = $900 при $10k — подняли с 0.6 чтобы не блокировало при просадке $540
+TOT_HARD_FRAC = Decimal(os.environ.get("EXEC_TOT_HARD_FRAC", "0.95"))  # 95% от общего лимита $1000 = $950 — close-all + halt (подняли с 0.8)
 DAY_GAIN_CAP_PCT = Decimal(os.environ.get("EXEC_DAY_GAIN_CAP_PCT", "0"))   # >0: не входить, если плюс за день ≥ N% (правило 30%); 0 = выкл
 WATCHDOG_SEC  = int(os.environ.get("EXEC_WATCHDOG_SEC", "60"))
 # v1.6: перевод стопа в безубыток после срабатывания TP1.
