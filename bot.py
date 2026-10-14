@@ -57,6 +57,12 @@ try:
 except Exception as e:
     BCS = None
     _BCS_IMPORT_ERR = str(e)
+try:
+    import prophet as PP
+    _PP_IMPORT_ERR = None
+except Exception as e:
+    PP = None
+    _PP_IMPORT_ERR = str(e)
 from datetime import datetime, timezone, timedelta
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -397,6 +403,21 @@ def tg_updates():
         out = []
         for u in data.get("result", []) if data.get("ok") else []:
             TG_OFFSET[0] = max(TG_OFFSET[0], u.get("update_id", 0))
+            # Проверяем callback_query (inline keyboard)
+            cb = u.get("callback_query")
+            if cb:
+                cb_data = cb.get("data", "")
+                if cb_data.startswith("prophet_") and PP is not None:
+                    try:
+                        PP.on_callback(cb_data)
+                    except Exception as e:
+                        print(f"[PP] callback error: {e}")
+                # Answer callback чтобы убрать loading
+                try:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                                  json={"callback_query_id": cb.get("id", "")}, timeout=5)
+                except: pass
+                continue
             msg = u.get("message") or u.get("channel_post") or {}
             if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
                 continue
@@ -455,6 +476,15 @@ HELP_TEXT = (
     "/bc_close — принудительно закрыть открытую BC позицию\n"
     "/bc_stats — winrate, PnL, статистика\n"
     "/bc_log — прислать CSV журналы сигналов и сделок\n"
+    "\n<b>🔮 ПРОРОК (Multi-TF Scanner)</b>\n"
+    "/prophet — статус\n"
+    "/prophet_scan — один скан сейчас\n"
+    "/prophet_scan on — непрерывный скан (каждый час)\n"
+    "/prophet_scan off — остановить\n"
+    "/prophet_auto on — авто (11:00/15:00 МСК)\n"
+    "/prophet_auto off — остановить\n"
+    "/prophet_close — закрыть позицию\n"
+    "/prophet_stats — статистика\n"
     "\nСтратегия: <b>donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая. "
     "Сканирует каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, "
     "16:05, 20:05 UTC). Два контура защиты: стратегийный -$350 today-only + Upscale "
@@ -594,6 +624,26 @@ def handle_command(text: str) -> str:
         if BCS is None:
             return "⚠️ Big Candle не загружен"
         return BCS.status_report()
+    # ─── Prophet команды ──────────────────────────────────────────────────────
+    if cmd == "/prophet":
+        if PP is None: return f"⚠️ Prophet не загружен: {_PP_IMPORT_ERR}"
+        return PP.cmd_status()
+    if cmd.startswith("/prophet_scan"):
+        if PP is None: return "⚠️ Prophet не загружен"
+        parts = text.split()
+        arg = parts[1] if len(parts) > 1 else ""
+        return PP.cmd_scan(arg)
+    if cmd.startswith("/prophet_auto"):
+        if PP is None: return "⚠️ Prophet не загружен"
+        parts = text.split()
+        arg = parts[1] if len(parts) > 1 else ""
+        return PP.cmd_auto(arg)
+    if cmd == "/prophet_close":
+        if PP is None: return "⚠️ Prophet не загружен"
+        return PP.cmd_close()
+    if cmd == "/prophet_stats":
+        if PP is None: return "⚠️ Prophet не загружен"
+        return PP.cmd_stats()
     if cmd in ("/help", "/start"):
         return HELP_TEXT
     return ""
@@ -845,6 +895,17 @@ def main():
     else:
         print(f"[BCS] модуль не загружен: {_BCS_IMPORT_ERR}")
         send_telegram(f"⚠️ Big Candle модуль не загружен: {esc(str(_BCS_IMPORT_ERR))}")
+
+    # ── Запуск Prophet (Multi-TF Scanner) ────────────────────────────────────
+    if PP is not None:
+        try:
+            PP.start()
+        except Exception as e:
+            print(f"[PP] ошибка запуска: {e}")
+            traceback.print_exc()
+            send_telegram(f"⚠️ Prophet не запустился: {esc(str(e))}")
+    else:
+        print(f"[PP] модуль не загружен: {_PP_IMPORT_ERR}")
 
     # Команды в чате — в отдельном потоке, не дожидаясь скана. Скан ~100 пар
     # с лимитом 12 запросов/сек может идти ощутимо долго; раньше poll_commands()
