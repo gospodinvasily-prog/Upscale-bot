@@ -91,7 +91,8 @@ BC_LEVERAGE         = int(os.environ.get("BIG_CANDLE_LEVERAGE", "5"))
 BC_VOL_MULT         = float(os.environ.get("BIG_CANDLE_VOL_MULT", "2.0"))
 BC_USE_SMA50        = os.environ.get("BIG_CANDLE_USE_SMA50", "1") == "1"
 BC_ATR_STOP_MULT    = float(os.environ.get("BIG_CANDLE_ATR_STOP_MULT", "2.0"))
-BC_ATR_TP_MULT      = float(os.environ.get("BIG_CANDLE_ATR_TP_MULT", "3.0"))   # 3×ATR (было 4.0 — оптимизатор показал что 3×ATR + hold 48ч = PF 2.30
+BC_ATR_TP_MULT      = float(os.environ.get("BIG_CANDLE_ATR_TP_MULT", "3.0"))   # TP1 = 3×ATR
+BC_ATR_TP2_MULT     = float(os.environ.get("BIG_CANDLE_ATR_TP2_MULT", "5.0"))   # TP2 = 5×ATR (дальше, 2-я зона)
 BC_ATR_PERIOD       = int(os.environ.get("BIG_CANDLE_ATR_PERIOD", "4"))   # 4 свечи 15m = 1 час
 BC_ATR_STOP_MIN_PCT = float(os.environ.get("BIG_CANDLE_ATR_STOP_MIN_PCT", "0.30"))
 BC_ATR_TP_MIN_PCT   = float(os.environ.get("BIG_CANDLE_ATR_TP_MIN_PCT", "0.45"))  # мин 0.45% тейк (было 0.60, уменьшен т.к. TP=3×ATR
@@ -418,18 +419,24 @@ def _check_signal():
         # Считаем уровни стопа и тейка
         atr_pct = (atr_value / entry_price) * 100
         stop_pct = max(BC_ATR_STOP_MIN_PCT, BC_ATR_STOP_MULT * atr_pct)
-        tp_pct = max(BC_ATR_TP_MIN_PCT, BC_ATR_TP_MULT * atr_pct)
+        tp1_pct = max(BC_ATR_TP_MIN_PCT, BC_ATR_TP_MULT * atr_pct)   # TP1 = 3×ATR
+        tp2_pct = max(BC_ATR_TP_MIN_PCT * 1.5, BC_ATR_TP2_MULT * atr_pct)  # TP2 = 5×ATR
 
-        # Гарантируем RR ≥ 1.5
-        if tp_pct < stop_pct * 1.5:
-            tp_pct = stop_pct * 1.5
+        # Гарантируем RR ≥ 1.5 для TP1
+        if tp1_pct < stop_pct * 1.5:
+            tp1_pct = stop_pct * 1.5
+        # TP2 должен быть дальше TP1
+        if tp2_pct <= tp1_pct:
+            tp2_pct = tp1_pct * 1.5
 
         if is_long:
             stop_price = entry_price * (1 - stop_pct / 100)
-            tp_price = entry_price * (1 + tp_pct / 100)
+            tp1_price = entry_price * (1 + tp1_pct / 100)
+            tp2_price = entry_price * (1 + tp2_pct / 100)
         else:
             stop_price = entry_price * (1 + stop_pct / 100)
-            tp_price = entry_price * (1 - tp_pct / 100)
+            tp1_price = entry_price * (1 - tp1_pct / 100)
+            tp2_price = entry_price * (1 - tp2_pct / 100)
 
         signal = {
             "sym": "BTC",
@@ -440,9 +447,13 @@ def _check_signal():
             "atr": atr_value,
             "atr_pct": atr_pct,
             "stop_price": stop_price,
-            "tp_price": tp_price,
+            "tp_price": tp1_price,       # обратная совместимость
+            "tp1_price": tp1_price,      # TP1 = 3×ATR (50% позиции)
+            "tp2_price": tp2_price,      # TP2 = 5×ATR (остаток 50%)
             "stop_pct": stop_pct,
-            "tp_pct": tp_pct,
+            "tp_pct": tp1_pct,           # обратная совместимость
+            "tp1_pct": tp1_pct,
+            "tp2_pct": tp2_pct,
             "sma_value": sma_value,
             "signal_ts": big["ts"],
             "signal_time_msk": _to_msk(big["ts"]).strftime("%H:%M"),
@@ -484,7 +495,8 @@ def _execute_signal(signal):
         "price": entry,
         "stop": stop,
         "stop_pct": stop_pct,
-        "tp1_price": tp,
+        "tp1_price": signal.get("tp1_price", signal["tp_price"]),   # TP1 = 3×ATR
+        "tp2_price": signal.get("tp2_price", signal["tp_price"] * 1.5),  # TP2 = 5×ATR
         "exit_mode": "tp_ladder",
         "risk_usd": BC_RISK_USD,
         "max_pos_usd": margin * BC_LEVERAGE,
@@ -499,18 +511,21 @@ def _execute_signal(signal):
         executor.on_signal(sig, score)
 
         size_str = f"${margin:.0f} маржа × {BC_LEVERAGE}x"
-        rr = signal["tp_pct"] / signal["stop_pct"]
+        rr1 = signal.get("tp1_pct", signal["tp_pct"]) / signal["stop_pct"]
+        rr2 = signal.get("tp2_pct", signal["tp_pct"] * 1.5) / signal["stop_pct"]
         direction_emoji = "🟢 LONG" if signal["is_long"] else "🔴 SHORT"
+        tp1 = signal.get("tp1_price", signal["tp_price"])
+        tp2 = signal.get("tp2_price", signal["tp_price"] * 1.5)
         if B:
             B.send_telegram(
                 f"🚨 <b>BIG CANDLE BTC {direction_emoji}</b>\n"
                 f"Вход: ${entry:.2f}\n"
                 f"Стоп: ${stop:.2f} ({stop_pct:.3f}%)\n"
-                f"Тейк: ${tp:.2f} ({signal['tp_pct']:.3f}%)\n"
-                f"📈 ATR_5m: ${signal['atr']:.2f} → RR 1:{rr:.1f}\n"
+                f"TP1: ${tp1:.2f} ({signal.get('tp1_pct', signal['tp_pct']):.3f}%, RR 1:{rr1:.1f}) — 50% позиции\n"
+                f"TP2: ${tp2:.2f} ({signal.get('tp2_pct', signal['tp_pct']*1.5):.3f}%, RR 1:{rr2:.1f}) — остаток 50%\n"
+                f"📈 ATR: ${signal['atr']:.2f}\n"
                 f"Маржа: {size_str} (риск ${BC_RISK_USD})\n"
                 f"Vol×{signal['vol_ratio']:.2f} | SMA50 1H: ${signal['sma_value']:.0f}"
-                + (f"\n⚠️ Окно {BC_WINDOW_START_HOUR_MSK}:00-{BC_WINDOW_END_HOUR_MSK}:{BC_WINDOW_END_MIN_MSK:02d} МСК" if False else "")
             )
 
         _state["trades_today"] += 1
