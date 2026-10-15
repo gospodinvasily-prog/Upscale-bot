@@ -612,8 +612,6 @@ def _scanner_loop():
                 # V8: сканы 05:15-22:15, исключая 07:15, 13:15, 16:15
                 if now_dt.hour in [7, 13, 16] or now_dt.hour < 5 or now_dt.hour > 22:
                     time.sleep(60); continue
-                if now_dt.hour not in AUTO_HOURS_MSK and now_dt.hour not in list(range(5, 23)):
-                    time.sleep(60); continue
                 # Проверяем не сканировали ли в этот час
                 if _now() - _state.get("last_scan_ts", 0) < 3600:
                     time.sleep(60); continue
