@@ -53,11 +53,11 @@ LEVERAGE = int(os.environ.get("PROPHET_LEVERAGE", "5"))
 TP_MULT = float(os.environ.get("PROPHET_TP_MULT", "3.0"))
 SL_MULT = float(os.environ.get("PROPHET_SL_MULT", "2.0"))
 MAX_HOLD = int(os.environ.get("PROPHET_MAX_HOLD_HOURS", "48")) * 3600
-MIN_SCORE = int(os.environ.get("PROPHET_MIN_SCORE", "70"))
-AUTO_SCORE = int(os.environ.get("PROPHET_AUTO_SCORE", "90"))
+MIN_SCORE = int(os.environ.get("PROPHET_MIN_SCORE", "60"))      # V8: снижен с 70
+AUTO_SCORE = int(os.environ.get("PROPHET_AUTO_SCORE", "60"))     # V8: снижен с 90
 SCAN_INTERVAL = int(os.environ.get("PROPHET_SCAN_INTERVAL", "3600"))
 MAX_MARGIN = float(os.environ.get("PROPHET_MAX_MARGIN", "3000"))
-MAX_OPEN = int(os.environ.get("PROPHET_MAX_OPEN", "2"))
+MAX_OPEN = int(os.environ.get("PROPHET_MAX_OPEN", "3"))       # V8: увеличен с 2
 AUTO_HOURS_MSK = [int(x) for x in os.environ.get("PROPHET_AUTO_HOURS", "11,15").split(",")]
 # Cleaner: при auto-scan закрывает позиции старше MAX_HOLD (по умолчанию 48ч)
 CLEANER_ENABLED = os.environ.get("PROPHET_CLEANER", "1") == "1"
@@ -260,11 +260,26 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
         g = sum(1 for c in c15[-3:] if c["close"] > c["open"])
         d15 = "LONG" if g >= 2 else ("SHORT" if g <= 1 else "NEUTRAL")
     
-    d4 = "LONG" if price > sma50*1.02 and rsi > 50 else "NEUTRAL"
+    # V8: LONG если price > sma50*1.02 and rsi > 50
+    #     SHORT если price < sma50*0.98 and rsi < 50
+    d4 = "NEUTRAL"
+    if price > sma50*1.02 and rsi > 50:
+        d4 = "LONG"
+    elif price < sma50*0.98 and rsi < 50:
+        d4 = "SHORT"
     
-    agree = sum(1 for d in [d4, d1, d15] if d == "LONG")
-    if agree < 2: return None
-    if d4 != "LONG": return None
+    # V8: проверка confluence в ОБЕ стороны
+    long_agree = sum(1 for d in [d4, d1, d15] if d == "LONG")
+    short_agree = sum(1 for d in [d4, d1, d15] if d == "SHORT")
+    
+    if long_agree >= 2 and d4 == "LONG":
+        direction = "LONG"; agree = long_agree
+    elif short_agree >= 2 and d4 == "SHORT":
+        direction = "SHORT"; agree = short_agree
+    else:
+        return None
+    
+    is_long = direction == "LONG"
     
     # SCORING
     score = 0; details = []
@@ -282,10 +297,15 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
     elif 20 <= adx < 30: score += 5; details.append(f"ADX{adx:.0f}")
     else: details.append(f"ADX{adx:.0f}")
     
-    # 4. RSI (0-10)
-    if 60 <= rsi <= 80: score += 10; details.append(f"RSI{rsi:.0f}✓")
-    elif 50 <= rsi < 60: score += 5; details.append(f"RSI{rsi:.0f}")
-    else: details.append(f"RSI{rsi:.0f}")
+    # 4. RSI (0-10) — V8: реверсивная логика для SHORT
+    if is_long:
+        if 60 <= rsi <= 80: score += 10; details.append(f"RSI{rsi:.0f}✓")
+        elif 50 <= rsi < 60: score += 5; details.append(f"RSI{rsi:.0f}")
+        else: details.append(f"RSI{rsi:.0f}")
+    else:
+        if 20 <= rsi <= 40: score += 10; details.append(f"RSI{rsi:.0f}✓")
+        elif 40 < rsi <= 50: score += 5; details.append(f"RSI{rsi:.0f}")
+        else: details.append(f"RSI{rsi:.0f}")
     
     # 5. DAY (-10 to +15)
     wd = scan_dt.weekday()
@@ -324,11 +344,12 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
     
     sp = SL_MULT * atr_pct; tp = TP_MULT * atr_pct
     return {
-        "symbol": sym, "price": price, "score": score, "direction": "LONG",
+        "symbol": sym, "price": price, "score": score, "direction": direction,
         "atr_pct": atr_pct, "rsi": rsi, "adx": adx, "agree": agree,
         "vol_ratio": vr, "bb_exp": bb_exp, "weekday": wdn, "hour": hm,
         "stop_pct": sp, "tp_pct": tp, "atr": atr,
-        "stop_price": price*(1-sp/100), "tp_price": price*(1+tp/100),
+        "stop_price": price*(1-sp/100) if is_long else price*(1+sp/100),
+        "tp_price": price*(1+tp/100) if is_long else price*(1-tp/100),
         "details": " | ".join(details),
     }
 
@@ -376,9 +397,11 @@ def send_signal(setup):
     _save()
     
     s = setup
+    is_long = s.get("direction", "LONG") == "LONG"
+    dir_emoji = "🟢 LONG" if is_long else "🔴 SHORT"
     msg = (
         f"🔮 <b>ПРОРОК-СИГНАЛ</b>\n\n"
-        f"🎯 {s['symbol']}/USDT — 🟢 LONG\n"
+        f"🎯 {s['symbol']}/USDT — {dir_emoji}\n"
         f"Score: <b>{s['score']:.0f}</b>\n\n"
         f"📊 Анализ:\n"
         f"   {s['details']}\n\n"
@@ -441,8 +464,11 @@ def execute_trade(setup):
         margin = MAX_MARGIN
         pos_size = margin * LEVERAGE
     
+    # V8: поддержка SHORT
+    is_long = setup.get("direction", "LONG") == "LONG"
+    side = "long" if is_long else "short"
     sig = {
-        "symbol": sym, "side": "long", "price": entry,
+        "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
         "max_pos_usd": pos_size, "max_same_side": 1,
@@ -452,9 +478,10 @@ def execute_trade(setup):
     try:
         score = int(setup["score"])
         executor.on_signal(sig, score)
+        dir_emoji = "🟢 LONG" if is_long else "🔴 SHORT"
         if B:
             B.send_telegram(
-                f"✅ <b>ПРОРОК: {sym} LONG открыт</b>\n"
+                f"✅ <b>ПРОРОК: {sym} {dir_emoji} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
                 f"Тейк: ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
@@ -468,7 +495,7 @@ def execute_trade(setup):
         with _tracked_lock:
             tr = _load_tracked()
             tr[f"pending_{sym}_{int(_now())}"] = {
-                "sym": sym, "side": "long", "entry": entry,
+                "sym": sym, "side": side, "dir": side, "entry": entry,
                 "stop": stop, "tp": tp, "opened_ts": _now(),
                 "strategy": STRATEGY_TAG, "status": "open",
             }
@@ -582,12 +609,18 @@ def _scanner_loop():
             now_dt = dt.datetime.now(MSK)
             
             if mode == "auto":
-                if now_dt.hour not in AUTO_HOURS_MSK:
+                # V8: сканы 05:15-22:15, исключая 07:15, 13:15, 16:15
+                if now_dt.hour in [7, 13, 16] or now_dt.hour < 5 or now_dt.hour > 22:
+                    time.sleep(60); continue
+                if now_dt.hour not in AUTO_HOURS_MSK and now_dt.hour not in list(range(5, 23)):
                     time.sleep(60); continue
                 # Проверяем не сканировали ли в этот час
                 if _now() - _state.get("last_scan_ts", 0) < 3600:
                     time.sleep(60); continue
             elif mode == "continuous":
+                # V8: исключаем часы 07:15, 13:15, 16:15
+                if now_dt.hour in [7, 13, 16]:
+                    time.sleep(60); continue
                 if _now() - _state.get("last_scan_ts", 0) < SCAN_INTERVAL:
                     time.sleep(60); continue
             
@@ -634,7 +667,8 @@ def _scanner_loop():
             setup = do_scan(now_ts)
             
             if setup:
-                print(f"[prophet] скан {scan_dt_str}: лучший сигнал {setup['symbol']} LONG score={setup['score']:.0f}")
+                setup_dir = setup.get('direction', 'LONG')
+                print(f"[prophet] скан {scan_dt_str}: лучший сигнал {setup['symbol']} {setup_dir} score={setup['score']:.0f}")
                 min_s = AUTO_SCORE if mode == "auto" else MIN_SCORE
                 if setup["score"] >= min_s:
                     _stats["signals"] += 1
@@ -646,11 +680,12 @@ def _scanner_loop():
                     if B:
                         threshold_str = f"авто ≥{AUTO_SCORE}" if mode == "auto" else f"ручной ≥{MIN_SCORE}"
                         mode_label = {"auto": "🤖 Авто", "continuous": "🔄 Непрерывный", "single": "🔍 Разовый"}.get(mode, mode)
+                        setup_dir_label = "🟢 LONG" if setup.get('direction') == "LONG" else "🔴 SHORT"
                         B.send_telegram(
                             f"🔮 Скан {scan_dt_str} МСК завершён ({mode_label})\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
                             f"Проверено пар: {len(PAIRS)}\n"
-                            f"Лучший сигнал: {setup['symbol']} LONG score={setup['score']:.0f}\n"
+                            f"Лучший сигнал: {setup['symbol']} {setup_dir_label} score={setup['score']:.0f}\n"
                             f"⏸️ Ниже порога ({threshold_str}) — пропуск\n"
                             f"Открыто: {open_count}/{MAX_OPEN}"
                         )
@@ -689,9 +724,10 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 Авто: 11:00/15:00 МСК | Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
+    lines.append(f"\n📅 Сканы: 05:15-22:15 (без 07/13/16) | Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}")
     lines.append(f"TP={TP_MULT}×ATR | SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
+    lines.append(f"🎯 Направление: LONG + SHORT")
     lines.append(f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)")
     lines.append(f"\nКоманды:")
     lines.append(f"  /prophet_scan — один скан")
@@ -719,7 +755,8 @@ def cmd_scan(arg=""):
                     send_signal(setup)
                 elif B:
                     if setup:
-                        B.send_telegram(f"🔮 Скан завершён\nЛучший: {setup['symbol']} LONG score={setup['score']:.0f}\nНиже порога {MIN_SCORE} — пропуск")
+                        dir_label = "🟢 LONG" if setup.get('direction') == "LONG" else "🔴 SHORT"
+                        B.send_telegram(f"🔮 Скан завершён\nЛучший: {setup['symbol']} {dir_label} score={setup['score']:.0f}\nНиже порога {MIN_SCORE} — пропуск")
                     else:
                         B.send_telegram("🔮 Скан завершён\n❌ Сигналов не найдено")
             except Exception as e:
@@ -754,7 +791,8 @@ def cmd_close():
             if pos:
                 mid = UE._pos_market(pos)
                 if mid:
-                    info = {"id": pid, "mid": mid, "dir": "long"}
+                    dir_str = rec.get("dir", rec.get("side", "long"))
+                    info = {"id": pid, "mid": mid, "dir": dir_str}
                     res = executor.close_position(info, reason="PROPHET_MANUAL")
                     with _tracked_lock:
                         tr = _load_tracked()
@@ -835,7 +873,8 @@ def run_cleaner(reason="AUTO_CLEAN"):
                 if pos:
                     mid = UE._pos_market(pos)
                     if mid:
-                        info = {"id": pid, "mid": mid, "dir": "long"}
+                        dir_str = rec.get("dir", rec.get("side", "long"))
+                        info = {"id": pid, "mid": mid, "dir": dir_str}
                         executor.close_position(info, reason=reason)
                         closed_list.append(f"{sym} ({age_h:.0f}ч, {reason_str})")
                         closed_count += 1
@@ -887,9 +926,10 @@ def start():
     print(f"[prophet] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
-            f"🔮 <b>Пророк v2 запущен</b>\n"
+            f"🔮 <b>Пророк V8 запущен</b>\n"
             f"Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
+            f"🎯 Направление: LONG + SHORT\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
             f"TP={TP_MULT}×ATR | SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
             f"Авто: {AUTO_HOURS_MSK} МСК | Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
