@@ -709,7 +709,7 @@ def _scanner_loop():
 
 def cmd_status():
     mode = _state.get("scan_mode", "off")
-    mode_str = {"off": "🔴 Выкл", "continuous": "🔄 Непрерывный (каждый час)", "auto": "🤖 Авто (11:00/15:00)"}.get(mode, mode)
+    mode_str = {"off": "🔴 Выкл", "continuous": "🔄 Непрерывный (каждый час)", "auto": "🤖 Авто (05-22 каждый час)"}.get(mode, mode)
     lines = ["", "━━━ 🔮 Пророк ━━━"]
     lines.append(f"Режим: {mode_str}")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}/{MAX_OPEN}")
@@ -766,7 +766,7 @@ def cmd_auto(arg=""):
     if arg.lower() == "on":
         _state["scan_mode"] = "auto"
         _save()
-        return f"🤖 Авто-режим включён. Скан в {AUTO_HOURS_MSK} МСК. Порог ≥{AUTO_SCORE}."
+        return "🤖 Авто-режим включён.\nСканы: 05:15-22:15 каждый час (без 07/13/16)\nПорог: ≥60\n🎯 Направление: LONG + SHORT"
     elif arg.lower() == "off":
         _state["scan_mode"] = "off"
         _save()
@@ -930,6 +930,6 @@ def start():
             f"🎯 Направление: LONG + SHORT\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
             f"TP={TP_MULT}×ATR | SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
-            f"Авто: {AUTO_HOURS_MSK} МСК | Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
+            f"Сканы: 05:15-22:15 (без 07/13/16) | Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
             f"Команды: /prophet /prophet_scan /prophet_auto /prophet_close /prophet_clean"
         )
