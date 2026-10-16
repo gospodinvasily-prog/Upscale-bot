@@ -1047,6 +1047,13 @@ def _scanner_loop():
 # === COMMANDS ===
 
 def cmd_status():
+    # V12-max5: при запросе статуса — сначала синхронизируем tracked с Upscale
+    # (молча убираем orphan'ы, чтобы статус показывал реальные позиции)
+    try:
+        _auto_sync_orphans(verbose_telegram=False)
+    except Exception as e:
+        print(f"[prophet V12-max5] status auto-sync error: {e}")
+
     mode = _state.get("scan_mode", "off")
     mode_str = {"off": "🔴 Выкл",
                 "continuous": "🔄 Непрерывный (каждый час в :15)",
@@ -1105,7 +1112,8 @@ def cmd_status():
     lines.append(f"  /prophet_scan — один скан")
     lines.append(f"  /prophet_scan on — непрерывный (каждый час в :15)")
     lines.append(f"  /prophet_auto on — авто (V12 часы, с подтверждением)")
-    lines.append(f"  /prophet_clean — cleaner зависших")
+    lines.append(f"  /prophet_clean — cleaner зависших (по возрасту)")
+    lines.append(f"  /prophet_sync — синхронизация tracked с Upscale (убрать orphan)")
     return "\n".join(lines)
 
 def cmd_scan(arg=""):
