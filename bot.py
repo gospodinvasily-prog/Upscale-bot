@@ -485,9 +485,11 @@ HELP_TEXT = (
     "/prophet_auto off — остановить\n"
     "/prophet_close — закрыть позицию\n"
     "/prophet_clean — ручной cleaner зависших позиций\n"
+    "/prophet_sync — убрать orphan-записи (синхронизация с Upscale)\n"
     "/prophet_stats — статистика\n"
-    "ℹ️ V12: LONG+SHORT, динамический TP (ADX&lt;25→2.5, ADX≥25→3.0), "
-    "сканы в :15 (без пересечения с 4H close), авто-подтверждение входа через 15m свечу\n"
+    "ℹ️ V12-max5: LONG+SHORT, динамический TP (ADX&lt;25→2.5, ADX≥25→3.0), "
+    "сканы в :15 (без пересечения с 4H close), авто-подтверждение входа через 15m свечу, "
+    "пирамидинг (новые только если предыдущие в плюсе, до 5)\n"
     "\nСтратегия: <b>donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая. "
     "Сканирует каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, "
     "16:05, 20:05 UTC). Два контура защиты: стратегийный -$350 today-only + Upscale "
@@ -647,6 +649,9 @@ def handle_command(text: str) -> str:
     if cmd == "/prophet_clean":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_clean()
+    if cmd == "/prophet_sync":
+        if PP is None: return "⚠️ Prophet не загружен"
+        return PP.cmd_sync()
     if cmd == "/prophet_stats":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_stats()

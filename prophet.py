@@ -959,6 +959,14 @@ def _scanner_loop():
                 except Exception as e:
                     print(f"[prophet] cleaner error in scanner loop: {e}")
 
+            # V12-max5: AUTO-SYNC — убираем orphan'ы перед сканом
+            # (позиция уже закрыта на Upscale, но запись осталась в tracked)
+            try:
+                if B and hasattr(B, "EXECUTOR") and B.EXECUTOR and B.EXECUTOR.client:
+                    _auto_sync_orphans()
+            except Exception as e:
+                print(f"[prophet V12-max5] auto-sync error: {e}")
+
             # Уже есть открытая позиция?
             tracked = _load_tracked()
             open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
@@ -1186,6 +1194,80 @@ def cmd_clean():
     """Ручной запуск cleaner — закрыть зависшие позиции старше MAX_HOLD + GRACE."""
     closed, msg = run_cleaner(reason="MANUAL_CLEAN")
     return msg
+
+def cmd_sync():
+    """
+    V12-max5: Принудительная синхронизация tracked.json с live позициями Upscale.
+    Удаляет orphan-записи (есть в tracked, но нет в live) БЕЗ попытки закрыть —
+    позиция уже закрыта на Upscale, нужно только убрать мусор из tracked.
+    Решает проблему "Открыто: 2" когда реально открыта 1.
+    """
+    return _auto_sync_orphans(verbose_telegram=True)
+
+
+def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
+    """
+    V12-max5: Синхронизация tracked.json с live позициями Upscale.
+    Молча убирает orphan-записи. Если verbose_telegram=True — отправляет отчёт в Telegram.
+
+    Возвращает строку с описанием результата.
+    """
+    if not B or not hasattr(B, "EXECUTOR"):
+        return "⚠️ Executor недоступен"
+    executor = B.EXECUTOR
+    if not executor or not executor.client:
+        return "⚠️ Нет клиента Upscale"
+
+    try:
+        executor._ensure_account()
+        if not executor.account_id:
+            return "⚠️ Нет account_id"
+        live = UE._as_list(executor.client.positions(executor.account_id))
+        live_ids = {UE._pos_id(p) for p in live if isinstance(p, dict)}
+    except Exception as e:
+        return f"⚠️ Ошибка получения live позиций: {e}"
+
+    with _tracked_lock:
+        tracked = _load_tracked()
+
+    open_recs = [(pid, v) for pid, v in tracked.items()
+                 if v.get("status") == "open" and not pid.startswith("pending_")]
+    if not open_recs:
+        return "🧹 Нет открытых записей в tracked"
+
+    orphan_count = 0
+    orphan_list = []
+
+    for pid, rec in open_recs:
+        if pid not in live_ids:
+            sym = rec.get("sym", "?")
+            direction = rec.get("direction", rec.get("dir", "long"))
+            opened_ts = rec.get("opened_ts", 0)
+            age_min = (int(_now()) - opened_ts) / 60 if opened_ts else 0
+            orphan_count += 1
+            orphan_list.append(f"{sym} {direction} ({age_min:.0f}мин назад)")
+            with _tracked_lock:
+                tr = _load_tracked()
+                if pid in tr:
+                    tr[pid]["status"] = "closed"
+                    tr[pid]["close_reason"] = "AUTO_SYNC_ORPHAN"
+                    tr[pid]["closed_ts"] = int(_now())
+                    _save_tracked(tr)
+
+    if orphan_count > 0:
+        msg_lines = [f"🔄 V12-max5 SYNC: убрано {orphan_count} orphan-записей:"]
+        for c in orphan_list:
+            msg_lines.append(f"  • {c}")
+        msg = "\n".join(msg_lines)
+        if verbose_telegram and B:
+            B.send_telegram(msg)
+        # Перечитываем tracked после очистки
+        tracked_after = _load_tracked()
+        open_n = sum(1 for v in tracked_after.values() if v.get("status") == "open")
+        print(f"[prophet V12-max5] auto-sync: убрано {orphan_count} orphan, теперь открыто {open_n}")
+        return f"{msg}\n\n📊 Теперь открыто: {open_n}"
+    else:
+        return f"✅ SYNC: tracked.json актуален (все {len(open_recs)} записей соответствуют live)"
 
 def run_cleaner(reason="AUTO_CLEAN"):
     """
