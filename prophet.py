@@ -81,7 +81,14 @@ TP_MULT_WEAK = 2.5     # ADX<25  (слабый тренд)   — TP ближе
 MIN_SCORE = 60         # V12: 60 (V8 было 70) — было env, теперь хардкод
 AUTO_SCORE = 60        # V12: 60 (V8 было 90) — было env, теперь хардкод
 # V12: максимум одновременных позиций
-MAX_OPEN = 3           # V12: 3 (V8 было 2)
+MAX_OPEN = 5           # V12-max5: 5 (V8 было 2, V12-max3 было 3)
+# V12-max5: ПИРАМИДИНГ — новая позиция в сторону только если предыдущие в плюсе
+# - 1-я позиция: всегда можно открыть
+# - 2-я, 3-я, 4-я, 5-я: только если ВСЕ предыдущие в этой стороне в плюсе
+MAX_SAME_SIDE = 5      # до 5 LONG или 5 SHORT (при условии пирамидинга)
+# V12: per-side daily stop — блокирует только убыточную сторону
+# Если LONG набрал -$300 за день → блокируем LONG до завтра, SHORT остаётся работать
+SIDE_DAILY_STOP_USD = 300.0  # 3 убытка × $100 = $300, потом блок стороны
 # V12 окна сканов (15 часов, без 7/13/16 — убыточные в бэктестах)
 AUTO_HOURS_MSK = [5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 21, 22]
 SCAN_MINUTE = 15       # V12: сканы строго в :15 МСК (не пересекается с 4H close в :00)
@@ -108,9 +115,13 @@ _state = {
     "pending_signal": None,  # ждёт ответа по кнопке (старый flow, для single)
     "trades_today": 0,
     "trades_today_date": "",
-    "long_cooldown_until": 0,    # V12: cooldown после убыточного LONG
-    "short_cooldown_until": 0,   # V12: cooldown после убыточного SHORT
+    "long_cooldown_until": 0,    # V12: cooldown после убыточного LONG (24h)
+    "short_cooldown_until": 0,   # V12: cooldown после убыточного SHORT (24h)
     "symbol_blacklist": {},     # V12: {sym: ts_until}
+    # V12-max5: per-side daily PnL (сброс по MSK-дню)
+    "long_today_pnl": 0.0,       # кумулятивный PnL LONG за сегодня
+    "short_today_pnl": 0.0,      # кумулятивный PnL SHORT за сегодня
+    "pnl_date": "",              # для сброса в начале дня
 }
 _stats = {"scans": 0, "signals": 0, "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0}
 
@@ -121,6 +132,99 @@ def _save():
     try:
         with open(STATE_FILE, "w") as f: json.dump(_state, f)
     except: pass
+
+def _reset_daily_pnl_if_needed():
+    """V12-max5: сброс per-side daily PnL при смене MSK-дня."""
+    today = _today()
+    if _state.get("pnl_date") != today:
+        _state["pnl_date"] = today
+        _state["long_today_pnl"] = 0.0
+        _state["short_today_pnl"] = 0.0
+        _save()
+
+def _side_blocked(direction: str) -> bool:
+    """V12-max5: проверить, заблокирована ли сторона из-за daily stop."""
+    _reset_daily_pnl_if_needed()
+    if direction == "LONG":
+        return _state.get("long_today_pnl", 0.0) <= -SIDE_DAILY_STOP_USD
+    else:
+        return _state.get("short_today_pnl", 0.0) <= -SIDE_DAILY_STOP_USD
+
+def _update_side_pnl(direction: str, pnl: float):
+    """V12-max5: добавить PnL к дневному итогу по стороне."""
+    _reset_daily_pnl_if_needed()
+    if direction in ("LONG", "long"):
+        old = _state.get("long_today_pnl", 0.0)
+        _state["long_today_pnl"] = old + pnl
+    else:
+        old = _state.get("short_today_pnl", 0.0)
+        _state["short_today_pnl"] = old + pnl
+    _save()
+
+def _fetch_current_price_for_sym(sym: str):
+    """Получить текущую рыночную цену для символа."""
+    try:
+        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{sym}_USDT"}, timeout=10)
+        if r.ok:
+            d = r.json()
+            return float(d.get("last", 0))
+    except: pass
+    return None
+
+def _can_pyramid(direction: str, tracked: dict) -> tuple:
+    """
+    V12-max5: ПИРАМИДИНГ — можно ли открыть новую позицию в эту сторону?
+    Правила:
+      - 1-я позиция в сторону: ВСЕГДА можно (если есть свободный слот)
+      - 2-я, 3-я, 4-я, 5-я: только если ВСЕ предыдущие позиции в этой стороне В ПЛЮСЕ
+        (по текущей рыночной цене)
+    Возвращает (can_open: bool, reason: str)
+    """
+    side_long = direction in ("LONG", "long")
+    # Считаем сколько позиций в этой стороне уже открыто
+    side_positions = []
+    for pid, rec in tracked.items():
+        if rec.get("status") != "open": continue
+        if pid.startswith("pending_"): continue
+        rec_dir = rec.get("direction", rec.get("dir", "long"))
+        rec_is_long = rec_dir in ("LONG", "long")
+        if rec_is_long == side_long:
+            side_positions.append(rec)
+
+    n_side = len(side_positions)
+    # Если в стороне ещё нет позиций — всегда можно (первая)
+    if n_side == 0:
+        return True, "первая позиция в сторону"
+
+    # Для последующих — проверяем что ВСЕ предыдущие в плюсе
+    profitable = 0
+    losing = 0
+    for rec in side_positions:
+        sym = rec.get("sym")
+        entry = rec.get("entry", 0)
+        if not sym or not entry:
+            continue
+        cur_price = _fetch_current_price_for_sym(sym)
+        if not cur_price:
+            # Не можем проверить — считаем что не в плюсе (безопасно)
+            losing += 1
+            continue
+        if side_long:
+            # LONG: прибыль если cur > entry
+            pnl_pct = (cur_price - entry) / entry * 100
+        else:
+            # SHORT: прибыль если cur < entry
+            pnl_pct = (entry - cur_price) / entry * 100
+        if pnl_pct > 0.1:  # мини-порог 0.1% чтобы избежать шума
+            profitable += 1
+        else:
+            losing += 1
+
+    if losing > 0:
+        return False, f"в {direction} уже {n_side} позиций, {losing} в убытке — пирамидинг запрещён"
+
+    return True, f"в {direction} {n_side} позиций, все в плюсе — пирамидинг разрешён"
+
 def _load():
     global _state
     try:
@@ -442,11 +546,22 @@ def do_scan(scan_ts=None):
             if not c4h or not c1h or not c15m: continue
             r = analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt)
             if r is None: continue
-            # V12: direction cooldown
+            # V12: direction cooldown (24h после убытка)
             if r["direction"] == "LONG":
                 if now_ts < _state.get("long_cooldown_until", 0): continue
             else:
                 if now_ts < _state.get("short_cooldown_until", 0): continue
+            # V12-max5: per-side daily stop — блокируем убыточную сторону
+            if _side_blocked(r["direction"]):
+                side_pnl = _state.get("long_today_pnl" if r["direction"]=="LONG" else "short_today_pnl", 0.0)
+                print(f"[prophet V12-max5] {r['direction']} blocked: today PnL ${side_pnl:.0f} ≤ -${SIDE_DAILY_STOP_USD:.0f}")
+                continue
+            # V12-max5: ПИРАМИДИНГ — не открываем 2-ю позицию в сторону если 1-я в минусе
+            # (но 1-я в сторону — всегда можно)
+            can_pyramid, pyramid_reason = _can_pyramid(r["direction"], tracked)
+            if not can_pyramid:
+                print(f"[prophet V12-max5] {r['symbol']} {r['direction']}: пирамидинг запрещён — {pyramid_reason}")
+                continue
             results.append(r)
         except Exception as e:
             print(f"[prophet] {sym}: {e}")
@@ -583,7 +698,17 @@ def _confirmation_worker(setup, fire_ts: int):
             if B: B.send_telegram(f"⏭️ {sym} {emoji_dir}: подтверждение пришло, но слоты заняты ({open_count}/{MAX_OPEN})")
             return
 
-        # Проверяем подтверждение
+        # V12-max5: повторная проверка пирамидинга перед самым входом
+        # (за 15 минут ожидания предыдущая позиция могла уйти в минус)
+        can_pyramid, pyramid_reason = _can_pyramid(direction, tracked)
+        if not can_pyramid:
+            if B: B.send_telegram(
+                f"⏭️ {sym} {emoji_dir}: подтверждение пришло, но пирамидинг запрещён\n"
+                f"Причина: {pyramid_reason}"
+            )
+            return
+
+        # Проверяем подтверждение свечи
         if _confirm_signal(setup):
             # Обновляем цену входа на текущую
             setup["price"] = _fetch_current_price(sym) or setup["price"]
@@ -636,7 +761,7 @@ def execute_trade(setup):
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
-        "max_pos_usd": pos_size, "max_same_side": 1,
+        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,  # V12-max5: 3 (было 1)
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
 
@@ -740,10 +865,13 @@ def manage_positions():
             except: pass
 
             _stats["pnl"] += pnl
+            # V12-max5: обновляем per-side daily PnL
+            direction_field = rec.get("direction", rec.get("dir", "long"))
+            _update_side_pnl(direction_field, pnl)
+            side_pnl_now = _state.get("long_today_pnl" if direction_field in ("LONG","long") else "short_today_pnl", 0.0)
             # V12: cooldown после убытка
             if pnl < 0:
-                direction = rec.get("direction", rec.get("dir", "long"))
-                if direction == "LONG" or direction == "long":
+                if direction_field in ("LONG", "long"):
                     _state["long_cooldown_until"] = int(_now()) + 24*3600
                 else:
                     _state["short_cooldown_until"] = int(_now()) + 24*3600
@@ -752,6 +880,15 @@ def manage_positions():
                 bl[rec["sym"]] = int(_now()) + 7*24*3600
                 _state["symbol_blacklist"] = bl
                 _save()
+            # V12-max5: уведомление если сторона упёрлась в daily stop
+            if side_pnl_now <= -SIDE_DAILY_STOP_USD:
+                side_name = "LONG" if direction_field in ("LONG","long") else "SHORT"
+                if B: B.send_telegram(
+                    f"🚫 <b>V12-max5: {side_name} заблокирован до завтра</b>\n"
+                    f"Сегодняшний PnL по {side_name}: ${side_pnl_now:+.0f}\n"
+                    f"Лимит стороны: -${SIDE_DAILY_STOP_USD:.0f}\n"
+                    f"Обратная сторона продолжает работать."
+                )
             if pnl > 0: _stats["wins"] += 1
             else: _stats["losses"] += 1
             del tracked[pid]; changed = True
@@ -918,21 +1055,40 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 V12 часы: {AUTO_HOURS_MSK} МСК, скан в :{SCAN_MINUTE:02d}")
-    lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
+    lines.append(f"\n📅 V12-max5 часы: {AUTO_HOURS_MSK} МСК, скан в :{SCAN_MINUTE:02d}")
+    lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}")
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}")
     lines.append(f"TP: динамический (ADX<25 → {TP_MULT_WEAK}×ATR, ADX≥25 → {TP_MULT_STRONG}×ATR)")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
     lines.append(f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)")
+    lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (блокирует только сторону)")
     lines.append(f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)")
+    # V12-max5: per-side daily PnL
+    _reset_daily_pnl_if_needed()
+    long_pnl = _state.get("long_today_pnl", 0.0)
+    short_pnl = _state.get("short_today_pnl", 0.0)
+    long_block = "🚫" if long_pnl <= -SIDE_DAILY_STOP_USD else "✅"
+    short_block = "🚫" if short_pnl <= -SIDE_DAILY_STOP_USD else "✅"
+    # Считаем открытые позиции по сторонам
+    tracked = _load_tracked()  # перечитываем для актуального count
+    long_open = sum(1 for v in tracked.values() if v.get("status") == "open"
+                    and v.get("direction", v.get("dir", "long")) in ("LONG", "long")
+                    and not v.get("sym", "").startswith("pending_"))
+    short_open = sum(1 for v in tracked.values() if v.get("status") == "open"
+                     and v.get("direction", v.get("dir", "short")) in ("SHORT", "short")
+                     and not v.get("sym", "").startswith("pending_"))
+    lines.append(f"\n📊 Сегодня PnL:")
+    lines.append(f"  🟢 LONG:  ${long_pnl:+.0f} / -${SIDE_DAILY_STOP_USD:.0f} {long_block} | открыто: {long_open}/{MAX_SAME_SIDE}")
+    lines.append(f"  🔴 SHORT: ${short_pnl:+.0f} / -${SIDE_DAILY_STOP_USD:.0f} {short_block} | открыто: {short_open}/{MAX_SAME_SIDE}")
+    lines.append(f"  📌 Пирамидинг: новые только если предыдущие в плюсе")
     # V12 cooldowns
     now_ts = int(_now())
     long_cd = _state.get("long_cooldown_until", 0)
     short_cd = _state.get("short_cooldown_until", 0)
     if long_cd > now_ts:
-        lines.append(f"🚫 LONG cooldown: ещё {(long_cd-now_ts)//3600}ч")
+        lines.append(f"⏸️ LONG 24h cooldown: ещё {(long_cd-now_ts)//3600}ч")
     if short_cd > now_ts:
-        lines.append(f"🚫 SHORT cooldown: ещё {(short_cd-now_ts)//3600}ч")
+        lines.append(f"⏸️ SHORT 24h cooldown: ещё {(short_cd-now_ts)//3600}ч")
     bl = _state.get("symbol_blacklist", {})
     active_bl = {s: t for s, t in bl.items() if t > now_ts}
     if active_bl:
@@ -946,11 +1102,14 @@ def cmd_status():
 
 def cmd_scan(arg=""):
     if arg.lower() == "on":
+        # V12 fix: при переключении режимов сбрасываем pending_signal
         _state["scan_mode"] = "continuous"
+        _state["pending_signal"] = None
         _save()
         return "🔄 V12 непрерывный скан включён (каждый час в :15 МСК). /prophet_scan off — остановить."
     elif arg.lower() == "off":
         _state["scan_mode"] = "off"
+        _state["pending_signal"] = None
         _save()
         return "🔴 Непрерывный скан выключен."
     else:
@@ -975,11 +1134,19 @@ def cmd_scan(arg=""):
 
 def cmd_auto(arg=""):
     if arg.lower() == "on":
+        # V12 fix: при переключении режимов сбрасываем висящий pending_signal от continuous
+        # (чтобы старая кнопка "ВОЙТИ" от ручного режима не путала пользователя в auto)
+        old_pending = _state.get("pending_signal")
         _state["scan_mode"] = "auto"
+        _state["pending_signal"] = None
         _save()
-        return f"🤖 V12 Авто-режим включён.\nЧасы скана: {AUTO_HOURS_MSK}\nМинута: :{SCAN_MINUTE:02d}\nПорог: ≥{AUTO_SCORE}\nПодтверждение: {CONFIRM_WAIT_SEC//60} мин"
+        msg = f"🤖 V12 Авто-режим включён.\nЧасы скана: {AUTO_HOURS_MSK}\nМинута: :{SCAN_MINUTE:02d}\nПорог: ≥{AUTO_SCORE}\nПодтверждение: {CONFIRM_WAIT_SEC//60} мин (15m свеча, автоматически)"
+        if old_pending:
+            msg += f"\n\n⏭️ Старый сигнал от ручного режима ({old_pending['symbol']}) отменён — в auto режиме бот сам принимает решения."
+        return msg
     elif arg.lower() == "off":
         _state["scan_mode"] = "off"
+        _state["pending_signal"] = None
         _save()
         return "🔴 Авто-режим выключен."
     return "Использование: /prophet_auto on | /prophet_auto off"
@@ -1126,22 +1293,24 @@ def cmd_stats():
 
 def start():
     _load()
+    _reset_daily_pnl_if_needed()
     global _scanner_thread
     if _scanner_thread is None:
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12")
         _scanner_thread.start()
-    print(f"[prophet V12] Старт: режим={_state.get('scan_mode','off')}")
+    print(f"[prophet V12-max5] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
-            f"🔮 <b>Пророк V12 запущен</b>\n"
-            f"📊 Версия: V12 ФИНАЛ\n"
-            f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
+            f"🔮 <b>Пророк V12-max5 запущен</b>\n"
+            f"📊 Версия: V12-max5 ФИНАЛ\n"
+            f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
             f"📈 TP: динамический (ADX&lt;25 → {TP_MULT_WEAK}×ATR, ADX≥25 → {TP_MULT_STRONG}×ATR)\n"
             f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
             f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
             f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)\n"
+            f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (LONG/SHORT раздельно)\n"
             f"🟢 LONG + 🔴 SHORT\n"
             f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
             f"Команды: /prophet /prophet_scan /prophet_auto /prophet_close /prophet_clean"
