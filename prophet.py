@@ -1222,7 +1222,9 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     V12-max5: Синхронизация tracked.json с live позициями Upscale.
     Убирает orphan-записи:
       - real orphan: pid не в live_ids → позиция закрыта на Upscale
-      - pending orphan: pending_* старше 60 сек, нет соответствия в live → не открылась
+      - pending orphan: pending_* старше 5 мин И символа точно нет в live → не открылась
+        (старше 5 мин чтобы дать время на открытие, не сносить свежие)
+    ВАЖНО: если live_syms пустой (не смогли получить) — НЕ трогаем pending_!
     """
     if not B or not hasattr(B, "EXECUTOR"):
         return "⚠️ Executor недоступен"
@@ -1249,6 +1251,11 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     except Exception as e:
         return f"⚠️ Ошибка получения live позиций: {e}"
 
+    # ВАЖНО: если markets не загружены — НЕ трогаем pending_, можем снести реальные
+    markets_ok = bool(executor._mk)
+    if not markets_ok:
+        print(f"[prophet V12-max5] WARNING: markets не загружены, пропускаем pending_ cleanup")
+    
     with _tracked_lock:
         tracked = _load_tracked()
 
@@ -1256,43 +1263,44 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     cleaned_count = 0
     cleaned_list = []
 
-    # 1. Чистим pending_ orphan'ы (старше 60 сек, не подтверждены в live)
-    for pid in list(tracked.keys()):
-        rec = tracked[pid]
-        if rec.get("status") != "open": continue
-        if not pid.startswith("pending_"): continue
-        sym = rec.get("sym", "?")
-        opened_ts = rec.get("opened_ts", 0)
-        age_sec = now_ts - opened_ts if opened_ts else 0
-        # Если pending_ старше 60 сек и символа нет в live → удаляем
-        if age_sec > 60 and sym not in live_syms:
-            direction = rec.get("direction", rec.get("dir", "long"))
-            with _tracked_lock:
-                tr = _load_tracked()
-                if pid in tr:
-                    tr[pid]["status"] = "closed"
-                    tr[pid]["close_reason"] = "AUTO_SYNC_PENDING_ORPHAN"
-                    tr[pid]["closed_ts"] = now_ts
-                    _save_tracked(tr)
-            cleaned_count += 1
-            cleaned_list.append(f"⏳ {sym} {direction} (pending {age_sec//60}мин, не открылась)")
-        # Если pending_ и символ есть в live → конвертируем в real entry
-        elif sym in live_syms:
-            real_id = live_syms[sym]
-            with _tracked_lock:
-                tr = _load_tracked()
-                if pid in tr:
-                    # Копируем запись под real_id, удаляем pending_
-                    tr[real_id] = tr[pid]
-                    tr[real_id]["close_reason"] = ""
-                    del tr[pid]
-                    _save_tracked(tr)
-            # Регистрируем стратегию
-            try:
-                executor._registry_set(real_id, STRATEGY_TAG)
-            except: pass
-            cleaned_count += 1
-            cleaned_list.append(f"🔄 {sym} (pending→real {real_id})")
+    # 1. Чистим pending_ orphan'ы (старше 5 МИН, не подтверждены в live)
+    # ВАЖНО: 5 минут вместо 60 сек, чтобы дать время на реальное открытие
+    if markets_ok:
+        for pid in list(tracked.keys()):
+            rec = tracked[pid]
+            if rec.get("status") != "open": continue
+            if not pid.startswith("pending_"): continue
+            sym = rec.get("sym", "?")
+            opened_ts = rec.get("opened_ts", 0)
+            age_sec = now_ts - opened_ts if opened_ts else 0
+            # Если pending_ старше 5 минут и символа ТОЧНО нет в live → удаляем
+            if age_sec > 300 and sym not in live_syms:
+                direction = rec.get("direction", rec.get("dir", "long"))
+                with _tracked_lock:
+                    tr = _load_tracked()
+                    if pid in tr:
+                        tr[pid]["status"] = "closed"
+                        tr[pid]["close_reason"] = "AUTO_SYNC_PENDING_ORPHAN"
+                        tr[pid]["closed_ts"] = now_ts
+                        _save_tracked(tr)
+                cleaned_count += 1
+                cleaned_list.append(f"⏳ {sym} {direction} (pending {age_sec//60}мин, не открылась)")
+            # Если pending_ и символ есть в live → конвертируем в real entry
+            elif sym in live_syms:
+                real_id = live_syms[sym]
+                with _tracked_lock:
+                    tr = _load_tracked()
+                    if pid in tr and real_id not in tr:
+                        # Копируем запись под real_id, удаляем pending_
+                        tr[real_id] = dict(tr[pid])
+                        tr[real_id]["close_reason"] = ""
+                        del tr[pid]
+                        _save_tracked(tr)
+                        cleaned_count += 1
+                        cleaned_list.append(f"🔄 {sym} (pending→real {real_id})")
+                    try:
+                        executor._registry_set(real_id, STRATEGY_TAG)
+                    except: pass
 
     # 2. Чистим real orphan'ы (pid не в live_ids)
     # Перечитываем tracked после pending_ очистки
