@@ -915,6 +915,7 @@ def manage_positions():
 # === SCAN LOOPS ===
 
 _scanner_thread = None
+_watchdog_thread = None
 
 def _scanner_loop():
     """V12: Главный цикл — сканы строго в HH:15 МСК каждый час из AUTO_HOURS_MSK."""
@@ -973,15 +974,31 @@ def _scanner_loop():
             if open_count >= MAX_OPEN:
                 time.sleep(60); continue
 
-            # Сканируем
+            # Сканируем — отметку ставим ПОСЛЕ успешного скана, не до
+            # (если упадёт до отправки сообщения — next iter повторит)
+            scan_dt_str = now_dt.strftime("%H:%M")
+            scan_started_msg = f"🔍 V12-max5 скан в {scan_dt_str} МСК (режим={mode}, открыто={open_count}/{MAX_OPEN})"
+            print(f"[prophet V12-max5] {scan_started_msg}")
+            # V12-max5: уведомляем о старте скана чтобы не было тишины
+            if B and mode == "auto":
+                try:
+                    B.send_telegram(scan_started_msg)
+                except Exception as e:
+                    print(f"[prophet V12-max5] send start msg error: {e}")
+
+            try:
+                setup = do_scan(now_ts)
+            except Exception as e:
+                print(f"[prophet V12-max5] do_scan error: {e}")
+                if B:
+                    try: B.send_telegram(f"⚠️ V12-max5: ошибка скана в {scan_dt_str}: {e}")
+                    except: pass
+                setup = None
+
+            # Скан завершён (успешно или с ошибкой) — фиксируем время
             _state["last_scan_ts"] = _now()
             _stats["scans"] += 1
             _save()
-
-            scan_dt_str = now_dt.strftime("%H:%M")
-            print(f"[prophet V12] скан в {scan_dt_str} МСК, режим={mode}, пар={len(PAIRS)}, открыто={open_count}/{MAX_OPEN}")
-
-            setup = do_scan(now_ts)
 
             if setup:
                 direction = setup.get("direction", "LONG")
@@ -1449,13 +1466,36 @@ def cmd_stats():
 
 # === START ===
 
+def _scanner_watchdog():
+    """V12-max5: Watchdog — если scanner thread умер, перезапускаем его."""
+    while True:
+        try:
+            time.sleep(120)  # проверка каждые 2 минуты
+            mode = _state.get("scan_mode", "off")
+            if mode == "off": continue
+            global _scanner_thread
+            if _scanner_thread is None or not _scanner_thread.is_alive():
+                print(f"[prophet V12-max5] WATCHDOG: scanner thread умер, перезапускаю...")
+                if B:
+                    try: B.send_telegram("🔄 V12-max5: scanner thread перезапускается (watchdog)")
+                    except: pass
+                _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12-restart")
+                _scanner_thread.start()
+        except Exception as e:
+            print(f"[prophet V12-max5] watchdog error: {e}")
+
 def start():
     _load()
     _reset_daily_pnl_if_needed()
     global _scanner_thread
-    if _scanner_thread is None:
+    if _scanner_thread is None or not _scanner_thread.is_alive():
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12")
         _scanner_thread.start()
+    # V12-max5: запускаем watchdog для авто-перезапуска scanner
+    global _watchdog_thread
+    if _watchdog_thread is None:
+        _watchdog_thread = threading.Thread(target=_scanner_watchdog, daemon=True, name="prophet-watchdog")
+        _watchdog_thread.start()
     print(f"[prophet V12-max5] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
@@ -1470,6 +1510,8 @@ def start():
             f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)\n"
             f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (LONG/SHORT раздельно)\n"
             f"🟢 LONG + 🔴 SHORT\n"
+            f"📌 Пирамидинг: новые только если предыдущие в плюсе\n"
+            f"🔄 Auto-sync orphans + watchdog scanner\n"
             f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
-            f"Команды: /prophet /prophet_scan /prophet_auto /prophet_close /prophet_clean"
+            f"Команды: /prophet /prophet_scan /prophet_auto /prophet_close /prophet_clean /prophet_sync"
         )
