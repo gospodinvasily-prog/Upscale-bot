@@ -138,6 +138,10 @@ if EXCLUDE_SYMBOLS:
 
 TG_OFFSET = [0]               # id последнего прочитанного сообщения в Telegram
 
+# V12-max5: флаг отключения Donchian 4H (только Donchian, Prophet продолжит)
+# Управляется командами /donchian_off и /donchian_on из Telegram
+DONCHIAN_DISABLED = [False]   # mutable container для доступа из thread'ов
+
 # ─── УТИЛИТЫ ──────────────────────────────────────────────────────────────────
 
 def esc(s) -> str:
@@ -467,6 +471,10 @@ HELP_TEXT = (
     "/state — состояние: cooldown, today_realized, day_loss_stop, prev_day_pnl\n"
     "/trail — текущие trailing-стопы всех открытых donchian-позиций\n"
     "/daily — P&L дня (сегодня, вчера) с разбивкой по причинам выхода\n"
+    "/donchian_off — ⏸️ отключить новые входы 4H (Prophet продолжит)\n"
+    "/donchian_on — ▶️ включить новые входы 4H\n"
+    "/donchian_status — статус флага\n"
+    "/closeall — 🛑 закрыть ВСЕ позиции (и Prophet, и Donchian)\n"
     "\n<b>📒 ЖУРНАЛЫ</b>\n"
     "/log — прислать журнал авто-слоя (CSV) прямо сейчас — только по вызову\n"
     "\n<b>🚨 BIG CANDLE STRATEGY (BTC скальпер)</b>\n"
@@ -476,20 +484,16 @@ HELP_TEXT = (
     "/bc_close — принудительно закрыть открытую BC позицию\n"
     "/bc_stats — winrate, PnL, статистика\n"
     "/bc_log — прислать CSV журналы сигналов и сделок\n"
-    "\n<b>🔮 ПРОРОК V12 (Multi-TF Scanner)</b>\n"
+    "\n<b>🔮 ПРОРОК (Multi-TF Scanner)</b>\n"
     "/prophet — статус\n"
     "/prophet_scan — один скан сейчас\n"
-    "/prophet_scan on — непрерывный скан (каждый час в :15 МСК)\n"
+    "/prophet_scan on — непрерывный скан (каждый час)\n"
     "/prophet_scan off — остановить\n"
-    "/prophet_auto on — авто (V12 часы, с подтверждением 15m)\n"
+    "/prophet_auto on — авто (11:00/15:00 МСК)\n"
     "/prophet_auto off — остановить\n"
     "/prophet_close — закрыть позицию\n"
     "/prophet_clean — ручной cleaner зависших позиций\n"
-    "/prophet_sync — убрать orphan-записи (синхронизация с Upscale)\n"
     "/prophet_stats — статистика\n"
-    "ℹ️ V12-max5: LONG+SHORT, динамический TP (ADX&lt;25→2.5, ADX≥25→3.0), "
-    "сканы в :15 (без пересечения с 4H close), авто-подтверждение входа через 15m свечу, "
-    "пирамидинг (новые только если предыдущие в плюсе, до 5)\n"
     "\nСтратегия: <b>donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая. "
     "Сканирует каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, "
     "16:05, 20:05 UTC). Два контура защиты: стратегийный -$350 today-only + Upscale "
@@ -527,6 +531,9 @@ def handle_command(text: str) -> str:
         # Ручной запуск скана в отдельном потоке, чтобы команда ответила быстро
         def _run_scan():
             try:
+                if DONCHIAN_DISABLED[0]:
+                    send_telegram("⏸️ Donchian 4H отключён командой /donchian_off\nИспользуй /donchian_on для включения")
+                    return
                 DR42.check_signals()
             except Exception as e:
                 send_telegram(f"⚠️ /scan ошибка: {esc(str(e))}")
@@ -599,6 +606,25 @@ def handle_command(text: str) -> str:
         return f"📒 Отправлено файлов: {sent}" if sent else "📒 Журналы пока пустые."
     if cmd == "/dr42":
         return DR42.status_report()
+    # ─── V12-max5: Управление Donchian 4H (без остановки Prophet) ──────────────
+    if cmd == "/donchian_off":
+        DONCHIAN_DISABLED[0] = True
+        return ("⏸️ <b>Donchian 4H отключён</b>\n"
+                "Новые входы от donchian_4h_v22 заблокированы.\n"
+                "Открытые позиции продолжают работать (trailing, TP).\n"
+                "Prophet V12-max5 продолжает работать как обычно.\n"
+                "Команды: /donchian_on — включить, /donchian_status — статус")
+    if cmd == "/donchian_on":
+        DONCHIAN_DISABLED[0] = False
+        return ("▶️ <b>Donchian 4H включён</b>\n"
+                "Авто-скан каждые 4H восстановлен.\n"
+                "Prophet V12-max5 работает как обычно.")
+    if cmd == "/donchian_status":
+        state = "⏸️ ОТКЛЮЧЕН" if DONCHIAN_DISABLED[0] else "▶️ ВКЛЮЧЁН"
+        return (f"📊 <b>Donchian 4H: {state}</b>\n"
+                f"Prophet V12-max5: работает независимо\n"
+                f"EXECUTOR halted: {'да' if EXECUTOR.halted else 'нет'}\n"
+                f"Команды: /donchian_off, /donchian_on")
     # ─── Big Candle команды ──────────────────────────────────────────────────
     if cmd == "/bc":
         if BCS is None:
@@ -649,9 +675,6 @@ def handle_command(text: str) -> str:
     if cmd == "/prophet_clean":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_clean()
-    if cmd == "/prophet_sync":
-        if PP is None: return "⚠️ Prophet не загружен"
-        return PP.cmd_sync()
     if cmd == "/prophet_stats":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_stats()
@@ -966,12 +989,17 @@ def main():
                     print(f"[DR42] не удалось сохранить метку скана: {e}")
                 candle_str = datetime.fromtimestamp(last_4h_ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 print(f"[DR42] запуск скана по свече {candle_str}")
-                try:
-                    DR42.check_signals()
-                except Exception as e:
-                    print(f"[DR42 ERROR] {e}")
-                    traceback.print_exc()
-                    send_telegram(f"⚠️ donchian_4h_v22: ошибка скана — {esc(str(e))}")
+                # V12-max5: проверка флага отключения Donchian
+                if DONCHIAN_DISABLED[0]:
+                    print(f"[DR42] скан пропущен — Donchian отключён через /donchian_off")
+                    send_telegram(f"⏸️ Donchian 4H: авто-скан пропущен (отключён /donchian_off)")
+                else:
+                    try:
+                        DR42.check_signals()
+                    except Exception as e:
+                        print(f"[DR42 ERROR] {e}")
+                        traceback.print_exc()
+                        send_telegram(f"⚠️ donchian_4h_v22: ошибка скана — {esc(str(e))}")
 
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
