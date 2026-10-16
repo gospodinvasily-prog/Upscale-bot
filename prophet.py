@@ -1049,8 +1049,12 @@ def _scanner_loop():
 def cmd_status():
     # V12-max5: при запросе статуса — сначала синхронизируем tracked с Upscale
     # (молча убираем orphan'ы, чтобы статус показывал реальные позиции)
+    sync_msg = None
     try:
-        _auto_sync_orphans(verbose_telegram=False)
+        sync_msg = _auto_sync_orphans(verbose_telegram=False)
+        # Если что-то убрано — уведомим в Telegram (даже не в verbose режиме)
+        if sync_msg and ("SYNC:" in sync_msg and "убрано" in sync_msg):
+            if B: B.send_telegram("🧹 " + sync_msg)
     except Exception as e:
         print(f"[prophet V12-max5] status auto-sync error: {e}")
 
@@ -1216,9 +1220,9 @@ def cmd_sync():
 def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     """
     V12-max5: Синхронизация tracked.json с live позициями Upscale.
-    Молча убирает orphan-записи. Если verbose_telegram=True — отправляет отчёт в Telegram.
-
-    Возвращает строку с описанием результата.
+    Убирает orphan-записи:
+      - real orphan: pid не в live_ids → позиция закрыта на Upscale
+      - pending orphan: pending_* старше 60 сек, нет соответствия в live → не открылась
     """
     if not B or not hasattr(B, "EXECUTOR"):
         return "⚠️ Executor недоступен"
@@ -1232,50 +1236,106 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
             return "⚠️ Нет account_id"
         live = UE._as_list(executor.client.positions(executor.account_id))
         live_ids = {UE._pos_id(p) for p in live if isinstance(p, dict)}
+        # Также собираем symbol -> position для matching pending_ по символу
+        live_syms = {}
+        if executor._mk:
+            for lp in live:
+                if not isinstance(lp, dict): continue
+                lp_mid = UE._pos_market(lp)
+                for s, m in executor._mk.items():
+                    if str(m.get("id","")) == lp_mid:
+                        live_syms[s] = UE._pos_id(lp)
+                        break
     except Exception as e:
         return f"⚠️ Ошибка получения live позиций: {e}"
 
     with _tracked_lock:
         tracked = _load_tracked()
 
+    now_ts = int(_now())
+    cleaned_count = 0
+    cleaned_list = []
+
+    # 1. Чистим pending_ orphan'ы (старше 60 сек, не подтверждены в live)
+    for pid in list(tracked.keys()):
+        rec = tracked[pid]
+        if rec.get("status") != "open": continue
+        if not pid.startswith("pending_"): continue
+        sym = rec.get("sym", "?")
+        opened_ts = rec.get("opened_ts", 0)
+        age_sec = now_ts - opened_ts if opened_ts else 0
+        # Если pending_ старше 60 сек и символа нет в live → удаляем
+        if age_sec > 60 and sym not in live_syms:
+            direction = rec.get("direction", rec.get("dir", "long"))
+            with _tracked_lock:
+                tr = _load_tracked()
+                if pid in tr:
+                    tr[pid]["status"] = "closed"
+                    tr[pid]["close_reason"] = "AUTO_SYNC_PENDING_ORPHAN"
+                    tr[pid]["closed_ts"] = now_ts
+                    _save_tracked(tr)
+            cleaned_count += 1
+            cleaned_list.append(f"⏳ {sym} {direction} (pending {age_sec//60}мин, не открылась)")
+        # Если pending_ и символ есть в live → конвертируем в real entry
+        elif sym in live_syms:
+            real_id = live_syms[sym]
+            with _tracked_lock:
+                tr = _load_tracked()
+                if pid in tr:
+                    # Копируем запись под real_id, удаляем pending_
+                    tr[real_id] = tr[pid]
+                    tr[real_id]["close_reason"] = ""
+                    del tr[pid]
+                    _save_tracked(tr)
+            # Регистрируем стратегию
+            try:
+                executor._registry_set(real_id, STRATEGY_TAG)
+            except: pass
+            cleaned_count += 1
+            cleaned_list.append(f"🔄 {sym} (pending→real {real_id})")
+
+    # 2. Чистим real orphan'ы (pid не в live_ids)
+    # Перечитываем tracked после pending_ очистки
+    with _tracked_lock:
+        tracked = _load_tracked()
     open_recs = [(pid, v) for pid, v in tracked.items()
                  if v.get("status") == "open" and not pid.startswith("pending_")]
-    if not open_recs:
-        return "🧹 Нет открытых записей в tracked"
-
-    orphan_count = 0
-    orphan_list = []
-
     for pid, rec in open_recs:
         if pid not in live_ids:
             sym = rec.get("sym", "?")
             direction = rec.get("direction", rec.get("dir", "long"))
             opened_ts = rec.get("opened_ts", 0)
-            age_min = (int(_now()) - opened_ts) / 60 if opened_ts else 0
-            orphan_count += 1
-            orphan_list.append(f"{sym} {direction} ({age_min:.0f}мин назад)")
+            age_min = (now_ts - opened_ts) / 60 if opened_ts else 0
             with _tracked_lock:
                 tr = _load_tracked()
                 if pid in tr:
                     tr[pid]["status"] = "closed"
                     tr[pid]["close_reason"] = "AUTO_SYNC_ORPHAN"
-                    tr[pid]["closed_ts"] = int(_now())
+                    tr[pid]["closed_ts"] = now_ts
                     _save_tracked(tr)
+            cleaned_count += 1
+            cleaned_list.append(f"👻 {sym} {direction} (real, {age_min:.0f}мин, закрыта на Upscale)")
 
-    if orphan_count > 0:
-        msg_lines = [f"🔄 V12-max5 SYNC: убрано {orphan_count} orphan-записей:"]
-        for c in orphan_list:
+    # Перечитываем tracked для финального count
+    tracked_after = _load_tracked()
+    open_n = sum(1 for v in tracked_after.values() if v.get("status") == "open")
+
+    if cleaned_count > 0:
+        msg_lines = [f"🔄 V12-max5 SYNC: убрано {cleaned_count} orphan-записей:"]
+        for c in cleaned_list:
             msg_lines.append(f"  • {c}")
+        msg_lines.append(f"\n📊 Теперь открыто: {open_n}")
         msg = "\n".join(msg_lines)
         if verbose_telegram and B:
             B.send_telegram(msg)
-        # Перечитываем tracked после очистки
-        tracked_after = _load_tracked()
-        open_n = sum(1 for v in tracked_after.values() if v.get("status") == "open")
-        print(f"[prophet V12-max5] auto-sync: убрано {orphan_count} orphan, теперь открыто {open_n}")
-        return f"{msg}\n\n📊 Теперь открыто: {open_n}"
+        print(f"[prophet V12-max5] auto-sync: убрано {cleaned_count} orphan, теперь открыто {open_n}")
+        return msg
     else:
-        return f"✅ SYNC: tracked.json актуален (все {len(open_recs)} записей соответствуют live)"
+        live_count = len(live_ids)
+        msg = f"✅ SYNC: tracked актуален (open в tracked={len(open_recs)}, live на Upscale={live_count})"
+        if verbose_telegram and B:
+            B.send_telegram(msg)
+        return msg
 
 def run_cleaner(reason="AUTO_CLEAN"):
     """
