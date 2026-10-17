@@ -86,9 +86,19 @@ MAX_OPEN = 5           # V12-max5: 5 (V8 было 2, V12-max3 было 3)
 # - 1-я позиция: всегда можно открыть
 # - 2-я, 3-я, 4-я, 5-я: только если ВСЕ предыдущие в этой стороне в плюсе
 MAX_SAME_SIDE = 5      # до 5 LONG или 5 SHORT (при условии пирамидинга)
-# V12: per-side daily stop — блокирует только убыточную сторону
-# Если LONG набрал -$300 за день → блокируем LONG до завтра, SHORT остаётся работать
 SIDE_DAILY_STOP_USD = 300.0  # 3 убытка × $100 = $300, потом блок стороны
+# V12-counter-trend: разные TP для trend vs counter-trend сделок
+# - BULL BTC: LONG (trend) → TP=3.0×ATR, SHORT (counter) → TP=1.5×ATR
+# - BEAR BTC: SHORT (trend) → TP=3.0×ATR, LONG (counter) → TP=1.5×ATR
+TP_TREND = 3.0          # LONG в BULL, SHORT в BEAR — с трендом
+TP_COUNTER = 1.5        # SHORT в BULL, LONG в BEAR — против тренда
+# V12-bear-aware: торговля в BEAR BTC режиме (обе стороны работают!)
+# - BULL BTC (+1): LONG (trend) + SHORT (counter)
+# - BEAR BTC (-1): SHORT (trend) + LONG (counter) ← LONG в BEAR разрешён с TP=1.5
+# - NEUTRAL (0): не торгуем
+BEAR_AWARE_ENABLED = True
+MIN_SCORE_BEAR = 70       # в BEAR режиме строже отбор (vs 60 в BULL)
+BEAR_COOLDOWN_HOURS = 48  # в BEAR режиме 48ч cooldown (vs 24ч в BULL)
 # V12 окна сканов (15 часов, без 7/13/16 — убыточные в бэктестах)
 AUTO_HOURS_MSK = [5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 21, 22]
 SCAN_MINUTE = 15       # V12: сканы строго в :15 МСК (не пересекается с 4H close в :00)
@@ -379,7 +389,16 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
     obv, obv_sm = _obv(c4)
 
     # HARD GATES (общие)
-    if btc_reg != +1: return None
+    # V12-counter-trend: обе стороны работают и в BULL, и в BEAR BTC
+    # - BULL BTC (+1): LONG (trend) + SHORT (counter)
+    # - BEAR BTC (-1): SHORT (trend) + LONG (counter)
+    # - NEUTRAL (0): не торгуем
+    if btc_reg == 0:
+        return None  # NEUTRAL — не торгуем
+    if not BEAR_AWARE_ENABLED:
+        # Старая логика: только BULL
+        if btc_reg != +1: return None
+    # В обоих режимах (BULL/BEAR) разрешаем LONG и SHORT — у каждого свой TP
     if atr_pct < 2.0 or atr_pct > 3.5: return None
     if rsi > 80 or rsi < 20: return None
     lcp = abs(last["close"]-last["open"])/last["open"]*100 if last["open"] > 0 else 0
@@ -479,10 +498,21 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
         score -= 15; details.append("ATRштраф")
 
     score = max(0, min(score, 100))
-    if score < MIN_SCORE: return None
+    # V12-bear-aware: более строгий порог в BEAR режиме
+    min_score_now = MIN_SCORE_BEAR if (BEAR_AWARE_ENABLED and btc_reg == -1) else MIN_SCORE
+    if score < min_score_now: return None
 
-    # V12: динамический TP
-    tp_mult = _get_tp_mult(adx)
+    # V12-counter-trend: TP зависит от направления vs тренда BTC
+    # trend direction = с трендом BTC → TP_TREND (3.0)
+    # counter direction = против тренда BTC → TP_COUNTER (1.5)
+    if btc_reg == +1:
+        # BULL BTC: LONG=trend, SHORT=counter
+        tp_mult = TP_TREND if direction == "LONG" else TP_COUNTER
+    elif btc_reg == -1:
+        # BEAR BTC: SHORT=trend, LONG=counter
+        tp_mult = TP_TREND if direction == "SHORT" else TP_COUNTER
+    else:
+        tp_mult = TP_TREND  # default (NEUTRAL не торгуем, но на всякий)
     sp = SL_MULT * atr_pct
     tp = tp_mult * atr_pct
 
@@ -512,8 +542,13 @@ def do_scan(scan_ts=None):
     scan_dt = dt.datetime.fromtimestamp(scan_ts, tz=MSK)
 
     btc_reg = _btc_regime(scan_ts)
-    if btc_reg != +1:
-        return None
+    # V12-bear-aware: разрешаем BULL и BEAR (но не NEUTRAL)
+    if BEAR_AWARE_ENABLED:
+        if btc_reg == 0:
+            return None  # NEUTRAL — не торгуем
+    else:
+        if btc_reg != +1:
+            return None  # только BULL (старая логика)
 
     # V12: clean expired blacklists
     now_ts = int(_now())
@@ -871,10 +906,13 @@ def manage_positions():
             side_pnl_now = _state.get("long_today_pnl" if direction_field in ("LONG","long") else "short_today_pnl", 0.0)
             # V12: cooldown после убытка
             if pnl < 0:
+                # V12-bear-aware: 48ч cooldown в BEAR, 24ч в BULL
+                btc_reg_close = _btc_regime(int(_now()))
+                cd_hours = BEAR_COOLDOWN_HOURS if (BEAR_AWARE_ENABLED and btc_reg_close == -1) else 24
                 if direction_field in ("LONG", "long"):
-                    _state["long_cooldown_until"] = int(_now()) + 24*3600
+                    _state["long_cooldown_until"] = int(_now()) + cd_hours * 3600
                 else:
-                    _state["short_cooldown_until"] = int(_now()) + 24*3600
+                    _state["short_cooldown_until"] = int(_now()) + cd_hours * 3600
                 # V12: blacklist символа на 7 дней
                 bl = _state.get("symbol_blacklist", {})
                 bl[rec["sym"]] = int(_now()) + 7*24*3600
@@ -1119,10 +1157,14 @@ def cmd_status():
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
     lines.append(f"\n📅 V12-max5 часы: {AUTO_HOURS_MSK} МСК, скан в :{SCAN_MINUTE:02d}")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}")
-    lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}")
-    lines.append(f"TP: динамический (ADX<25 → {TP_MULT_WEAK}×ATR, ADX≥25 → {TP_MULT_STRONG}×ATR)")
+    lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}" + (f" | BEAR ≥{MIN_SCORE_BEAR}" if BEAR_AWARE_ENABLED else ""))
+    lines.append(f"TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
     lines.append(f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)")
+    # V12-counter-trend: показываем что включён
+    if BEAR_AWARE_ENABLED:
+        lines.append(f"🐻 Bear-aware + Counter-trend: BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER}) | BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})")
+        lines.append(f"   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (блокирует только сторону)")
     lines.append(f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)")
     # V12-max5: per-side daily PnL
@@ -1530,12 +1572,13 @@ def start():
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
-            f"📈 TP: динамический (ADX&lt;25 → {TP_MULT_WEAK}×ATR, ADX≥25 → {TP_MULT_STRONG}×ATR)\n"
+            f"📈 TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)\n"
             f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
             f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
             f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)\n"
             f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (LONG/SHORT раздельно)\n"
-            f"🟢 LONG + 🔴 SHORT\n"
+            + (f"🐻 Bear-aware + Counter-trend:\n   BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER})\n   BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})\n   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}\n" if BEAR_AWARE_ENABLED else "")
+            + f"🟢 LONG + 🔴 SHORT (в обе стороны в BULL и BEAR)\n"
             f"📌 Пирамидинг: новые только если предыдущие в плюсе\n"
             f"🔄 Auto-sync orphans + watchdog scanner\n"
             f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
