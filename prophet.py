@@ -919,7 +919,14 @@ _watchdog_thread = None
 
 def _scanner_loop():
     """V12: Главный цикл — сканы строго в HH:15 МСК каждый час из AUTO_HOURS_MSK."""
-    print(f"[prophet V12] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
+    print(f"[prophet V12-max5] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
+    # V12-max5: диагностика TZ — проверяем что часовой пояс правильный
+    _now_diag = dt.datetime.now(MSK)
+    _utc_diag = dt.datetime.now(dt.timezone.utc)
+    print(f"[prophet V12-max5] TZ диагностика: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, разница={(_now_diag.hour - _utc_diag.hour) % 24}ч")
+    if B:
+        try: B.send_telegram(f"🕐 V12-max5 TZ проверка: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, ожидаемая разница=3ч (MSK=UTC+3)")
+        except: pass
     while True:
         try:
             mode = _state.get("scan_mode", "off")
@@ -930,11 +937,28 @@ def _scanner_loop():
             now_ts = int(_now())
 
             # V12: скан строго в HH:15 (окно 10 минут, т.е. :10-:20)
-            # Проверяем что час в AUTO_HOURS_MSK и минута в окне :10-:20
+            # Проверяем что час в AUTO_HOURS_MSK и минута в окне :10-:25
+            # (расширили до :25 чтобы успеть после Donchian в 4H часы)
             if now_dt.hour not in AUTO_HOURS_MSK:
+                # Логируем каждый час для диагностики
+                if now_dt.minute == 0:
+                    print(f"[prophet V12-max5] {now_dt.strftime('%H:%M')} MSK — час {now_dt.hour} не в скан-окне (это норма)")
                 time.sleep(60); continue
-            if not (10 <= now_dt.minute <= 20):
+            if not (10 <= now_dt.minute <= 25):
                 time.sleep(30); continue
+
+            # V12-max5: ИЗБЕГАЕМ КОНФЛИКТА с Donchian 4H
+            # 4H свеча закрывается в 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 MSK
+            # Donchian запускает check_signals() через 5 минут (в :05)
+            # Скан Donchian идёт ~2-3 минуты по 100+ парам
+            # Если Prophet запустится в :15 — может конфликтовать за Gate API
+            # Решение: в часы 4H закрытия (3,7,11,15,19,23) ждём до :20 (Donchian закончил)
+            HOURS_4H_CLOSE = [3, 7, 11, 15, 19, 23]  # MSK часы закрытия 4H свечей
+            if now_dt.hour in HOURS_4H_CLOSE and now_dt.minute < 18:
+                # Ждём пока Donchian закончит свой скан (он идёт в :05-:15)
+                if now_dt.minute == 10:
+                    print(f"[prophet V12-max5] {now_dt.strftime('%H:%M')} MSK — час 4H закрытия, ждём до :18 чтобы не конфликтовать с Donchian")
+                time.sleep(60); continue
 
             # Уже сканировали в этот час?
             last_scan = _state.get("last_scan_ts", 0)
@@ -977,7 +1001,9 @@ def _scanner_loop():
             # Сканируем — отметку ставим ПОСЛЕ успешного скана, не до
             # (если упадёт до отправки сообщения — next iter повторит)
             scan_dt_str = now_dt.strftime("%H:%M")
-            scan_started_msg = f"🔍 V12-max5 скан в {scan_dt_str} МСК (режим={mode}, открыто={open_count}/{MAX_OPEN})"
+            # V12-max5: диагностика — показываем и MSK время и UTC для проверки TZ
+            utc_dt_str = dt.datetime.now(dt.timezone.utc).strftime("%H:%M")
+            scan_started_msg = f"🔍 V12-max5 скан в {scan_dt_str} МСК (UTC={utc_dt_str}, режим={mode}, открыто={open_count}/{MAX_OPEN})"
             print(f"[prophet V12-max5] {scan_started_msg}")
             # V12-max5: уведомляем о старте скана чтобы не было тишины
             if B and mode == "auto":
