@@ -209,15 +209,18 @@ def _can_pyramid(direction: str, tracked: dict) -> tuple:
     # Для последующих — проверяем что ВСЕ предыдущие в плюсе
     profitable = 0
     losing = 0
+    unknown = 0  # V12-fix: не можем проверить цену → не блокируем
     for rec in side_positions:
         sym = rec.get("sym")
         entry = rec.get("entry", 0)
         if not sym or not entry:
+            unknown += 1
             continue
         cur_price = _fetch_current_price_for_sym(sym)
         if not cur_price:
-            # Не можем проверить — считаем что не в плюсе (безопасно)
-            losing += 1
+            # V12-fix: Не можем получить цену → НЕ блокируем (считаем OK)
+            # Прошлая логика блокировала = false positive
+            unknown += 1
             continue
         if side_long:
             # LONG: прибыль если cur > entry
@@ -232,6 +235,11 @@ def _can_pyramid(direction: str, tracked: dict) -> tuple:
 
     if losing > 0:
         return False, f"в {direction} уже {n_side} позиций, {losing} в убытке — пирамидинг запрещён"
+
+    # V12-fix: если есть unknown (не смогли проверить цену) — разрешаем
+    # НЕ блокируем из-за того что не смогли получить цену
+    if unknown > 0:
+        return True, f"в {direction} {n_side} позиций, {profitable} в плюсе, {unknown} неизвестно (не блокируем) — пирамидинг разрешён"
 
     return True, f"в {direction} {n_side} позиций, все в плюсе — пирамидинг разрешён"
 
@@ -1535,20 +1543,67 @@ def cmd_stats():
 # === START ===
 
 def _scanner_watchdog():
-    """V12-max5: Watchdog — если scanner thread умер, перезапускаем его."""
+    """V12-max5: Watchdog — если scanner thread умер ИЛИ завис (heartbeat), перезапускаем.
+    
+    Защита от зависания (как сегодня 13:00→15:35):
+    - scanner thread технически жив (is_alive=True)
+    - Но заблокирован на сетевом вызове (Gate API / Upscale API / sleep)
+    - last_scan_ts не обновлялся > 2 часов в активном режиме
+    
+    Решение: heartbeat check — если нет скана >2ч при mode=auto/continuous, перезапуск.
+    """
+    HEARTBEAT_TIMEOUT_SEC = 2 * 3600  # 2 часа без скана = завис
     while True:
         try:
             time.sleep(120)  # проверка каждые 2 минуты
             mode = _state.get("scan_mode", "off")
             if mode == "off": continue
             global _scanner_thread
+            
+            # Проверка 1: thread умер (классический случай)
             if _scanner_thread is None or not _scanner_thread.is_alive():
                 print(f"[prophet V12-max5] WATCHDOG: scanner thread умер, перезапускаю...")
                 if B:
-                    try: B.send_telegram("🔄 V12-max5: scanner thread перезапускается (watchdog)")
+                    try: B.send_telegram("🔄 V12-max5: scanner thread перезапускается (умер, watchdog)")
                     except: pass
                 _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12-restart")
                 _scanner_thread.start()
+                continue
+            
+            # Проверка 2: thread жив но завис (heartbeat check)
+            # Если сейчас активный час скана (или рядом с ним) и last_scan_ts старый → завис
+            now_msk = dt.datetime.now(MSK)
+            now_ts = int(_now())
+            last_scan = _state.get("last_scan_ts", 0)
+            age_sec = now_ts - last_scan if last_scan else 999999
+            
+            # Проверяем только если сейчас вообще должны быть сканы (в пределах часа от скан-окна)
+            # Не проверяем ночью когда бот может не сканить 4-5 часов подряд
+            current_hour_msk = now_msk.hour
+            # Бот может не сканить 4 часа ночью (между 22 и 5), пропускаем проверку
+            # Сканы: [5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 21, 22]
+            # Большой gap только: 22 → 5 (7 часов), 12 → 14 (2 часа)
+            # Если gap > 2 часов в дневное время — проблема
+            
+            # Если age > 2 часов И это дневное время (между 5:00 и 23:00 МСК)
+            if age_sec > HEARTBEAT_TIMEOUT_SEC and 5 <= current_hour_msk <= 23:
+                last_scan_msk = dt.datetime.fromtimestamp(last_scan, tz=MSK) if last_scan else None
+                last_scan_str = last_scan_msk.strftime("%Y-%m-%d %H:%M") if last_scan_msk else "никогда"
+                age_hours = age_sec / 3600
+                print(f"[prophet V12-max5] WATCHDOG: scanner ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч назад), перезапускаю...")
+                if B:
+                    try: B.send_telegram(
+                        f"🚨 <b>V12-max5: scanner ЗАВИС!</b>\n"
+                        f"Последний скан: {last_scan_str} ({age_hours:.1f}ч назад)\n"
+                        f"Принудительный перезапуск scanner thread."
+                    )
+                    except: pass
+                # Принудительно создаём новый thread
+                _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12-heartbeat-restart")
+                _scanner_thread.start()
+                # Сбрасываем last_scan_ts чтобы следующая проверка не сработала сразу
+                _state["last_scan_ts"] = int(_now())
+                _save()
         except Exception as e:
             print(f"[prophet V12-max5] watchdog error: {e}")
 
