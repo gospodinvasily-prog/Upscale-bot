@@ -1,120 +1,77 @@
-
-
+# -*- coding: utf-8 -*-
 """
-Бот v12.0 — автоматическая торговля стратегией Donchian 4H v2.2 на Upscale.
+Бот v13.0 — Prophet V12-FINAL + Anomaly Scanner A+
+===================================================
+Стратегии:
+  1. Prophet V12-FINAL (Multi-TF Scanner + Counter-trend TP + Bear-aware)
+     - Скан в :30 каждого часа из AUTO_HOURS_MSK
+     - Подтверждение через 15m свечу (:45)
+     - MAX_OPEN=5, counter-trend TP, per-side daily stop
+  2. Anomaly Scanner A+ (5 аномалий)
+     - Скан в :50 каждого часа (24 скана/день)
+     - MAX_OPEN=2, 24ч кулдаун по паре
+     - 5 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion
+  3. Big Candle Strategy (BTC скальпер)
+     - Окно 10:00-11:15 МСК, 15m свечи
 
-Единственная стратегия — donchian_4h_v22 (exec_donchian_4h_v22.py):
-полностью автоматическая, без ручных команд входа/выхода. Логика идентична
-бэктесту bt_donchian_4h_v22_final.py:
-  - Donchian(20) на 4H-свечах (6 сканов в сутки)
-  - BTC SMA(50) режим на 1D
-  - DMI + ATR фильтр 0.6%–2.0%
-  - Trailing 4.5×ATR по CLOSE свечи (не по high/low)
-  - Partial TP +8% favourable → закрыть 50% позиции, остаток в breakeven
-  - Daily Stop today-only -$350 (закрывает только сегодня-открытые убыточные,
-    старые позиции НЕ трогает)
-  - MAX_LOSERS_PER_SIDE=3 (не открываем новые в сторону, где 3+ убыточные)
-  - Cooldown 14 дней после 4 убытков подряд по паре
-  - Compound sizing: max($100, min($250, equity × 0.8%))
-  - DD brake ×0.4 при DD > $900 (восстановление при 85% от пика)
+Команды:
+  /up — статус счёта
+  /hist — история сделок
+  /risk — риск-менеджмент
+  /closeall — закрыть ВСЕ позиции
+  /halt — пауза (новые входы заблокированы)
+  /resume — снять паузу
+  
+  Prophet:
+  /prophet — статус
+  /prophet_on — включить
+  /prophet_off — выключить
+  /prophet_close — закрыть позиции Prophet
+  /prophet_clean — cleaner зависших
+  
+  Anomaly:
+  /anomaly — статус
+  /anomaly_on — включить
+  /anomaly_off — выключить
+  /anomaly_close — закрыть позиции Anomaly
+  /anomaly_clean — cleaner зависших
+  
+  Big Candle:
+  /bc — статус
+  /bc_on /bc_off — вкл/выкл
 
-Два независимых контура защиты:
-  1. Контур стратегии (exec_donchian_4h_v22.py): DAILY_STOP_LOSS = -$350 today-only
-  2. Контур Upscale (upscale_exec.py watchdog):
-     DAY_HARD_FRAC=0.8 → $400 при $10k (close-all + halt до 00:00 UTC)
-     TOT_HARD_FRAC=0.8 → $800 при $10k (close-all + halt + ручной /resume)
-
-Что делает этот файл:
-  - инфраструктура: Gate.io REST API, Telegram, CSV-журнал авто-слоя
-  - EXECUTOR (upscale_exec.py) — реальное исполнение ордеров на Upscale (demo/dry)
-  - каждые 4 часа (после закрытия 4H-свечи UTC + 5 мин буфер) запускает
-    exec_donchian_4h_v22.check_signals() — сканирует пары, шлёт сигналы в EXECUTOR
-  - команды в чате: /up /btc /hist /risk /riskraw /uptest /closeall /halt
-                    /resume /log /scan /state /trail /daily /help
-  - диспетчер бэктестов: RUN_BACKTEST=<mode> запускает соответствующий bt_*.py один раз
-
-Зависимости: requests, upscale_exec.py, exec_donchian_4h_v22.py.
-Переменные окружения: TELEGRAM_TOKEN, LOG_DIR (необязательно).
+Зависимости: requests, upscale_exec.py, prophet.py, anomaly_scanner.py, big_candle_scanner.py
 """
 
-import os
-import re
-import csv
-import signal as _signal
-import html
-import math
-import time
-import threading
-import traceback
-import json
-import requests
-import upscale_exec
-import exec_donchian_4h_v22 as DR42
-# exec_orderflow (айсберг) убран — заменён на Big Candle Strategy
-try:
-    import big_candle_scanner as BCS
-    _BCS_IMPORT_ERR = None
-except Exception as e:
-    BCS = None
-    _BCS_IMPORT_ERR = str(e)
-try:
-    import prophet as PP
-    _PP_IMPORT_ERR = None
-except Exception as e:
-    PP = None
-    _PP_IMPORT_ERR = str(e)
+import os, re, csv, html, math, time, threading, traceback, json, requests
 from datetime import datetime, timezone, timedelta
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID        = "426470592"
-BOT_VERSION    = "v12.0"
-
+BOT_VERSION    = "v13.0"
 MSK = timezone(timedelta(hours=3))
 
+# Риск по умолчанию (Prophet/Anomaly передают свой риск в сигнале)
+RISK_USD    = float(os.environ.get("RISK_USD", "20"))
+MAX_POS_USD = float(os.environ.get("MAX_POS_USD", "3000"))
+
+# BTC VWAP (справочно)
+BTC_VWAP_MARGIN_PCT = float(os.environ.get("BTC_VWAP_MARGIN_PCT", "0.2"))
+VWAP_WINDOW_BARS    = 97
+
+# Лимит запросов к Gate API
+API_RATE_PER_SEC = 12
 GATE = "https://api.gateio.ws/api/v4/futures/usdt"
 
-# ── Риск по умолчанию для EXECUTOR (donchian передаёт свой риск в каждом
-# сигнале — compound sizing от текущего equity Upscale, см.
-# exec_donchian_4h_v22.py — эти значения остаются только как запасной
-# дефолт конструктора Executor, реально по ним торговли не бывает) ──
-RISK_USD      = float(os.environ.get("RISK_USD", "20"))
-MAX_POS_USD   = float(os.environ.get("MAX_POS_USD", "3000"))
-
-# ── BTC VWAP — используется только командой /btc (информационная справка,
-# не влияет на торговлю — donchian сам считает режим BTC по SMA(50)) ──
-BTC_VWAP_MARGIN_PCT = float(os.environ.get("BTC_VWAP_MARGIN_PCT", "0.2"))
-VWAP_WINDOW_BARS    = 97      # ≈ сутки 15м свечей
-
-# ── Расписание скана donchian_4h_v22: 4H свечи закрываются в 00:00, 04:00,
-# 08:00, 12:00, 16:00, 20:00 UTC. Буфер SCAN_BUFFER_SEC (300 = 5 мин) даёт
-# свече зафиксироваться на стороне Gate.io. Скан запускается ОДИН РАЗ на
-# каждую закрытую 4H-свечу — метка последнего скан-таймстампа лежит в файле,
-# чтобы при рестарте Render не отработать повторно за ту же свечу. ──
-SCAN_INTERVAL_SEC = 4 * 3600                  # 4H = 14400 сек
-SCAN_BUFFER_SEC    = int(os.environ.get("DR42_SCAN_BUFFER_SEC", "300"))
-# На Render — Persistent Disk через BOT_DATA_DIR=/var/data; локально — текущая папка
+# Файлы
 _DEFAULT_DIR = os.environ.get("BOT_DATA_DIR", os.environ.get("LOG_DIR", "."))
-SCAN_MARK_FILE     = os.path.join(_DEFAULT_DIR, "donchian_4h_last_scan.txt")
-
-# ── Сеть ──
-API_RATE_PER_SEC = 12      # общий лимит запросов к Gate (с запасом к публичному лимиту)
-
-# ── Логирование авто-слоя ──
-# LOG_DIR по умолчанию = BOT_DATA_DIR (на Render это /var/data)
 LOG_DIR  = os.environ.get("LOG_DIR", _DEFAULT_DIR)
-try:
-    import os as _os
-    _os.makedirs(LOG_DIR, exist_ok=True)
-except Exception:
-    pass
-EXEC_CSV = os.path.join(LOG_DIR, "exec_dry_v8.csv")    # что сделал (или бы сделал) авто-слой
+try: os.makedirs(LOG_DIR, exist_ok=True)
+except: pass
+EXEC_CSV = os.path.join(LOG_DIR, "exec_dry_v8.csv")
 
 # ─── UPSCALE PAIRS ────────────────────────────────────────────────────────────
-
-# Монеты, которые не торгуем. Задаётся переменной EXCLUDE_SYMBOLS через запятую,
-# например EXCLUDE_SYMBOLS=ENA,POPCAT. Кода менять не надо.
 EXCLUDE_SYMBOLS = {x.strip().upper() for x in
                    (os.environ.get("EXCLUDE_SYMBOLS") or "").split(",") if x.strip()}
 
@@ -134,80 +91,89 @@ UPSCALE_PAIRS = [
 if EXCLUDE_SYMBOLS:
     UPSCALE_PAIRS = [p for p in UPSCALE_PAIRS if p.upper() not in EXCLUDE_SYMBOLS]
 
-# ─── ГЛОБАЛЬНОЕ СОСТОЯНИЕ ────────────────────────────────────────────────────
-
-TG_OFFSET = [0]               # id последнего прочитанного сообщения в Telegram
-
-# V12-max5: флаг отключения Donchian 4H (только Donchian, Prophet продолжит)
-# Управляется командами /donchian_off и /donchian_on из Telegram
-DONCHIAN_DISABLED = [False]   # mutable container для доступа из thread'ов
+# ─── ИМПОРТ СТРАТЕГИЙ ────────────────────────────────────────────────────────
+import upscale_exec
+try:
+    import big_candle_scanner as BCS
+    _BCS_IMPORT_ERR = None
+except Exception as e:
+    BCS = None
+    _BCS_IMPORT_ERR = str(e)
+try:
+    import prophet as PP
+    _PP_IMPORT_ERR = None
+except Exception as e:
+    PP = None
+    _PP_IMPORT_ERR = str(e)
+try:
+    import anomaly_scanner as ANOM
+    _ANOM_IMPORT_ERR = None
+except Exception as e:
+    ANOM = None
+    _ANOM_IMPORT_ERR = str(e)
 
 # ─── УТИЛИТЫ ──────────────────────────────────────────────────────────────────
-
-def esc(s) -> str:
-    return html.escape(str(s), quote=False)
-
-def fnum(x, default=0.0) -> float:
+def esc(s): return html.escape(str(s), quote=False)
+def fnum(x, default=0.0):
     try:
         v = float(x)
         return v if math.isfinite(v) else default
-    except (TypeError, ValueError):
-        return default
-
-def pct(a: float, b: float) -> float:
-    """Изменение от a к b в %."""
-    return (b - a) / a * 100 if a else 0.0
-
-def msk_time_str(ts=None) -> str:
-    d = datetime.fromtimestamp(ts, MSK) if ts else datetime.now(MSK)
-    return d.strftime("%H:%M МСК")
+    except: return default
 
 class RateLimiter:
-    """Равномерно распределяет запросы между потоками."""
-    def __init__(self, rate: float):
+    def __init__(self, rate):
         self.interval = 1.0 / rate
         self.lock = threading.Lock()
         self.next_ts = 0.0
-
     def wait(self):
         with self.lock:
             now = time.monotonic()
-            if self.next_ts < now:
-                self.next_ts = now
+            if self.next_ts < now: self.next_ts = now
             delay = self.next_ts - now
             self.next_ts += self.interval
-        if delay > 0:
-            time.sleep(delay)
+        if delay > 0: time.sleep(delay)
 
 LIMITER = RateLimiter(API_RATE_PER_SEC)
 
-def api_get(path: str, params: dict, timeout: int = 8):
+def api_get(path, params, timeout=8):
     url = f"{GATE}/{path}"
     for attempt in range(2):
         LIMITER.wait()
         try:
             r = requests.get(url, params=params, timeout=timeout)
-            if r.status_code == 429:
-                time.sleep(1.5)
-                continue
-            if r.status_code != 200:
-                return None
+            if r.status_code == 429: time.sleep(1.5); continue
+            if r.status_code != 200: return None
             return r.json()
         except Exception as e:
-            if attempt == 1:
-                print(f"[API ERROR] {path} {params.get('contract', '')}: {e}")
+            if attempt == 1: print(f"[API ERROR] {path}: {e}")
     return None
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
+def _escape_stray(text):
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "&":
+            m = re.match(r"&(amp|lt|gt|quot|#\d+);", text[i:])
+            out.append(text[i:i+m.end()] if m else "&amp;")
+            i += m.end() if m else 1; continue
+        if ch == "<":
+            m = re.match(r"</?([a-zA-Z0-9]+)(\s[^<>]*)?/?>", text[i:])
+            if m and m.group(1).lower() in ("b","i","u","s","code","pre","a"):
+                out.append(text[i:i+m.end()]); i += m.end(); continue
+            out.append("&lt;"); i += 1; continue
+        out.append(ch); i += 1
+    return "".join(out)
 
-def send_telegram(text: str):
-    # Экранируем ПЕРЕД отправкой: любой одиночный "<" (например, из текста
-    # ошибки HTTP, в котором могла прилететь HTML-страница 502/503 от
-    # Upscale) иначе ловит 400 "can't parse entities", и сообщение тихо
-    # не доходит — а это бьёт и по самым важным алертам (аварийная защита,
-    # close-all не принят). Раньше это экранирование было только в
-    # send_blocks(), а send_telegram() вызывается напрямую из upscale_exec.py
-    # и exec_donchian_regime_v42.py почти везде.
+def _balance_html(text):
+    text = _escape_stray(text)
+    for tag in ("b","i","code","pre","u","s"):
+        opened = text.count(f"<{tag}>") - text.count(f"</{tag}>")
+        if opened > 0: text += f"</{tag}>" * opened
+        elif opened < 0: text = f"<{tag}>" * (-opened) + text
+    return text
+
+def send_telegram(text):
     text = _balance_html(text)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -217,467 +183,333 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
-def send_document(path: str, caption: str = ""):
-    """Отправляет файл в Telegram. На Render диск стирается при каждом деплое —
-    так статистика сохраняется у пользователя в чате."""
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        return
+def send_document(path, caption=""):
+    if not os.path.exists(path) or os.path.getsize(path) == 0: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
         with open(path, "rb") as f:
             r = requests.post(url, data={"chat_id": CHAT_ID, "caption": caption},
                               files={"document": (os.path.basename(path), f)}, timeout=30)
-        r.raise_for_status()
+            r.raise_for_status()
     except Exception as e:
         print(f"[TG DOC ERROR] {path}: {e}")
 
-_HTML_OK = ("b", "i", "u", "s", "code", "pre", "a")
-
-def _escape_stray(text: str) -> str:
-    """Экранирует «<» и «&», которые НЕ являются частью разрешённого тега.
-    Telegram отвечает 400 «can't parse entities», если встретит одиночный «<»."""
-    out, i, n = [], 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "&":
-            m = re.match(r"&(amp|lt|gt|quot|#\d+);", text[i:])
-            out.append(text[i:i + m.end()] if m else "&amp;")
-            i += m.end() if m else 1
-            continue
-        if ch == "<":
-            m = re.match(r"</?([a-zA-Z0-9]+)(\s[^<>]*)?/?>", text[i:])
-            if m and m.group(1).lower() in _HTML_OK:
-                out.append(text[i:i + m.end()])
-                i += m.end()
-                continue
-            out.append("&lt;")
-            i += 1
-            continue
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-def _balance_html(text: str) -> str:
-    """Закрывает теги, оставшиеся открытыми в куске (при разбиении длинного
-    сообщения на части Telegram ломается на непарных тегах)."""
-    text = _escape_stray(text)
-    for tag in ("b", "i", "code", "pre", "u", "s"):
-        opened = text.count(f"<{tag}>") - text.count(f"</{tag}>")
-        if opened > 0:
-            text += f"</{tag}>" * opened
-        elif opened < 0:
-            text = f"<{tag}>" * (-opened) + text
-    return text
-
-def send_blocks(blocks: list, limit: int = 3800):
-    """Telegram режет сообщения > 4096 символов — собираем блоки в пачки."""
-    buf = ""
-    for b in blocks:
-        while len(b) > limit:
-            cut = b.rfind(" ", 0, limit) or limit
-            if buf:
-                send_telegram(_balance_html(buf))
-                buf = ""
-            send_telegram(_balance_html(b[:cut]))
-            b = b[cut:].lstrip()
-        if buf and len(buf) + len(b) + 1 > limit:
-            send_telegram(_balance_html(buf))
-            buf = ""
-        buf = f"{buf}\n{b}" if buf else b
-    if buf:
-        send_telegram(_balance_html(buf))
-
 # ─── СВЕЧИ ────────────────────────────────────────────────────────────────────
-
-def parse_candles(raw) -> list:
+def parse_candles(raw):
     out = []
-    if not isinstance(raw, list):
-        return out
+    if not isinstance(raw, list): return out
     for c in raw:
         try:
             out.append({"t": int(c["t"]), "o": float(c["o"]), "h": float(c["h"]),
                         "l": float(c["l"]), "c": float(c["c"]), "v": fnum(c.get("v", 0))})
-        except (KeyError, TypeError, ValueError):
-            continue
+        except: continue
     out.sort(key=lambda x: x["t"])
     return out
 
-def split_closed(candles: list, interval_sec: int, now_ts: float):
-    """Закрытые свечи определяем по времени, а не по позиции [-2]."""
-    closed = [c for c in candles if c["t"] + interval_sec <= now_ts]
-    forming = candles[-1] if candles and candles[-1]["t"] + interval_sec > now_ts else None
-    price = candles[-1]["c"] if candles else 0.0
-    return closed, forming, price
+def get_candles(symbol, interval, limit):
+    return parse_candles(api_get("candlesticks", {"contract": f"{symbol}_USDT", "interval": interval, "limit": limit}))
 
-def get_candles(symbol: str, interval: str, limit: int) -> list:
-    return parse_candles(api_get("candlesticks", {"contract": f"{symbol}_USDT",
-                                                  "interval": interval, "limit": limit}))
-
-# ─── BTC VWAP (справочная команда /btc — не используется стратегией) ────────
-
-def vwap_rolling(candles: list):
-    """VWAP по последним VWAP_WINDOW_BARS закрытым 15м свечам (≈ сутки)."""
+# ─── BTC VWAP (справочно) ─────────────────────────────────────────────────────
+def vwap_rolling(candles):
     seg = candles[-VWAP_WINDOW_BARS:]
     vol = sum(c["v"] for c in seg)
-    if not seg or vol <= 0:
-        return None
-    return sum((c["h"] + c["l"] + c["c"]) / 3 * c["v"] for c in seg) / vol
+    if not seg or vol <= 0: return None
+    return sum((c["h"]+c["l"]+c["c"])/3 * c["v"] for c in seg) / vol
 
-def btc_bias(now_ts=None) -> dict:
-    """Уклон BTC: цена последней ЗАКРЫТОЙ 15м свечи относительно своего VWAP.
-    Чисто информационная справка для /btc — реальный режим, который
-    использует стратегия donchian, это BTC SMA(50) на дневных свечах."""
+def btc_bias(now_ts=None):
     now_ts = now_ts or time.time()
     raw = get_candles("BTC", "15m", VWAP_WINDOW_BARS + 8)
-    closed, _, price = split_closed(raw, 900, now_ts)
-    if len(closed) < 40:
-        return {"bias": None, "dev": 0.0, "price": price, "vwap": None}
+    closed = [c for c in raw if c["t"] + 900 <= now_ts]
+    price = raw[-1]["c"] if raw else 0.0
+    if len(closed) < 40: return {"bias": None, "dev": 0.0, "price": price, "vwap": None}
     vw = vwap_rolling(closed)
-    if not vw:
-        return {"bias": None, "dev": 0.0, "price": price, "vwap": None}
+    if not vw: return {"bias": None, "dev": 0.0, "price": price, "vwap": None}
     dev = (closed[-1]["c"] - vw) / vw * 100
-    m = BTC_VWAP_MARGIN_PCT
-    bias = "long" if dev > m else "short" if dev < -m else "neutral"
+    bias = "long" if dev > BTC_VWAP_MARGIN_PCT else "short" if dev < -BTC_VWAP_MARGIN_PCT else "neutral"
     return {"bias": bias, "dev": dev, "price": price, "vwap": vw}
 
-def btc_line(b: dict) -> str:
-    if not b or b.get("bias") is None:
-        return "₿ BTC: данных нет"
-    ico = {"long": "🟢 лонг", "short": "🔴 шорт", "neutral": "⚪ нейтраль"}[b["bias"]]
+def btc_line(b):
+    if not b or b.get("bias") is None: return "₿ BTC: данных нет"
+    ico = {"long":"🟢 лонг","short":"🔴 шорт","neutral":"⚪ нейтраль"}[b["bias"]]
     side = "выше" if b["dev"] >= 0 else "ниже"
-    return (f"₿ BTC VWAP-уклон: {ico} ({abs(b['dev']):.2f}% {side} VWAP, "
-            f"запас {BTC_VWAP_MARGIN_PCT}%)")
+    return f"₿ BTC VWAP: {ico} ({abs(b['dev']):.2f}% {side} VWAP)"
 
 # ─── CSV ──────────────────────────────────────────────────────────────────────
-
-def _append_csv(path: str, row: dict):
+def _append_csv(path, row):
     try:
         header = ",".join(row.keys())
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 first = f.readline().strip()
-            if first != header:   # колонки изменились (новая версия) — старый файл в архив
-                os.replace(path, f"{path}.old-{int(time.time())}")
+            if first != header: os.replace(path, f"{path}.old-{int(time.time())}")
         new = not os.path.exists(path)
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(row.keys()))
-            if new:
-                w.writeheader()
+            if new: w.writeheader()
             w.writerow(row)
     except Exception as e:
         print(f"[CSV ERROR] {path}: {e}")
 
-# ─── АВТО-СЛОЙ UPSCALE ────────────────────────────────────────────────────────
-# EXECUTOR — общий исполнитель ордеров на Upscale (upscale_exec.py). Единственный
-# источник сигналов для него теперь — donchian_regime_v42 (exec_donchian_regime_v42.py),
-# которая передаёт риск/лимит позиции прямо в каждом сигнале (compound sizing от
-# текущего equity), поэтому RISK_USD/MAX_POS_USD ниже используются только как
-# запасной дефолт конструктора.
+# ─── EXECUTOR ─────────────────────────────────────────────────────────────────
 EXECUTOR = upscale_exec.Executor(send_telegram, lambda row: _append_csv(EXEC_CSV, row),
                                  RISK_USD, MAX_POS_USD, UPSCALE_PAIRS + ["BTC"])
 
-# ─── КОМАНДЫ В ЧАТЕ ───────────────────────────────────────────────────────────
-
+# ─── TELEGRAM COMMANDS ────────────────────────────────────────────────────────
+TG_OFFSET = [0]
 TG_READ = {"fails": 0, "quiet_until": 0.0, "conflicts": 0}
 
 def tg_drop_webhook():
-    """Если у бота стоит webhook, getUpdates не работает (ошибка 409).
-    Снимаем его один раз при старте — команды в чате должны читаться."""
-    if not TELEGRAM_TOKEN:
-        return
+    if not TELEGRAM_TOKEN: return
     try:
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
                          params={"drop_pending_updates": "false"}, timeout=10)
         if r.ok and r.json().get("ok"):
-            print("[TG] webhook снят (если был) — команды читаются через getUpdates")
-    except Exception as e:
-        print(f"[TG] не удалось снять webhook: {e}")
+            print("[TG] webhook снят")
+    except: pass
 
 def tg_updates():
-    """Новые сообщения из чата (короткий опрос, никаких доп. настроек не нужно)."""
-    if not TELEGRAM_TOKEN or time.time() < TG_READ["quiet_until"]:
-        return []
+    if not TELEGRAM_TOKEN or time.time() < TG_READ["quiet_until"]: return []
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     try:
         r = requests.get(url, params={"offset": TG_OFFSET[0] + 1, "timeout": 0, "limit": 20}, timeout=10)
         r.raise_for_status()
         data = r.json()
-        TG_READ["fails"] = 0
-        TG_READ["conflicts"] = 0
+        TG_READ["fails"] = 0; TG_READ["conflicts"] = 0
         out = []
         for u in data.get("result", []) if data.get("ok") else []:
             TG_OFFSET[0] = max(TG_OFFSET[0], u.get("update_id", 0))
-            # Проверяем callback_query (inline keyboard)
             cb = u.get("callback_query")
             if cb:
                 cb_data = cb.get("data", "")
                 if cb_data.startswith("prophet_") and PP is not None:
-                    try:
-                        PP.on_callback(cb_data)
-                    except Exception as e:
-                        print(f"[PP] callback error: {e}")
-                # Answer callback чтобы убрать loading
+                    try: PP.on_callback(cb_data)
+                    except: pass
                 try:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
                                   json={"callback_query_id": cb.get("id", "")}, timeout=5)
                 except: pass
                 continue
             msg = u.get("message") or u.get("channel_post") or {}
-            if str(msg.get("chat", {}).get("id")) != str(CHAT_ID):
-                continue
+            if str(msg.get("chat", {}).get("id")) != str(CHAT_ID): continue
             text = (msg.get("text") or "").strip()
-            if text:
-                out.append(text)
+            if text: out.append(text)
         return out
     except requests.HTTPError as e:
-        # 409 = сообщения уже читает другой экземпляр бота. При деплое Render
-        # ненадолго держит два контейнера — это нормально и проходит само.
         if getattr(e.response, "status_code", 0) == 409:
             TG_READ["conflicts"] += 1
             TG_READ["quiet_until"] = time.time() + 60
-            if TG_READ["conflicts"] in (1, 5, 20):
-                print(f"[TG] 409: команды читает другой экземпляр бота "
-                      f"(обычно старый контейнер при деплое). Попытка {TG_READ['conflicts']}.")
-            if TG_READ["conflicts"] == 20:
-                send_telegram("⚠️ Команды в чате не читаются уже 20 минут: похоже, "
-                              "запущено два экземпляра бота. Проверь, что в Render "
-                              "работает только один сервис.")
         return []
     except Exception as e:
         TG_READ["fails"] += 1
-        if TG_READ["fails"] <= 3:
-            print(f"[TG READ ERROR] {e}")
-        else:
+        if TG_READ["fails"] > 3:
             TG_READ["quiet_until"] = time.time() + 600
             TG_READ["fails"] = 0
-            print("[TG READ] команды временно отключены на 10 мин (ошибки чтения)")
         return []
 
 HELP_TEXT = (
-    "<b>📊 СТАТИСТИКА С БИРЖИ</b>\n"
-    "/hist — результаты закрытых сделок: по дням, по монетам, в единицах риска\n"
-    "        <i>/hist 30 — за 30 дней (по умолчанию 7). Эти данные не теряются при перезапуске</i>\n"
-    "/up — версия, режим, эквити, открытые позиции, статус donchian_4h_v22\n"
-    "/risk — баланс, просадка, до лимитов Upscale\n"
-    "/riskraw — то же сырым ответом API (для разбора проблем)\n"
-    "/btc — уклон биткоина по VWAP (справочно; стратегия сама считает режим по SMA(50))\n"
+    "<b>📊 СТАТИСТИКА</b>\n"
+    "/up — статус счёта + все стратегии\n"
+    "/status — обзор всех стратегий\n"
+    "/hist — история сделок\n"
+    "/risk — риск-менеджмент\n"
+    "/btc — уклон BTC\n"
     "\n<b>⚙️ УПРАВЛЕНИЕ</b>\n"
-    "/halt — пауза: новых входов не будет, открытые позиции и их ордера остаются\n"
-    "/resume — снять паузу (включая сброс аварийки TOTAL)\n"
-    "/closeall — закрыть все позиции на демо\n"
-    "/uptest — тест связи: открыть и сразу закрыть BTC на демо\n"
-    "\n<b>🔬 СТРАТЕГИЯ donchian_4h_v22</b>\n"
-    "/scan — ручной запуск скана (не ждать следующей 4H-свечи)\n"
-    "/state — состояние: cooldown, today_realized, day_loss_stop, prev_day_pnl\n"
-    "/trail — текущие trailing-стопы всех открытых donchian-позиций\n"
-    "/daily — P&L дня (сегодня, вчера) с разбивкой по причинам выхода\n"
-    "/donchian_off — ⏸️ отключить новые входы 4H (Prophet продолжит)\n"
-    "/donchian_on — ▶️ включить новые входы 4H\n"
-    "/donchian_status — статус флага\n"
-    "/closeall — 🛑 закрыть ВСЕ позиции (и Prophet, и Donchian)\n"
-    "\n<b>📒 ЖУРНАЛЫ</b>\n"
-    "/log — прислать журнал авто-слоя (CSV) прямо сейчас — только по вызову\n"
-    "\n<b>🚨 BIG CANDLE STRATEGY (BTC скальпер)</b>\n"
-    "/bc — статус стратегии (окно, лимиты, winrate)\n"
-    "/bc_on — включить авто-торговлю\n"
-    "/bc_off — выключить авто-торговлю (только алерты)\n"
-    "/bc_close — принудительно закрыть открытую BC позицию\n"
-    "/bc_stats — winrate, PnL, статистика\n"
-    "/bc_log — прислать CSV журналы сигналов и сделок\n"
-    "\n<b>🔮 ПРОРОК (Multi-TF Scanner)</b>\n"
+    "/halt — пауза (новые входы заблокированы)\n"
+    "/resume — снять паузу\n"
+    "/closeall — закрыть ВСЕ позиции\n"
+    "\n<b>🔮 PROPHET V12-FINAL</b>\n"
     "/prophet — статус\n"
-    "/prophet_scan — один скан сейчас\n"
-    "/prophet_scan on — непрерывный скан (каждый час)\n"
-    "/prophet_scan off — остановить\n"
-    "/prophet_auto on — авто (11:00/15:00 МСК)\n"
-    "/prophet_auto off — остановить\n"
-    "/prophet_close — закрыть позицию\n"
-    "/prophet_clean — ручной cleaner зависших позиций\n"
-    "/prophet_stats — статистика\n"
-    "\nСтратегия: <b>donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая. "
-    "Сканирует каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, "
-    "16:05, 20:05 UTC). Два контура защиты: стратегийный -$350 today-only + Upscale "
-    "аварийка $400/$800 (close-all + halt)."
+    "/prophet_on — включить\n"
+    "/prophet_off — выключить\n"
+    "/prophet_close — закрыть позиции Prophet\n"
+    "/prophet_clean — cleaner зависших\n"
+    "\n<b>🚨 ANOMALY SCANNER A+</b>\n"
+    "/anomaly — статус\n"
+    "/anomaly_on — включить\n"
+    "/anomaly_off — выключить\n"
+    "/anomaly_close — закрыть позиции Anomaly\n"
+    "/anomaly_clean — cleaner зависших\n"
+    "\n<b>🚨 BIG CANDLE (BTC скальпер)</b>\n"
+    "/bc — статус\n"
+    "/bc_on — включить\n"
+    "/bc_off — выключить\n"
+    "/bc_close — закрыть позицию\n"
+    "/bc_stats — статистика\n"
 )
 
-def handle_command(text: str) -> str:
+def _all_strategies_status():
+    """Общий обзор всех стратегий: статус, открытые сделки, PnL."""
+    lines = ["", "━━━ 📊 Обзор стратегий ━━━"]
+    
+    # Prophet
+    if PP is not None:
+        try:
+            pp_mode = PP._state.get("scan_mode", "off")
+            pp_status = "🟢 ВКЛ" if pp_mode == "auto" else "🔴 ВЫКЛ"
+            pp_tracked = PP._load_tracked()
+            pp_open = [(v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0)) 
+                       for v in pp_tracked.values() 
+                       if v.get("status") == "open" and not any(k.startswith("pending_") for k in [k for k,v2 in pp_tracked.items() if v2 == v])]
+            pp_open_clean = []
+            for pid, v in pp_tracked.items():
+                if v.get("status") == "open" and not pid.startswith("pending_"):
+                    pp_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0)))
+            lines.append(f"\n🔮 Prophet V12: {pp_status} | открыто: {len(pp_open_clean)}/{PP.MAX_OPEN}")
+            lines.append(f"   сканов: {PP._stats['scans']} | сигналов: {PP._stats['signals']} | сделок: {PP._stats['trades']}")
+            if PP._stats["trades"] > 0:
+                wr = PP._stats['wins']/PP._stats['trades']*100
+                lines.append(f"   WR: {wr:.0f}% | PnL: ${PP._stats['pnl']:+.2f}")
+            for sym, dir_v, entry in pp_open_clean:
+                emoji = "🟢" if dir_v in ("LONG","long") else "🔴"
+                lines.append(f"   {emoji} {sym} @ ${entry:.4g}")
+        except Exception as e:
+            lines.append(f"\n🔮 Prophet: ⚠️ {e}")
+    else:
+        lines.append(f"\n🔮 Prophet: ❌ не загружен")
+    
+    # Anomaly
+    if ANOM is not None:
+        try:
+            an_mode = ANOM._state.get("scan_mode", "off")
+            an_status = "🟢 ВКЛ" if an_mode == "auto" else "🔴 ВЫКЛ"
+            an_tracked = ANOM._load_tracked()
+            an_open_clean = []
+            for pid, v in an_tracked.items():
+                if v.get("status") == "open" and not pid.startswith("pending_"):
+                    an_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0), v.get("n_anomalies",0)))
+            lines.append(f"\n🚨 Anomaly A+: {an_status} | открыто: {len(an_open_clean)}/{ANOM.MAX_OPEN}")
+            lines.append(f"   сканов: {ANOM._stats['scans']} | сигналов: {ANOM._stats['signals']} | сделок: {ANOM._stats['trades']}")
+            if ANOM._stats["trades"] > 0:
+                wr = ANOM._stats['wins']/ANOM._stats['trades']*100
+                lines.append(f"   WR: {wr:.0f}% | PnL: ${ANOM._stats['pnl']:+.2f}")
+            for sym, dir_v, entry, n_anom in an_open_clean:
+                emoji = "🟢" if dir_v in ("LONG","long") else "🔴"
+                lines.append(f"   {emoji} {sym} @ ${entry:.4g} ({n_anom}/5)")
+        except Exception as e:
+            lines.append(f"\n🚨 Anomaly: ⚠️ {e}")
+    else:
+        lines.append(f"\n🚨 Anomaly: ❌ не загружен")
+    
+    # Big Candle
+    if BCS is not None:
+        try:
+            bc_enabled = BCS._state.get("enabled", False)
+            bc_status = "🟢 ВКЛ" if bc_enabled else "🔴 ВЫКЛ"
+            bc_tracked = BCS._load_tracked()
+            bc_open = sum(1 for v in bc_tracked.values() if v.get("status") == "open")
+            lines.append(f"\n🚨 Big Candle: {bc_status} | открыто: {bc_open}")
+            lines.append(f"   сигналов: {BCS._stats['signals_total']} | сделок: {BCS._stats['trades_opened']}/{BCS._stats['trades_closed']}")
+        except Exception as e:
+            lines.append(f"\n🚨 Big Candle: ⚠️ {e}")
+    else:
+        lines.append(f"\n🚨 Big Candle: ❌ не загружен")
+    
+    # Общий итог
+    total_open = 0
+    if PP is not None:
+        try:
+            pp_tr = PP._load_tracked()
+            total_open += sum(1 for v in pp_tr.values() if v.get("status") == "open" and not any(k.startswith("pending_") for k in [k for k,v2 in pp_tr.items() if v2 == v]))
+        except: pass
+    if ANOM is not None:
+        try:
+            an_tr = ANOM._load_tracked()
+            total_open += sum(1 for v in an_tr.values() if v.get("status") == "open" and not any(k.startswith("pending_") for k in [k for k,v2 in an_tr.items() if v2 == v]))
+        except: pass
+    if BCS is not None:
+        try:
+            bc_tr = BCS._load_tracked()
+            total_open += sum(1 for v in bc_tr.values() if v.get("status") == "open")
+        except: pass
+    
+    lines.append(f"\n📊 Всего открыто позиций: {total_open}")
+    lines.append(f"🤖 EXECUTOR halted: {'да' if EXECUTOR.halted else 'нет'}")
+    
+    return "\n".join(lines)
+
+
+def handle_command(text):
     parts = text.replace(",", ".").split()
-    if not parts or not parts[0].startswith("/"):
-        return ""
+    if not parts or not parts[0].startswith("/"): return ""
     cmd = parts[0].lower().split("@")[0]
-    arg = parts[1].upper() if len(parts) > 1 else ""
+    arg = parts[1] if len(parts) > 1 else ""
 
     if cmd == "/up":
-        return EXECUTOR.status() + "\n" + DR42.status_report()
+        return EXECUTOR.status() + "\n\n" + _all_strategies_status()
+    if cmd == "/status":
+        return _all_strategies_status()
     if cmd == "/btc":
         b = btc_bias()
         return btc_line(b) + (f"\nVWAP {b['vwap']:.2f}, цена {b['price']:.2f}" if b.get("vwap") else "")
     if cmd in ("/hist", "/history", "/trades"):
-        days = int(arg) if arg.isdigit() else 7      # /hist 30 — за 30 дней
+        days = int(arg) if arg.isdigit() else 7
         return EXECUTOR.history(max(1, min(60, days)))
     if cmd == "/risk":
         return EXECUTOR.risk_summary()
-    if cmd == "/riskraw":
-        return EXECUTOR.risk_dump()
-    if cmd == "/uptest":
-        return EXECUTOR.selftest()
     if cmd == "/closeall":
         return EXECUTOR.closeall()
     if cmd == "/halt":
         return EXECUTOR.halt()
     if cmd == "/resume":
         return EXECUTOR.resume()
-    if cmd == "/scan":
-        # Ручной запуск скана в отдельном потоке, чтобы команда ответила быстро
-        def _run_scan():
-            try:
-                if DONCHIAN_DISABLED[0]:
-                    send_telegram("⏸️ Donchian 4H отключён командой /donchian_off\nИспользуй /donchian_on для включения")
-                    return
-                DR42.check_signals()
-            except Exception as e:
-                send_telegram(f"⚠️ /scan ошибка: {esc(str(e))}")
-        threading.Thread(target=_run_scan, daemon=True, name="manual-scan").start()
-        return "🔍 Запускаю ручной скан donchian_4h_v22 — результат будет в чате."
-    if cmd == "/cleanup":
-        # Ручная очистка ghost-позиций: сверяет tracked_positions с live_positions Upscale
-        # и удаляет те которых нет на Upscale (ghost'ы после отклонённых ордеров)
-        def _run_cleanup():
-            try:
-                # 1. Получаем live позиции с Upscale
-                EXECUTOR._ensure_account()
-                if not EXECUTOR.client or not EXECUTOR.account_id:
-                    send_telegram("⚠️ /cleanup: нет клиента Upscale")
-                    return
-                EXECUTOR._refresh_markets()
-                live_positions = upscale_exec._as_list(EXECUTOR.client.positions(EXECUTOR.account_id))
-                live_syms = set()
-                for p in live_positions:
-                    if not isinstance(p, dict):
-                        continue
-                    lp_mid = upscale_exec._pos_market(p)
-                    if EXECUTOR._mk:
-                        for s, m in EXECUTOR._mk.items():
-                            if str(m.get("id", "")) == lp_mid:
-                                live_syms.add(s)
-                                break
-                # 2. Читаем tracked_positions
-                tracked = DR42._load_tracked_positions() if hasattr(DR42, '_load_tracked_positions') else upscale_exec._load_json(DR42.OPEN_POS_FILE, {})
-                tracked_syms = set(tracked.keys())
-                # 3. Находим ghost'ы
-                ghosts = tracked_syms - live_syms
-                missing_real = live_syms - tracked_syms
-                # 4. Удаляем ghost'ы
-                if ghosts:
-                    for s in ghosts:
-                        del tracked[s]
-                    DR42._save_tracked_positions(tracked) if hasattr(DR42, '_save_tracked_positions') else upscale_exec._atomic_write_json(DR42.OPEN_POS_FILE, tracked)
-                    send_telegram(
-                        f"🧹 <b>/cleanup готово</b>\n"
-                        f"✅ Удалено ghost-позиций: {len(ghosts)}\n"
-                        f"   → {', '.join(sorted(ghosts))}\n"
-                        f"📊 Tracked: {len(tracked_syms)} → {len(tracked_syms - ghosts)}\n"
-                        f"📊 Live на Upscale: {len(live_syms)}\n"
-                        + (f"⚠️ Live без tracked: {', '.join(sorted(missing_real))}" if missing_real else "")
-                    )
-                else:
-                    send_telegram(
-                        f"🧹 <b>/cleanup готово</b>\n"
-                        f"Ghost-позиций не найдено ✅\n"
-                        f"📊 Tracked: {len(tracked_syms)} | Live: {len(live_syms)}\n"
-                        + (f"⚠️ Live без tracked: {', '.join(sorted(missing_real))}" if missing_real else "")
-                    )
-            except Exception as e:
-                send_telegram(f"⚠️ /cleanup ошибка: {esc(str(e))}")
-        threading.Thread(target=_run_cleanup, daemon=True, name="manual-cleanup").start()
-        return "🧹 Запускаю очистку ghost-позиций..."
-    if cmd == "/state":
-        return DR42.state_report()
-    if cmd == "/trail":
-        return DR42.trail_report()
-    if cmd == "/daily":
-        return DR42.daily_report()
-    if cmd in ("/log", "/files", "/journal"):
+    if cmd in ("/log", "/files"):
         today = datetime.now(MSK).strftime("%Y-%m-%d")
-        sent = 0
         if os.path.exists(EXEC_CSV) and os.path.getsize(EXEC_CSV) > 0:
             send_document(EXEC_CSV, f"{today} — авто-слой")
-            sent += 1
-        return f"📒 Отправлено файлов: {sent}" if sent else "📒 Журналы пока пустые."
-    if cmd == "/dr42":
-        return DR42.status_report()
-    # ─── V12-max5: Управление Donchian 4H (без остановки Prophet) ──────────────
-    if cmd == "/donchian_off":
-        DONCHIAN_DISABLED[0] = True
-        return ("⏸️ <b>Donchian 4H отключён</b>\n"
-                "Новые входы от donchian_4h_v22 заблокированы.\n"
-                "Открытые позиции продолжают работать (trailing, TP).\n"
-                "Prophet V12-max5 продолжает работать как обычно.\n"
-                "Команды: /donchian_on — включить, /donchian_status — статус")
-    if cmd == "/donchian_on":
-        DONCHIAN_DISABLED[0] = False
-        return ("▶️ <b>Donchian 4H включён</b>\n"
-                "Авто-скан каждые 4H восстановлен.\n"
-                "Prophet V12-max5 работает как обычно.")
-    if cmd == "/donchian_status":
-        state = "⏸️ ОТКЛЮЧЕН" if DONCHIAN_DISABLED[0] else "▶️ ВКЛЮЧЁН"
-        return (f"📊 <b>Donchian 4H: {state}</b>\n"
-                f"Prophet V12-max5: работает независимо\n"
-                f"EXECUTOR halted: {'да' if EXECUTOR.halted else 'нет'}\n"
-                f"Команды: /donchian_off, /donchian_on")
-    # ─── Big Candle команды ──────────────────────────────────────────────────
-    if cmd == "/bc":
-        if BCS is None:
-            return f"⚠️ Big Candle не загружен: {_BCS_IMPORT_ERR}"
-        return BCS.status_report()
-    if cmd == "/bc_on":
-        if BCS is None:
-            return "⚠️ Big Candle не загружен"
-        return BCS.cmd_on()
-    if cmd == "/bc_off":
-        if BCS is None:
-            return "⚠️ Big Candle не загружен"
-        return BCS.cmd_off()
-    if cmd == "/bc_close":
-        if BCS is None:
-            return "⚠️ Big Candle не загружен"
-        return BCS.cmd_close()
-    if cmd == "/bc_stats":
-        if BCS is None:
-            return "⚠️ Big Candle не загружен"
-        return BCS.cmd_stats()
-    if cmd == "/bc_log":
-        if BCS is None:
-            return "⚠️ Big Candle не загружен"
-        return BCS.cmd_log()
-    if cmd == "/bigcandle":
-        # алиас для /bc
-        if BCS is None:
-            return "⚠️ Big Candle не загружен"
-        return BCS.status_report()
-    # ─── Prophet команды ──────────────────────────────────────────────────────
+            return "📒 Отправлено"
+        return "📒 Журналы пустые"
+
+    # ─── Prophet V12-FINAL ──────────────────────────────────────────────────
     if cmd == "/prophet":
         if PP is None: return f"⚠️ Prophet не загружен: {_PP_IMPORT_ERR}"
         return PP.cmd_status()
-    if cmd.startswith("/prophet_scan"):
+    if cmd == "/prophet_on":
         if PP is None: return "⚠️ Prophet не загружен"
-        parts = text.split()
-        arg = parts[1] if len(parts) > 1 else ""
-        return PP.cmd_scan(arg)
-    if cmd.startswith("/prophet_auto"):
+        return PP.cmd_on()
+    if cmd == "/prophet_off":
         if PP is None: return "⚠️ Prophet не загружен"
-        parts = text.split()
-        arg = parts[1] if len(parts) > 1 else ""
-        return PP.cmd_auto(arg)
+        return PP.cmd_off()
     if cmd == "/prophet_close":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_close()
     if cmd == "/prophet_clean":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_clean()
-    if cmd == "/prophet_stats":
-        if PP is None: return "⚠️ Prophet не загружен"
-        return PP.cmd_stats()
+
+    # ─── Anomaly Scanner A+ ──────────────────────────────────────────────────
+    if cmd == "/anomaly":
+        if ANOM is None: return f"⚠️ Anomaly не загружен: {_ANOM_IMPORT_ERR}"
+        return ANOM.cmd_status()
+    if cmd == "/anomaly_on":
+        if ANOM is None: return "⚠️ Anomaly не загружен"
+        return ANOM.cmd_on()
+    if cmd == "/anomaly_off":
+        if ANOM is None: return "⚠️ Anomaly не загружен"
+        return ANOM.cmd_off()
+    if cmd == "/anomaly_close":
+        if ANOM is None: return "⚠️ Anomaly не загружен"
+        return ANOM.cmd_close()
+    if cmd == "/anomaly_clean":
+        if ANOM is None: return "⚠️ Anomaly не загружен"
+        return ANOM.cmd_clean()
+
+    # ─── Big Candle ──────────────────────────────────────────────────────────
+    if cmd == "/bc":
+        if BCS is None: return f"⚠️ Big Candle не загружен: {_BCS_IMPORT_ERR}"
+        return BCS.status_report()
+    if cmd == "/bc_on":
+        if BCS is None: return "⚠️ BC не загружен"
+        return BCS.cmd_on()
+    if cmd == "/bc_off":
+        if BCS is None: return "⚠️ BC не загружен"
+        return BCS.cmd_off()
+    if cmd == "/bc_close":
+        if BCS is None: return "⚠️ BC не загружен"
+        return BCS.cmd_close()
+    if cmd == "/bc_stats":
+        if BCS is None: return "⚠️ BC не загружен"
+        return BCS.cmd_stats()
+
     if cmd in ("/help", "/start"):
         return HELP_TEXT
     return ""
@@ -688,323 +520,77 @@ def poll_commands():
             answer = handle_command(text)
         except Exception as e:
             traceback.print_exc()
-            answer = f"Ошибка команды: {esc(str(e))}"
+            answer = f"Ошибка: {esc(str(e))}"
         if answer:
             print(f"[CMD] {text}")
             send_telegram(answer)
 
-# ─── ЖУРНАЛЫ ПЕРЕД ПЕРЕЗАПУСКОМ ───────────────────────────────────────────────
-
-def send_logs(caption_prefix: str):
-    """Отправляет журнал авто-слоя в Telegram. Вызывается ПЕРЕД перезапуском —
-    на Render файлы стираются при каждом деплое, иначе статистика теряется."""
-    today = datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
-    send_document(EXEC_CSV, f"{caption_prefix} {today} — авто-слой")
-
+# ─── SHUTDOWN ─────────────────────────────────────────────────────────────────
+import signal as _signal
 def _on_shutdown(signum, frame):
-    """Render присылает SIGTERM перед перезапуском — успеваем сохранить статистику."""
-    print(f"[SHUTDOWN] сигнал {signum}: отправляю журналы перед остановкой")
+    print(f"[SHUTDOWN] сигнал {signum}")
     try:
-        send_telegram("♻️ <b>Бот перезапускается</b> — отправляю журналы, "
-                      "чтобы статистика не потерялась при деплое.")
-        send_logs("перед перезапуском")
-    except Exception as e:
-        print(f"[SHUTDOWN ERROR] {e}")
+        send_telegram("♻️ <b>Бот перезапускается</b> — отправляю журналы.")
+        if os.path.exists(EXEC_CSV) and os.path.getsize(EXEC_CSV) > 0:
+            send_document(EXEC_CSV, f"{datetime.now(MSK).strftime('%Y-%m-%d %H:%M')} — авто-слой")
+    except: pass
     raise SystemExit(0)
 
-# ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
-
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     tg_drop_webhook()
     _signal.signal(_signal.SIGTERM, _on_shutdown)
     _signal.signal(_signal.SIGINT, _on_shutdown)
-    # Разовый прогон бэктеста: в Render добавить переменную окружения RUN_BACKTEST=<mode>,
-    # дождаться результатов в Telegram, затем убрать переменную (иначе он будет
-    # запускаться при каждом перезапуске). После бэктеста бот продолжает работать как обычно.
-    bt_mode = (os.environ.get("RUN_BACKTEST") or "").strip().lower()
-    print(f"[BACKTEST] RUN_BACKTEST={bt_mode!r} → " +
-          ("DONCHIAN 4H v2.2 FINAL (bt_donchian_4h_v22_final.py)" if bt_mode in ("donchian_4h_v22", "donchian_4h_v22_final", "31")
-           else "DONCHIAN REGIME v4.7 (bt_donchian_regime_v47.py)" if bt_mode in ("donchian_regime_v47", "30")
-           else "DONCHIAN REGIME v4.6 (bt_donchian_regime_v46.py)" if bt_mode in ("donchian_regime_v46", "29")
-           else "DONCHIAN REGIME v4.5 (bt_donchian_regime_v45.py)" if bt_mode in ("donchian_regime_v45", "28")
-           else "DONCHIAN REGIME v4.4, 60д (bt_donchian_regime_v44_60d.py)" if bt_mode in ("donchian_regime_v44_60d", "27")
-           else "DONCHIAN REGIME v4.4 (bt_donchian_regime_v44.py)" if bt_mode in ("donchian_regime_v44", "26")
-           else "DONCHIAN REGIME v4.2 (bt_donchian_regime_v42.py)" if bt_mode in ("donchian_regime_v42", "25")
-           else "DONCHIAN REGIME v4.1 (bt_donchian_regime_v41.py)" if bt_mode in ("donchian_regime_v41", "24")
-           else "DONCHIAN REGIME v4 (bt_donchian_regime.py)" if bt_mode in ("donchian_regime", "23")
-           else "DAILY TREND-FOLLOWING ATR (bt_daily_trend.py)" if bt_mode in ("daily_trend", "22")
-           else "сравнение стратегий (bt_compare.py)" if bt_mode in ("compare", "2", "cmp")
-           else "MULTI-REGIME ALL пул (bt_multiregime_all.py)" if bt_mode in ("multiregime_all", "21")
-           else "DRAFT+FLOW финальный тест (bt_draft3.py)" if bt_mode in ("draft3", "20")
-           else "DRAFT Day Range Fade (bt_draft.py)" if bt_mode in ("draft", "19")
-           else "ETH VOLATILITY BREAKOUT (bt_breakout.py)" if bt_mode in ("breakout", "18")
-           else "РАЗБОР ПО ПАРАМ (bt_pairs.py)" if bt_mode in ("pairs", "17")
-           else "ФИЛЬТР ПО BTC (bt_btc.py)" if bt_mode in ("btc", "16")
-           else "ПРОБОЙ VWAP (bt_vbreak.py)" if bt_mode in ("vbreak", "15")
-           else "VWAP КАК МАГНИТ (bt_vwap.py)" if bt_mode in ("vwap", "14")
-           else "СТОП И ПОДТЯЖКА (bt_stop.py)" if bt_mode in ("stop", "13")
-           else "ТАЙМФРЕЙМЫ ЗАРЯДА (bt_tf.py)" if bt_mode in ("tf", "12")
-           else "АУДИТ ДОПУЩЕНИЙ (bt_audit.py)" if bt_mode in ("audit", "11")
-           else "СХЕМА ВХОДА (bt_entry.py)" if bt_mode in ("entry", "10")
-           else "ОСЛАБЛЕНИЯ (bt_loose.py)" if bt_mode in ("loose", "9")
-           else "ДИАГНОСТИКА зарядов (bt_why.py)" if bt_mode in ("why", "8")
-           else "ДЛИННЫЙ бэктест (bt_long.py)" if bt_mode in ("long", "7")
-           else "ПЕРЕБОР параметров (bt_sweep.py)" if bt_mode in ("sweep2", "6", "params")
-           else "СДЕЛКИ по мелким свечам (bt_trades2.py)" if bt_mode in ("trades2", "5")
-           else "СДЕЛКИ (bt_trades.py)" if bt_mode in ("trades", "4", "trade")
-           else "потолок диапазона (bt_range.py)" if bt_mode in ("range", "3", "rng")
-           else "перебор настроек (backtest.py)" if bt_mode in ("1", "true", "yes", "on", "sweep")
-           else "не запускаю"))
-    if bt_mode in ("donchian_4h_v22", "donchian_4h_v22_final", "31", "1", "true", "yes", "on", "sweep", "compare", "2", "cmp", "range", "3", "rng", "trades", "4", "trade", "trades2", "5", "sweep2", "6", "params", "long", "7", "why", "8", "loose", "9", "entry", "10", "audit", "11", "tf", "12", "stop", "13", "vwap", "14", "vbreak", "15", "btc", "16", "pairs", "17", "breakout", "18", "draft", "19", "draft3", "20", "multiregime_all", "21", "daily_trend", "22", "donchian_regime", "23", "donchian_regime_v41", "24", "donchian_regime_v42", "25", "donchian_regime_v44", "26", "donchian_regime_v44_60d", "27", "donchian_regime_v45", "28", "donchian_regime_v46", "29", "donchian_regime_v47", "30"):
-        # Защита от повторов: если контейнер перезапустится (нехватка памяти, сбой,
-        # деплой), бэктест не начнётся заново — метка о запуске лежит рядом с логами.
-        mark = os.path.join(LOG_DIR, "backtest_done.txt")
-        today = datetime.now(MSK).strftime("%Y-%m-%d")
-        done = ""
-        try:
-            with open(mark, encoding="utf-8") as f:
-                done = f.read().strip()
-        except Exception:
-            pass
-        if done == today:
-            print(f"[BACKTEST] сегодня уже запускался ({done}) — пропуск")
-            send_telegram("ℹ️ Бэктест сегодня уже отрабатывал — повторно не запускаю.\n"
-                          "Если нужен ещё один прогон, убери и снова добавь RUN_BACKTEST.")
-        else:
-            try:
-                with open(mark, "w", encoding="utf-8") as f:
-                    f.write(today)
-            except Exception:
-                pass
-            try:
-                if bt_mode in ("donchian_4h_v22", "donchian_4h_v22_final", "31"):
-                    import bt_donchian_4h_v22_final
-                    bt_donchian_4h_v22_final.main()  # Donchian(20) на 4H + BTC SMA(50) + DMI + ATR + trailing по close + Partial TP +8%/50% + Daily Stop today-only -$350
-                elif bt_mode in ("donchian_regime_v47", "30"):
-                    import bt_donchian_regime_v47
-                    bt_donchian_regime_v47.main()  # v4.5 + Partial TP +5%/50% + breakeven (без sideways-фильтра v4.6)
-                elif bt_mode in ("donchian_regime_v46", "29"):
-                    import bt_donchian_regime_v46
-                    bt_donchian_regime_v46.main()  # v4.5 + sideways-фильтр BTC (20д коридор < 8% -> Long запрещён)
-                elif bt_mode in ("donchian_regime_v45", "28"):
-                    import bt_donchian_regime_v45
-                    bt_donchian_regime_v45.main()  # v4.4 без PerSide cap (MAX_PER_SIDE_CAP=6, PER_SIDE_BUDGET=999999)
-                elif bt_mode in ("donchian_regime_v44_60d", "27"):
-                    import bt_donchian_regime_v44_60d
-                    bt_donchian_regime_v44_60d.main()  # то же v4.4, но окно всего 60 дней (без BT_START)
-                elif bt_mode in ("donchian_regime_v44", "26"):
-                    import bt_donchian_regime_v44
-                    bt_donchian_regime_v44.main()  # Donchian(20) + BTC + DMI + compound + per-side cap + daily stop -$400
-                elif bt_mode in ("donchian_regime_v42", "25"):
-                    import bt_donchian_regime_v42
-                    bt_donchian_regime_v42.main()  # Donchian(20) + BTC SMA(50) + DMI + DD brake (no ADX)
-                elif bt_mode in ("donchian_regime_v41", "24"):
-                    import bt_donchian_regime_v41
-                    bt_donchian_regime_v41.main()  # Donchian(20) + BTC SMA(50) + DMI + ADX>20 + DD brake
-                elif bt_mode in ("donchian_regime", "23"):
-                    import bt_donchian_regime
-                    bt_donchian_regime.main()  # Donchian(20) + BTC SMA(50) + DMI + Trailing Stop
-                elif bt_mode in ("daily_trend", "22"):
-                    import bt_daily_trend
-                    bt_daily_trend.main()      # Daily Trend-Following с ATR-выходами
-                elif bt_mode in ("multiregime_all", "21"):
-                    import bt_multiregime_all
-                    bt_multiregime_all.main()  # MULTI-REGIME на всём пуле 103 пары
-                elif bt_mode in ("draft3", "20"):
-                    import bt_draft3
-                    bt_draft3.main()       # DRAFT+FLOW финальный тест серии (F1+F2 по потоку)
-                elif bt_mode in ("draft", "19"):
-                    import bt_draft
-                    bt_draft.main()        # DRAFT Day Range Fade (лимитки от рамки дня)
-                elif bt_mode in ("breakout", "18"):
-                    import bt_breakout
-                    bt_breakout.main()     # ETHVolatilityBreakoutPro на всём пуле пар
-                elif bt_mode in ("pairs", "17"):
-                    import bt_pairs
-                    bt_pairs.main()        # разбор по парам и группам
-                elif bt_mode in ("btc", "16"):
-                    import bt_btc
-                    bt_btc.main()          # фильтр по уклону BTC
-                elif bt_mode in ("vbreak", "15"):
-                    import bt_vbreak
-                    bt_vbreak.main()       # сигнал по пробою VWAP
-                elif bt_mode in ("vwap", "14"):
-                    import bt_vwap
-                    bt_vwap.main()         # VWAP как магнит
-                elif bt_mode in ("stop", "13"):
-                    import bt_stop
-                    bt_stop.main()         # шаг 1: стоп и подтяжка
-                elif bt_mode in ("tf", "12"):
-                    import bt_tf
-                    bt_tf.main()           # на каком ТФ искать заряд
-                elif bt_mode in ("audit", "11"):
-                    import bt_audit
-                    bt_audit.main()        # аудит допущений бэктеста
-                elif bt_mode in ("entry", "10"):
-                    import bt_entry
-                    bt_entry.main()        # новая схема входа с подтверждением
-                elif bt_mode in ("loose", "9"):
-                    import bt_loose
-                    bt_loose.main()        # что даст ослабление условий заряда
-                elif bt_mode in ("why", "8"):
-                    import bt_why
-                    bt_why.main()          # почему монета не стала зарядом
-                elif bt_mode in ("long", "7"):
-                    import bt_long
-                    bt_long.main()         # длинная история, только 1h
-                elif bt_mode in ("sweep2", "6", "params"):
-                    import bt_sweep
-                    bt_sweep.main()        # перебор параметров (пункты 4-7)
-                elif bt_mode in ("trades2", "5"):
-                    import bt_trades2
-                    bt_trades2.main()      # v3: сделка по мелким свечам
-                elif bt_mode in ("trades", "4", "trade"):
-                    import bt_trades
-                    bt_trades.main()       # v8.8: полноценный бэктест сделок
-                elif bt_mode in ("range", "3", "rng"):
-                    import bt_range
-                    bt_range.main()        # v8.8: проверка адаптивного потолка диапазона
-                elif bt_mode in ("compare", "2", "cmp"):
-                    import bt_compare
-                    bt_compare.main()      # сравнение стратегий
-                else:
-                    import backtest
-                    backtest.main()        # перебор настроек нашей стратегии
-            except MemoryError:
-                traceback.print_exc()
-                send_telegram("⚠️ Бэктесту не хватило памяти. Уменьши BT_PAIRS (например 30) "
-                              "или BT_DAYS.\nБот работает в обычном режиме.")
-            except Exception as e:
-                traceback.print_exc()
-                send_telegram(f"⚠️ Бэктест не отработал: {esc(str(e))}\nБот продолжает работу в обычном режиме.")
 
-    # Проверяем где храним state (на Render должен быть /var/data через BOT_DATA_DIR)
     _data_dir_actual = os.environ.get("BOT_DATA_DIR", "/tmp")
-    _disk_ok = "✅ Persistent Disk" if _data_dir_actual != "/tmp" else "⚠️ /tmp (стирается при деплое!)"
+    _disk_ok = "✅ Persistent Disk" if _data_dir_actual != "/tmp" else "⚠️ /tmp"
 
     start_lines = [
-        f"🚀 <b>Upscale Bot {BOT_VERSION}</b> | режим: <b>{EXECUTOR.mode}</b>"
-        + {"dry": " (только сообщения)", "demo": " (ордера на ДЕМО-счёт)"}.get(EXECUTOR.mode, ""),
+        f"🚀 <b>Upscale Bot {BOT_VERSION}</b> | режим: <b>{EXECUTOR.mode}</b>",
         "",
-        "📐 <b>Стратегия: donchian_4h_v22 (логика v2.2-FINAL)</b> — полностью автоматическая",
-        "   Donchian(20) на 4H + BTC SMA(50) 1D + DMI + ATR-фильтр 0.6%-2.0%",
-        "   Compound sizing: риск 0.8% equity (старт $100, макс $250), DD-brake ×0.4 при DD > $900",
-        "   Вход с плечом (EXEC_LEVERAGE, по умолчанию 5×)",
-        f"   Выход: trailing-стоп 4.5×ATR по CLOSE / разворот Donchian / {DR42.MAX_HOLD_DAYS} свечей 4H (без TP) | "
-        f"Partial TP +{int(DR42.PARTIAL_TP_PCT*100)}% favourable → закрыть {int(DR42.PARTIAL_TP_FRACTION*100)}% позиции, остаток в breakeven",
-        f"   Лимит: {DR42.MAX_CONCURRENT} одновременно (до {DR42.MAX_PER_SIDE_CAP} в сторону) | "
-        f"новых в день: {DR42.MAX_NEW_PER_DAY} | фильтр: {DR42.MAX_LOSERS_PER_SIDE} лузера в сторону",
-        f"   Daily Stop today-only: -$350 (закрывает только сегодня-открытые убыточные)",
-        f"   Cooldown: {DR42.CONSEC_LOSS_LIMIT} убытка подряд → блок {DR42.COOLDOWN_DAYS} дней",
-        f"   Exclude: {sorted(DR42.EXCLUDE_PAIRS)}",
-        f"   Скан каждые 4 часа после закрытия 4H-свечи (~00:05, 04:05, 08:05, 12:05, 16:05, 20:05 UTC)",
-        "   Аварийка Upscale (контур Upscale, отдельный от -$350): дневной $400 / общий $800 при $10k → close-all + halt",
-        f"💾 State: {_disk_ok}",
-        f"   → {_data_dir_actual}",
-        "",
-    ]
-    if EXCLUDE_SYMBOLS:
-        start_lines.append(f"🚫 Не торгуем (глобально): {', '.join(sorted(EXCLUDE_SYMBOLS))}")
-    start_lines += [
-        f"📊 Пар: {len(UPSCALE_PAIRS)}",
-        "🚨 Big Candle Strategy: BTC, окно 10:00-11:15 МСК, /bc_on для включения",
-        "💬 /help — все команды | /up статус | /bc статус BC | /scan ручной скан | /state состояние",
+        f"📊 Пар: {len(UPSCALE_PAIRS)} | 💾 {_disk_ok}",
+        "🔮 Prophet V12-FINAL: /prophet_on для включения",
+        "🚨 Anomaly Scanner A+: /anomaly_on для включения",
+        "🚨 Big Candle: окно 10:00-11:15 МСК, /bc_on",
+        "💬 /help — все команды",
     ]
     send_telegram("\n".join(start_lines))
 
-    # Баланс Upscale нужен donchian для compound sizing — обновляется в фоне
-    # каждые 5 минут и принудительно перед каждым сканом сигналов.
-    DR42.start_balance_updater()
-
-    # ── Запуск Big Candle Strategy (замена OrderFlow) ───────────────────────
-    # Стратегия больших свечей BTC: окно 10:00-11:15 МСК, 15m свечи, TP1=4×ATR,
-    # стоп=2×ATR, RR 1:2. Авто-торговля через Upscale API.
+    # Запуск Big Candle
     if BCS is not None:
-        try:
-            BCS.start()
+        try: BCS.start()
         except Exception as e:
-            print(f"[BCS] ошибка запуска: {e}")
-            traceback.print_exc()
-            send_telegram(f"⚠️ Big Candle Strategy не запустилась: {esc(str(e))}")
-    else:
-        print(f"[BCS] модуль не загружен: {_BCS_IMPORT_ERR}")
-        send_telegram(f"⚠️ Big Candle модуль не загружен: {esc(str(_BCS_IMPORT_ERR))}")
+            print(f"[BCS] ошибка: {e}")
+            send_telegram(f"⚠️ Big Candle: {esc(str(e))}")
 
-    # ── Запуск Prophet (Multi-TF Scanner) ────────────────────────────────────
+    # Запуск Prophet
     if PP is not None:
-        try:
-            PP.start()
+        try: PP.start()
         except Exception as e:
-            print(f"[PP] ошибка запуска: {e}")
-            traceback.print_exc()
-            send_telegram(f"⚠️ Prophet не запустился: {esc(str(e))}")
-    else:
-        print(f"[PP] модуль не загружен: {_PP_IMPORT_ERR}")
+            print(f"[PP] ошибка: {e}")
+            send_telegram(f"⚠️ Prophet: {esc(str(e))}")
 
-    # Команды в чате — в отдельном потоке, не дожидаясь скана. Скан ~100 пар
-    # с лимитом 12 запросов/сек может идти ощутимо долго; раньше poll_commands()
-    # вызывался в том же цикле ПЕРЕД сканом, и /halt, отправленный во время
-    # скана, читался только после его завершения.
+    # Запуск Anomaly
+    if ANOM is not None:
+        try: ANOM.start()
+        except Exception as e:
+            print(f"[ANOM] ошибка: {e}")
+            send_telegram(f"⚠️ Anomaly: {esc(str(e))}")
+
+    # Команды в чате — в отдельном потоке
     def _command_loop():
         while True:
-            try:
-                poll_commands()
-            except Exception as e:
-                print(f"[CMD LOOP ERROR] {e}")
-                traceback.print_exc()
+            try: poll_commands()
+            except Exception as e: print(f"[CMD LOOP ERROR] {e}")
             time.sleep(2)
     threading.Thread(target=_command_loop, daemon=True, name="tg-commands").start()
 
-    # ── 4H-расписание скана: метка — это TS последней закрытой 4H-свечи,
-    # по которой уже отработал скан. Хранится в файле SCAN_MARK_FILE, чтобы
-    # пережить рестарт Render. Алгоритм:
-    #   1. Текущая закрытая 4H-свеча: last_4h_ts = (now // 4h) * 4h
-    #   2. Скан можно запустить, если now >= last_4h_ts + SCAN_BUFFER_SEC
-    #      (свеча точно зафиксировалась на Gate)
-    #   3. Если last_scanned_4h_ts < last_4h_ts и время пришло — запускаем
-    #      скан, сохраняем last_4h_ts в файл.
-    # Таким образом, даже если бот был остановлен 8 часов и пропустил 2 свечи,
-    # при старте он отработает только ОДИН скан (по последней закрытой свече) —
-    # не пытается "наверстать" пропущенные, потому что сигналы уже устарели.
-    try:
-        with open(SCAN_MARK_FILE, encoding="utf-8") as f:
-            last_scanned_4h_ts = int(f.read().strip() or "0")
-    except Exception:
-        last_scanned_4h_ts = 0
-    print(f"[DR42] старт: last_scanned_4h_ts={last_scanned_4h_ts} ({datetime.fromtimestamp(last_scanned_4h_ts, timezone.utc).isoformat() if last_scanned_4h_ts else 'never'})")
-
+    # Главный цикл (больше не сканирует Donchian — только ждёт)
     while True:
         try:
-            now = time.time()
-            last_4h_ts = (int(now) // SCAN_INTERVAL_SEC) * SCAN_INTERVAL_SEC
-            # Если с момента закрытия 4H-свечи прошло >= SCAN_BUFFER_SEC и
-            # эту свечу мы ещё не сканировали — запускаем.
-            if (now >= last_4h_ts + SCAN_BUFFER_SEC
-                    and last_scanned_4h_ts < last_4h_ts):
-                last_scanned_4h_ts = last_4h_ts
-                try:
-                    with open(SCAN_MARK_FILE, "w", encoding="utf-8") as f:
-                        f.write(str(last_4h_ts))
-                except Exception as e:
-                    print(f"[DR42] не удалось сохранить метку скана: {e}")
-                candle_str = datetime.fromtimestamp(last_4h_ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                print(f"[DR42] запуск скана по свече {candle_str}")
-                # V12-max5: проверка флага отключения Donchian
-                if DONCHIAN_DISABLED[0]:
-                    print(f"[DR42] скан пропущен — Donchian отключён через /donchian_off")
-                    send_telegram(f"⏸️ Donchian 4H: авто-скан пропущен (отключён /donchian_off)")
-                else:
-                    try:
-                        DR42.check_signals()
-                    except Exception as e:
-                        print(f"[DR42 ERROR] {e}")
-                        traceback.print_exc()
-                        send_telegram(f"⚠️ donchian_4h_v22: ошибка скана — {esc(str(e))}")
-
+            time.sleep(5)
         except Exception as e:
             print(f"[LOOP ERROR] {e}")
-            traceback.print_exc()
-        time.sleep(5)
 
 if __name__ == "__main__":
     main()

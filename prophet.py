@@ -101,9 +101,9 @@ MIN_SCORE_BEAR = 70       # в BEAR режиме строже отбор (vs 60 
 BEAR_COOLDOWN_HOURS = 48  # в BEAR режиме 48ч cooldown (vs 24ч в BULL)
 # V12 окна сканов (15 часов, без 7/13/16 — убыточные в бэктестах)
 AUTO_HOURS_MSK = [5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 21, 22]
-SCAN_MINUTE = 15       # V12: сканы строго в :15 МСК (не пересекается с 4H close в :00)
+SCAN_MINUTE = 30       # V12-FINAL: сканы в :30 (подтверждение в :45)
 CONFIRM_WAIT_SEC = 900 # V12: ждём 15 минут для подтверждения сигнала (одна 15m свеча)
-SCAN_INTERVAL = 3600    # только для reference; реальный цикл управляется AUTO_HOURS_MSK + SCAN_MINUTE
+SCAN_INTERVAL = 3600    # только для reference
 
 _data_dir = os.environ.get("BOT_DATA_DIR", "/tmp")
 try: os.makedirs(_data_dir, exist_ok=True)
@@ -961,10 +961,13 @@ def manage_positions():
 # === SCAN LOOPS ===
 
 _scanner_thread = None
+_scanner_running = False  # V12-FINAL: флаг против дублирования
 _watchdog_thread = None
 
 def _scanner_loop():
-    """V12: Главный цикл — сканы строго в HH:15 МСК каждый час из AUTO_HOURS_MSK."""
+    """V12-FINAL: Главный цикл — сканы в HH:30 МСК каждый час из AUTO_HOURS_MSK."""
+    global _scanner_running
+    _scanner_running = True  # V12-FINAL:标记这个线程在运行
     print(f"[prophet V12-max5] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
     # V12-max5: диагностика TZ — проверяем что часовой пояс правильный
     _now_diag = dt.datetime.now(MSK)
@@ -975,6 +978,11 @@ def _scanner_loop():
         except: pass
     while True:
         try:
+            # V12-FINAL: если флаг сброшен (watchdog перезапускает) — останавливаемся
+            if not _scanner_running:
+                print(f"[prophet V12-max5] Scanner: флаг _scanner_running=False, останавливаюсь")
+                return  # выход из потока — watchdog создаст новый
+            
             mode = _state.get("scan_mode", "off")
             if mode == "off":
                 time.sleep(60); continue
@@ -982,36 +990,26 @@ def _scanner_loop():
             now_dt = dt.datetime.now(MSK)
             now_ts = int(_now())
 
-            # V12: скан строго в HH:15 (окно 10 минут, т.е. :10-:20)
-            # Проверяем что час в AUTO_HOURS_MSK и минута в окне :10-:25
-            # (расширили до :25 чтобы успеть после Donchian в 4H часы)
+            # V12-FINAL: скан в окне :25-:35 (раньше было :10-:25)
             if now_dt.hour not in AUTO_HOURS_MSK:
-                # Логируем каждый час для диагностики
-                if now_dt.minute == 0:
-                    print(f"[prophet V12-max5] {now_dt.strftime('%H:%M')} MSK — час {now_dt.hour} не в скан-окне (это норма)")
                 time.sleep(60); continue
-            if not (10 <= now_dt.minute <= 25):
+            if not (25 <= now_dt.minute <= 35):
                 time.sleep(30); continue
 
-            # V12-max5: ИЗБЕГАЕМ КОНФЛИКТА с Donchian 4H
-            # 4H свеча закрывается в 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 MSK
-            # Donchian запускает check_signals() через 5 минут (в :05)
-            # Скан Donchian идёт ~2-3 минуты по 100+ парам
-            # Если Prophet запустится в :15 — может конфликтовать за Gate API
-            # Решение: в часы 4H закрытия (3,7,11,15,19,23) ждём до :20 (Donchian закончил)
-            HOURS_4H_CLOSE = [3, 7, 11, 15, 19, 23]  # MSK часы закрытия 4H свечей
-            if now_dt.hour in HOURS_4H_CLOSE and now_dt.minute < 18:
-                # Ждём пока Donchian закончит свой скан (он идёт в :05-:15)
-                if now_dt.minute == 10:
-                    print(f"[prophet V12-max5] {now_dt.strftime('%H:%M')} MSK — час 4H закрытия, ждём до :18 чтобы не конфликтовать с Donchian")
-                time.sleep(60); continue
+            # V12-FINAL: убраны HOURS_4H_CLOSE (Donchian удалён)
 
-            # Уже сканировали в этот час?
+            # V12-FINAL: дедупликация — если last_scan обновлён в последние 90 сек → skip
             last_scan = _state.get("last_scan_ts", 0)
+            if _now() - last_scan < 90:
+                time.sleep(30); continue
             last_scan_dt = dt.datetime.fromtimestamp(last_scan, tz=MSK)
             if (last_scan_dt.year == now_dt.year and last_scan_dt.month == now_dt.month
                 and last_scan_dt.day == now_dt.day and last_scan_dt.hour == now_dt.hour):
                 time.sleep(60); continue
+
+            # V12-FINAL: ставим last_scan_ts ПЕРЕД сканом (предотвращает дублирование)
+            _state["last_scan_ts"] = int(_now())
+            _save()
 
             # Лимит сделок
             if _state.get("trades_today_date") != _today():
@@ -1067,8 +1065,7 @@ def _scanner_loop():
                     except: pass
                 setup = None
 
-            # Скан завершён (успешно или с ошибкой) — фиксируем время
-            _state["last_scan_ts"] = _now()
+            # V12-FINAL: last_scan_ts уже установлен ПЕРЕД сканом (дедупликация)
             _stats["scans"] += 1
             _save()
 
@@ -1206,63 +1203,25 @@ def cmd_status():
     if active_bl:
         lines.append(f"⛔ Blacklist: {len(active_bl)} пар (на 7д после убытка)")
     lines.append(f"\nКоманды:")
-    lines.append(f"  /prophet_scan — один скан")
-    lines.append(f"  /prophet_scan on — непрерывный (каждый час в :15)")
-    lines.append(f"  /prophet_auto on — авто (V12 часы, с подтверждением)")
-    lines.append(f"  /prophet_clean — cleaner зависших (по возрасту)")
-    lines.append(f"  /prophet_sync — синхронизация tracked с Upscale (убрать orphan)")
+    lines.append(f"  /prophet_on — включить")
+    lines.append(f"  /prophet_off — выключить")
+    lines.append(f"  /prophet_close — закрыть позиции")
+    lines.append(f"  /prophet_clean — cleaner зависших")
     return "\n".join(lines)
 
-def cmd_scan(arg=""):
-    if arg.lower() == "on":
-        # V12 fix: при переключении режимов сбрасываем pending_signal
-        _state["scan_mode"] = "continuous"
-        _state["pending_signal"] = None
-        _save()
-        return "🔄 V12 непрерывный скан включён (каждый час в :15 МСК). /prophet_scan off — остановить."
-    elif arg.lower() == "off":
-        _state["scan_mode"] = "off"
-        _state["pending_signal"] = None
-        _save()
-        return "🔴 Непрерывный скан выключен."
-    else:
-        # Single scan
-        def _run():
-            try:
-                setup = do_scan()
-                if setup and setup["score"] >= MIN_SCORE:
-                    _stats["signals"] += 1
-                    send_signal(setup)
-                elif B:
-                    if setup:
-                        direction = setup.get("direction", "LONG")
-                        emoji = "🟢" if direction == "LONG" else "🔴"
-                        B.send_telegram(f"🔮 V12 Скан завершён\nЛучший: {emoji} {setup['symbol']} {direction} score={setup['score']:.0f}\nНиже порога {MIN_SCORE} — пропуск")
-                    else:
-                        B.send_telegram("🔮 V12 Скан завершён\n❌ Сигналов не найдено")
-            except Exception as e:
-                if B: B.send_telegram(f"⚠️ /prophet_scan ошибка: {e}")
-        threading.Thread(target=_run, daemon=True, name="prophet-single").start()
-        return "🔍 Запускаю скан..."
+def cmd_on():
+    """V12-FINAL: включение авто-торговли (только авто, без ручного режима)."""
+    _state["scan_mode"] = "auto"
+    _state["pending_signal"] = None
+    _save()
+    return f"🤖 Prophet V12 включён.\nЧасы скана: {AUTO_HOURS_MSK}\nСкан в :{SCAN_MINUTE:02d} | Подтверждение: {CONFIRM_WAIT_SEC//60} мин\nПорог: ≥{AUTO_SCORE}\nMAX_OPEN: {MAX_OPEN}"
 
-def cmd_auto(arg=""):
-    if arg.lower() == "on":
-        # V12 fix: при переключении режимов сбрасываем висящий pending_signal от continuous
-        # (чтобы старая кнопка "ВОЙТИ" от ручного режима не путала пользователя в auto)
-        old_pending = _state.get("pending_signal")
-        _state["scan_mode"] = "auto"
-        _state["pending_signal"] = None
-        _save()
-        msg = f"🤖 V12 Авто-режим включён.\nЧасы скана: {AUTO_HOURS_MSK}\nМинута: :{SCAN_MINUTE:02d}\nПорог: ≥{AUTO_SCORE}\nПодтверждение: {CONFIRM_WAIT_SEC//60} мин (15m свеча, автоматически)"
-        if old_pending:
-            msg += f"\n\n⏭️ Старый сигнал от ручного режима ({old_pending['symbol']}) отменён — в auto режиме бот сам принимает решения."
-        return msg
-    elif arg.lower() == "off":
-        _state["scan_mode"] = "off"
-        _state["pending_signal"] = None
-        _save()
-        return "🔴 Авто-режим выключен."
-    return "Использование: /prophet_auto on | /prophet_auto off"
+def cmd_off():
+    """V12-FINAL: выключение авто-торговли."""
+    _state["scan_mode"] = "off"
+    _state["pending_signal"] = None
+    _save()
+    return "🔴 Prophet V12 выключен. Открытые позиции продолжают работать."
 
 def cmd_close():
     if not B or not hasattr(B, "EXECUTOR"): return "⚠️ Executor недоступен"
@@ -1280,7 +1239,6 @@ def cmd_close():
             if pos:
                 mid = UE._pos_market(pos)
                 if mid:
-                    # V12: dir из rec
                     dir_field = rec.get("dir", rec.get("direction", "long"))
                     if dir_field in ("SHORT", "short"): dir_field = "short"
                     else: dir_field = "long"
@@ -1598,6 +1556,9 @@ def _scanner_watchdog():
                         f"Принудительный перезапуск scanner thread."
                     )
                     except: pass
+                # V12-FINAL: сбрасываем флаг чтобы старый thread остановился
+                _scanner_running = False
+                time.sleep(5)  # даём старому потоку время остановиться
                 # Принудительно создаём новый thread
                 _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12-heartbeat-restart")
                 _scanner_thread.start()
@@ -1637,5 +1598,5 @@ def start():
             f"📌 Пирамидинг: новые только если предыдущие в плюсе\n"
             f"🔄 Auto-sync orphans + watchdog scanner\n"
             f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
-            f"Команды: /prophet /prophet_scan /prophet_auto /prophet_close /prophet_clean /prophet_sync"
+            f"Команды: /prophet /prophet_on /prophet_off /prophet_close /prophet_clean"
         )
