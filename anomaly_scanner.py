@@ -798,9 +798,11 @@ def _auto_sync_orphans(verbose_telegram=False):
                 real_id = live_syms[sym]
                 with _tracked_lock:
                     tr = _load_tracked()
-                    if pid in tr and real_id not in tr:
-                        tr[real_id] = dict(tr[pid])
-                        tr[real_id]["close_reason"] = ""
+                    if pid in tr:
+                        if real_id not in tr:
+                            tr[real_id] = dict(tr[pid])
+                            tr[real_id]["close_reason"] = ""
+                        # V13.1: всегда удаляем pending_ (даже если real_id уже был)
                         del tr[pid]
                         _save_tracked(tr)
                 try: executor._registry_set(real_id, STRATEGY_TAG)

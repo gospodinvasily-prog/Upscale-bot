@@ -347,11 +347,10 @@ def _all_strategies_status():
             pp_mode = PP._state.get("scan_mode", "off")
             pp_status = "🟢 ВКЛ" if pp_mode == "auto" else "🔴 ВЫКЛ"
             pp_tracked = PP._load_tracked()
-            pp_open = [(v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0)) 
-                       for v in pp_tracked.values() 
-                       if v.get("status") == "open" and not any(k.startswith("pending_") for k in [k for k,v2 in pp_tracked.items() if v2 == v])]
+            # V13.1: фильтруем pending_* (предторговые записи) — показываем только реальные позиции
             pp_open_clean = []
             for pid, v in pp_tracked.items():
+                if pid.startswith("pending_"): continue
                 if v.get("status") == "open":
                     pp_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0)))
             lines.append(f"\n🔮 Prophet V12: {pp_status} | открыто: {len(pp_open_clean)}/{PP.MAX_OPEN}")
@@ -375,6 +374,7 @@ def _all_strategies_status():
             an_tracked = ANOM._load_tracked()
             an_open_clean = []
             for pid, v in an_tracked.items():
+                if pid.startswith("pending_"): continue  # V13.1: фильтруем pending_*
                 if v.get("status") == "open":
                     an_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0), v.get("n_anomalies",0)))
             lines.append(f"\n🚨 Anomaly A+: {an_status} | открыто: {len(an_open_clean)}/{ANOM.MAX_OPEN}")
@@ -396,7 +396,7 @@ def _all_strategies_status():
             bc_enabled = BCS._state.get("enabled", False)
             bc_status = "🟢 ВКЛ" if bc_enabled else "🔴 ВЫКЛ"
             bc_tracked = BCS._load_tracked()
-            bc_open = sum(1 for v in bc_tracked.values() if v.get("status") == "open")
+            bc_open = sum(1 for pid, v in bc_tracked.items() if v.get("status") == "open" and not pid.startswith("pending_"))
             lines.append(f"\n🚨 Big Candle: {bc_status} | открыто: {bc_open}")
             lines.append(f"   сигналов: {BCS._stats['signals_total']} | сделок: {BCS._stats['trades_opened']}/{BCS._stats['trades_closed']}")
         except Exception as e:
@@ -404,22 +404,22 @@ def _all_strategies_status():
     else:
         lines.append(f"\n🚨 Big Candle: ❌ не загружен")
     
-    # Общий итог — просто сумма открытых из каждого tracked
+    # Общий итог — просто сумма открытых из каждого tracked (V13.1: без pending_*)
     total_open = 0
     if PP is not None:
         try:
             pp_tr = PP._load_tracked()
-            total_open += sum(1 for v in pp_tr.values() if v.get("status") == "open")
+            total_open += sum(1 for pid, v in pp_tr.items() if v.get("status") == "open" and not pid.startswith("pending_"))
         except: pass
     if ANOM is not None:
         try:
             an_tr = ANOM._load_tracked()
-            total_open += sum(1 for v in an_tr.values() if v.get("status") == "open")
+            total_open += sum(1 for pid, v in an_tr.items() if v.get("status") == "open" and not pid.startswith("pending_"))
         except: pass
     if BCS is not None:
         try:
             bc_tr = BCS._load_tracked()
-            total_open += sum(1 for v in bc_tr.values() if v.get("status") == "open")
+            total_open += sum(1 for pid, v in bc_tr.items() if v.get("status") == "open" and not pid.startswith("pending_"))
         except: pass
     
     lines.append(f"\n📊 Всего открыто позиций: {total_open}")

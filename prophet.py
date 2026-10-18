@@ -1337,14 +1337,17 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
                 cleaned_count += 1
                 cleaned_list.append(f"⏳ {sym} {direction} (pending {age_sec//60}мин, не открылась)")
             # Если pending_ и символ есть в live → конвертируем в real entry
+            # V13.1: если real_id уже отслеживается — просто удаляем дублирующий pending_
             elif sym in live_syms:
                 real_id = live_syms[sym]
                 with _tracked_lock:
                     tr = _load_tracked()
-                    if pid in tr and real_id not in tr:
-                        # Копируем запись под real_id, удаляем pending_
-                        tr[real_id] = dict(tr[pid])
-                        tr[real_id]["close_reason"] = ""
+                    if pid in tr:
+                        if real_id not in tr:
+                            # Копируем запись под real_id, удаляем pending_
+                            tr[real_id] = dict(tr[pid])
+                            tr[real_id]["close_reason"] = ""
+                        # В любом случае удаляем pending_ (он дублирует real_id)
                         del tr[pid]
                         _save_tracked(tr)
                         cleaned_count += 1
