@@ -1114,6 +1114,11 @@ def cmd_status():
     lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч")
     lines.append(f"Аномалии: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion")
     lines.append(f"BEAR фильтр: 3+ аномалии в BEAR → skip")
+    # V13.6: показываем версию + активные фичи
+    lines.append(f"🏷️ Версия: V13.6 (аудит-фиксы)")
+    if USE_SKIP_2_WEAK:
+        lines.append(f"✅ SKIP_2_WEAK: фильтрует 2 weak коррелированных")
+    lines.append(f"💪 STRONG аномалии (PF>1.4): Laggard, ZScoreDev, LiqMagnet")
     _reset_daily_pnl_if_needed()
     long_pnl = _state.get("long_today_pnl", 0.0)
     short_pnl = _state.get("short_today_pnl", 0.0)
