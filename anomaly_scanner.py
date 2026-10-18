@@ -624,7 +624,7 @@ def manage_positions():
             del tracked[pid]; changed = True
         else:
             hold = now - rec.get("opened_ts", now)
-            if hold >= MAX_HOLD:
+            if hold >= MAX_HOLD_SEC:
                 pos = next((p for p in live if UE._pos_id(p) == pid), None)
                 if pos:
                     mid = UE._pos_market(pos)
@@ -634,8 +634,8 @@ def manage_positions():
                         else: dir_field = "long"
                         info = {"id": pid, "mid": mid, "dir": dir_field}
                         try:
-                            executor.close_position(info, reason=f"ANOMALY_TIMEOUT_{MAX_HOLD//3600}h")
-                            if B: B.send_telegram(f"⏱️ Anomaly {rec['sym']}: safety-net {MAX_HOLD//3600}ч")
+                            executor.close_position(info, reason=f"ANOMALY_TIMEOUT_{MAX_HOLD_SEC//3600}h")
+                            if B: B.send_telegram(f"⏱️ Anomaly {rec['sym']}: safety-net {MAX_HOLD_SEC//3600}ч")
                         except: pass
 
     if changed:
@@ -854,7 +854,7 @@ def run_cleaner(reason="AUTO_CLEAN"):
         return 0, f"⚠️ {e}"
 
     now = _now()
-    max_hold = MAX_HOLD + 2 * 3600
+    max_hold = MAX_HOLD_SEC + 2 * 3600
     closed_count = 0
 
     for pid, rec in open_recs:
@@ -953,7 +953,7 @@ def cmd_status():
     lines.append(f"\n📅 Скан: :{SCAN_MINUTE:02d} каждого часа (24/день)")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
     lines.append(f"TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})")
-    lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
+    lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
     lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч")
     lines.append(f"Аномалии: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion")
@@ -1045,7 +1045,7 @@ def start():
             f"⏰ Скан: :{SCAN_MINUTE:02d} каждого часа (24/день)\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
             f"🎯 TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})\n"
-            f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
+            f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч\n"
             f"🐻 BEAR фильтр: 3+ аномалии в BEAR → skip\n"
             f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч\n"
             f"💰 Комиссии: {COMMISSION_PCT*2}% + {SPREAD_PCT}% спред\n"
