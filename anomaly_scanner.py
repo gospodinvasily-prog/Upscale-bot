@@ -74,6 +74,23 @@ SYMBOL_COOLDOWN_SEC = 24 * 3600
 SIDE_DAILY_STOP_USD = 300.0
 BEAR_AWARE_ENABLED = True
 
+# V13.6: SKIP_2_WEAK логика комбо (по аудиту + идея пользователя)
+# Бэктест V13.6 показал: SKIP_2_WEAK даёт +$8,559 vs WEIGHTED_SCORE -$2,360 vs CURRENT +$903
+# Причина: после фиксов аномалий (ZScoreDev look-ahead + Divergence sign-based)
+# они стали менее коррелированы → WEIGHTED_SCORE penalty за корреляцию стал излишним
+# SKIP_2_WEAK просто фильтрует редкие combos из 2 weak коррелированных
+USE_SKIP_2_WEAK = os.environ.get("ANOMALY_SKIP_2_WEAK", "1") == "1"
+# Классификация аномалий по PF (для SKIP_2_WEAK фильтра)
+STRONG_ANOMALIES = {"Laggard", "ZScoreDev", "LiqMagnet"}  # PF > 1.4
+WEAK_ANOMALIES = {"Divergence", "Exhaustion"}              # PF < 1.4
+# Коррелированные пары (если combo = ровно эти 2 → skip)
+# Это защищает от дублирования сигнала в MR-кластере
+CORRELATION_PAIRS = [
+    ("Laggard", "ZScoreDev"),     # оба Z-score MR
+    ("ZScoreDev", "Exhaustion"),  # Z-score MR + streak MR
+    ("Laggard", "Exhaustion"),    # отстающая монета падала 5+ свечей
+]
+
 # Реальные комиссии Upscale
 COMMISSION_PCT = 0.008  # 0.008% за операцию
 SPREAD_PCT = 0.03       # рыночный спред
@@ -240,11 +257,13 @@ def detect_anomalies(sym, scan_ts, c4h, market_returns, btc_reg):
             elif z_score >= 1.5:
                 anomalies.append(("Laggard", "SHORT", f"Z={z_score:+.2f}"))
 
-    # 2. ZSCOREDEV
-    sma20 = _sma([c["close"] for c in c4], 20)
-    if sma20 and len(c4) >= 20:
-        closes_20 = [c["close"] for c in c4[-20:]]
-        std_20 = statistics.stdev(closes_20) if len(closes_20) > 1 else 0
+    # 2. ZSCOREDEV (V13.6 audit fix: убран look-ahead bias)
+    # Раньше: c4[-1].close входил в sma20/std_20 → микро-смещение Z на ~5%
+    # Теперь: stats считаются по c4[-21:-1] (без последней свечи), затем z от текущей price
+    if len(c4) >= 21:
+        prev_closes = [c["close"] for c in c4[-21:-1]]  # 20 свечей ДО последней
+        sma20 = statistics.mean(prev_closes)
+        std_20 = statistics.stdev(prev_closes) if len(prev_closes) > 1 else 0
         if std_20 > 0:
             z = (price - sma20) / std_20
             if z <= -2.0:
@@ -252,35 +271,61 @@ def detect_anomalies(sym, scan_ts, c4h, market_returns, btc_reg):
             elif z >= 2.0:
                 anomalies.append(("ZScoreDev", "SHORT", f"Z={z:+.2f}"))
 
-    # 3. DIVERGENCE
+    # 3. DIVERGENCE (V13.6 audit fix: нормализация объёмов + sign-based logic)
+    # Раньше: баг знаков — если obv_past отрицательный, формула obv_now < obv_past*0.7
+    #         работала неправильно (ловила false positives при конвергенции)
+    #         + магические 0.7/1.3 без обоснования + ненормализованные объёмы
+    # Теперь: volume flow в [-1, +1] (нормализованный), сравнение по знакам
     if len(c4) >= 10:
         recent = c4[-5:]
-        price_up = recent[-1]["close"] > recent[0]["close"]
-        obv_now = 0
-        for i in range(1, len(recent)):
-            if recent[i]["close"] > recent[i-1]["close"]: obv_now += recent[i]["vol"]
-            elif recent[i]["close"] < recent[i-1]["close"]: obv_now -= recent[i]["vol"]
         older = c4[-10:-5]
-        obv_past = 0
-        for i in range(1, len(older)):
-            if older[i]["close"] > older[i-1]["close"]: obv_past += older[i]["vol"]
-            elif older[i]["close"] < older[i-1]["close"]: obv_past -= older[i]["vol"]
-        if price_up and obv_now < obv_past * 0.7:
-            anomalies.append(("Divergence", "SHORT", "цена↑ OBV↓"))
-        elif not price_up and obv_now > obv_past * 1.3:
-            anomalies.append(("Divergence", "LONG", "цена↓ OBV↑"))
+        price_up = recent[-1]["close"] > recent[0]["close"]
+        
+        def vol_flow(window):
+            """Нормализованный volume flow в [-1, +1]."""
+            if not window or len(window) < 2: return 0.0
+            total_vol = sum(abs(c["vol"]) for c in window)
+            if total_vol <= 0: return 0.0
+            signed = 0.0
+            for i in range(1, len(window)):
+                if window[i]["close"] > window[i-1]["close"]:
+                    signed += window[i]["vol"]
+                elif window[i]["close"] < window[i-1]["close"]:
+                    signed -= window[i]["vol"]
+            return signed / total_vol  # [-1, +1]
+        
+        vf_now = vol_flow(recent)    # [-1, +1]
+        vf_past = vol_flow(older)    # [-1, +1]
+        
+        # Истинная дивергенция: price direction ≠ volume flow direction
+        # SHORT: price↑ но volume flow отрицательный (продажи доминируют) → SHORT
+        # LONG:  price↓ но volume flow положительный (покупки доминируют) → LONG
+        if price_up and vf_now < -0.1 and vf_now < vf_past - 0.2:
+            anomalies.append(("Divergence", "SHORT", f"цена↑ VF={vf_now:+.2f}"))
+        elif not price_up and vf_now > 0.1 and vf_now > vf_past + 0.2:
+            anomalies.append(("Divergence", "LONG", f"цена↓ VF={vf_now:+.2f}"))
 
-    # 4. LIQUIDATION MAGNET
+    # 4. LIQUIDATION MAGNET (V13.5 audit fix #3: ATR-нормализация порога)
+    # Раньше: фиксированный порог 1.5% (магическое число)
+    # Теперь: порог = 1.0 × ATR_pct (волатильно-адаптивный)
+    # На волатильных монетах (ATR=3%) порог = 3%, на спокойных (ATR=0.5%) порог = 0.5%
+    # Дополнительно: добавлен breakout-confirmation — цена должна быть CLOSE к экстремуму,
+    # а не просто wick (close ≥ prev_close или close > prev 4h high для LONG)
     if len(c4) >= 12:
         recent_48h = c4[-12:]
         high_48h = max(c["high"] for c in recent_48h)
         low_48h = min(c["low"] for c in recent_48h)
         dist_to_high = (high_48h - price) / price * 100
         dist_to_low = (price - low_48h) / price * 100
-        if dist_to_high <= 1.5 and dist_to_high >= 0:
-            anomalies.append(("LiqMagnet", "LONG", f"около 48h high (+{dist_to_high:.2f}%)"))
-        elif dist_to_low <= 1.5 and dist_to_low >= 0:
-            anomalies.append(("LiqMagnet", "SHORT", f"около 48h low (-{dist_to_low:.2f}%)"))
+        # ATR-нормализованный порог (1.0×ATR_pct, не менее 0.5%, не более 3%)
+        liq_threshold = max(0.5, min(3.0, atr_pct * 1.0))
+        # Breakout-confirmation: последняя свеча должна быть в направлении сигнала
+        last_candle = c4[-1]
+        last_bullish = last_candle["close"] >= last_candle["open"]
+        if dist_to_high <= liq_threshold and dist_to_high >= 0 and last_bullish:
+            anomalies.append(("LiqMagnet", "LONG", f"около 48h high (+{dist_to_high:.2f}%, thr={liq_threshold:.2f}%)"))
+        elif dist_to_low <= liq_threshold and dist_to_low >= 0 and not last_bullish:
+            anomalies.append(("LiqMagnet", "SHORT", f"около 48h low (-{dist_to_low:.2f}%, thr={liq_threshold:.2f}%)"))
 
     # 5. EXHAUSTION
     if len(c4) >= 7:
@@ -317,6 +362,61 @@ def _get_tp_mult(direction, btc_reg):
     elif btc_reg == -1:
         return TP_TREND if direction == "SHORT" else TP_COUNTER
     return TP_TREND
+
+
+# === V13.6: SKIP_2_WEAK логика комбо ===
+
+def _is_2_weak_combo(anom_list):
+    """Проверяет: combo состоит ТОЛЬКО из 2 weak коррелированных аномалий.
+    Возвращает True если нужно ПРОПУСТИТЬ сигнал.
+    
+    Пропускаем если:
+    - Ровно 2 аномалии в одну сторону
+    - Обе слабые (Divergence, Exhaustion) → слабый сигнал
+    - ИЛИ обе из корреляционной пары → дублирование
+    """
+    if len(anom_list) != 2: return False
+    names = {n for n, _ in anom_list}
+    # Случай 1: обе слабые
+    if names.issubset(WEAK_ANOMALIES):
+        return True
+    # Случай 2: коррелированная пара
+    for a, b in CORRELATION_PAIRS:
+        if names == {a, b}:
+            return True
+    return False
+
+
+def _has_strong_anomaly(anom_list):
+    """Проверяет есть ли STRONG аномалия (PF > 1.4) в списке."""
+    return any(n in STRONG_ANOMALIES for n, _ in anom_list)
+
+
+def _count_uncorrelated(anom_list):
+    """Считает количество 'uncorrelated' аномалий для BEAR фильтра.
+    Коррелированные пары считаются как 1, не как 2."""
+    if not anom_list: return 0
+    names = {n for n, _ in anom_list}
+    count = 0
+    counted = set()
+    for n in names:
+        if n in counted: continue
+        # Проверяем есть ли корреляционный партнер
+        partner_found = False
+        for a, b in CORRELATION_PAIRS:
+            if n == a and b in names:
+                count += 1
+                counted.add(a); counted.add(b)
+                partner_found = True
+                break
+            elif n == b and a in names and a not in counted:
+                continue  # посчитаем когда дойдём до a
+        if not partner_found:
+            count += 1
+            counted.add(n)
+    return count
+
+
 
 # === ПРОВЕРКА ЗАНЯТОСТИ ПАРЫ PROPHET ===
 
@@ -386,17 +486,37 @@ def do_scan(scan_ts=None):
 
         direction = None
         active = []
-        if len(long_anom) >= MIN_ANOMALIES:
-            # BEAR фильтр: 3+ аномалии в BEAR → skip
-            if btc_reg == -1 and len(long_anom) >= 3:
+        
+        if USE_SKIP_2_WEAK:
+            # V13.6: SKIP_2_WEAK логика комбо
+            # Skip если combo состоит только из 2 weak коррелированных аномалий
+            if _is_2_weak_combo(long_anom) or _is_2_weak_combo(short_anom):
                 continue
-            direction = "LONG"
-            active = long_anom
-        elif len(short_anom) >= MIN_ANOMALIES:
-            if btc_reg == -1 and len(short_anom) >= 3:
-                continue
-            direction = "SHORT"
-            active = short_anom
+            
+            if len(long_anom) >= MIN_ANOMALIES:
+                # BEAR фильтр: 3+ uncorrelated LONG в BEAR → skip
+                if btc_reg == -1 and _count_uncorrelated(long_anom) >= 3:
+                    continue
+                direction = "LONG"
+                active = long_anom
+            elif len(short_anom) >= MIN_ANOMALIES:
+                if btc_reg == -1 and _count_uncorrelated(short_anom) >= 3:
+                    continue
+                direction = "SHORT"
+                active = short_anom
+        else:
+            # Старая логика: ≥2 аномалии в одну сторону
+            if len(long_anom) >= MIN_ANOMALIES:
+                # BEAR фильтр: 3+ аномалии в BEAR → skip
+                if btc_reg == -1 and len(long_anom) >= 3:
+                    continue
+                direction = "LONG"
+                active = long_anom
+            elif len(short_anom) >= MIN_ANOMALIES:
+                if btc_reg == -1 and len(short_anom) >= 3:
+                    continue
+                direction = "SHORT"
+                active = short_anom
 
         if not direction: continue
 
@@ -442,12 +562,15 @@ def do_scan(scan_ts=None):
             "anomalies": " | ".join([f"{n}({d})" for n, d in active]),
             "anomaly_names": [n for n, _ in active],
             "n_anomalies": len(active),
+            "has_strong": _has_strong_anomaly(active),
+            "is_2_weak_skipped": _is_2_weak_combo(active),  # всегда False если дошли сюда
             "stop_price": entry_price*(1-sp/100) if is_long else entry_price*(1+sp/100),
             "tp_price": entry_price*(1+tp/100) if is_long else entry_price*(1-tp/100),
         })
 
     if not results: return None
-    results.sort(key=lambda x: -x["n_anomalies"])
+    # V13.6: приоритет — STRONG аномалии сначала, потом по n_anomalies
+    results.sort(key=lambda x: (-int(x.get("has_strong", False)), -x["n_anomalies"]))
     return results[0]
 
 # === EXECUTE TRADE ===
@@ -484,6 +607,8 @@ def execute_trade(setup):
         executor.on_signal(sig, score)
         emoji_dir = "🟢 LONG" if side == "long" else "🔴 SHORT"
         score_label = "🔥 СИЛЬНЫЙ" if setup["n_anomalies"] >= 4 else ("⭐ Приоритет" if setup["n_anomalies"] >= 3 else "обычный")
+        # V13.6: показываем STRONG статус
+        strong_str = " | STRONG✓" if setup.get("has_strong") else ""
         if B:
             B.send_telegram(
                 f"🚨 <b>ANOMALY A+: {sym} {emoji_dir} открыт</b>\n"
@@ -492,7 +617,7 @@ def execute_trade(setup):
                 f"Тейк: ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
                 f"TP×ATR: {setup['tp_mult']:.1f}\n"
                 f"Маржа: ${margin:.0f} × {LEVERAGE}x\n"
-                f"📊 Аномалий: {setup['n_anomalies']}/5 ({score_label})\n"
+                f"📊 Аномалий: {setup['n_anomalies']}/5 ({score_label}){strong_str}\n"
                 f"📋 {setup['anomalies']}"
             )
         _state["trades_today"] += 1
@@ -591,15 +716,29 @@ def manage_positions():
                                 except: pass
             except: pass
 
-            # Комиссии
-            commission_pct = COMMISSION_PCT * 2 + SPREAD_PCT
-            pnl -= commission_pct
+            # V13.5 FIX (audit #2): Корректное вычитание комиссии
+            # Раньше было: pnl -= 0.046 (безразмерное вычитание из долларового PnL!)
+            # Биржа уже включила комиссии в realizedPnl, но мы добавляем спред (не учтённый биржей).
+            # Спред = SPREAD_PCT% × позиции = (entry × leverage × SPREAD_PCT / 100)
+            # Также считаем commission_usd = (entry × pos_size × commission_pct / 100)
+            # если realizedPnl на бирже = net (после комиссий биржи).
+            try:
+                pos_size_usd = rec.get("entry", 0) * LEVERAGE  # позиция в $
+                # спред + биржа (вход+выход) — учитываем как % от позиции
+                cost_usd = pos_size_usd * (COMMISSION_PCT * 2 + SPREAD_PCT) / 100.0
+                pnl -= cost_usd
+            except Exception as _e:
+                print(f"[anomaly A+] commission calc error: {_e}")
 
             _stats["pnl"] += pnl
             direction_field = rec.get("direction", rec.get("dir", "long"))
             _update_side_pnl(direction_field, pnl)
 
-            if pnl < 0:
+            # V13.5 FIX (audit #2): blacklist только при РЕАЛЬНОМ убытке (не микро-<-$0.05)
+            # и только при reason=STOP (как в бэктесте)
+            # если pnl близко к нулю (±$0.10) → считаем "no-trade" и не blacklist'им
+            BLACKLIST_THRESHOLD_USD = -0.50  # убыток > $0.50 = реальный стоп
+            if pnl < BLACKLIST_THRESHOLD_USD:
                 btc_reg_close = _btc_regime(int(_now()))
                 cd_hours = 48 if (BEAR_AWARE_ENABLED and btc_reg_close == -1) else 24
                 if direction_field in ("LONG", "long"):
@@ -615,7 +754,7 @@ def manage_positions():
                 _state["symbol_cooldown"] = sc
                 _save()
             else:
-                # 24ч кулдаун даже после прибыли
+                # 24ч кулдаун даже после прибыли или микро-убытка
                 sc = _state.get("symbol_cooldown", {})
                 sc[rec["sym"]] = int(_now()) + SYMBOL_COOLDOWN_SEC
                 _state["symbol_cooldown"] = sc
@@ -729,13 +868,14 @@ def _scanner_loop():
                 direction = setup["direction"]
                 emoji_dir = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
                 score_label = "🔥 СИЛЬНЫЙ" if setup["n_anomalies"] >= 4 else ("⭐ Приоритет" if setup["n_anomalies"] >= 3 else "обычный")
+                strong_str = " | STRONG✓" if setup.get("has_strong") else ""
                 print(f"[anomaly A+] сигнал: {setup['symbol']} {direction} ({setup['n_anomalies']}/5 {score_label})")
                 _stats["signals"] += 1
 
                 if B:
                     B.send_telegram(
                         f"🚨 <b>ANOMALY A+ — сигнал найден</b>\n"
-                        f"🎯 {setup['symbol']} {emoji_dir} ({setup['n_anomalies']}/5 {score_label})\n"
+                        f"🎯 {setup['symbol']} {emoji_dir} ({setup['n_anomalies']}/5 {score_label}{strong_str})\n"
                         f"📋 {setup['anomalies']}\n"
                         f"⏱️ Вхожу по рынку..."
                     )

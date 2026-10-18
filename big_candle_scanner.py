@@ -137,7 +137,18 @@ _state = {
     "last_signal_ts": 0,
     "trades_today": 0,
     "trades_today_date": "",
+    # V13.4: pending_signals — сигналы что не прошли фильтр и ждут подтверждения в 12:15 МСК
+    # Формат: [{"day": "2026-10-18", "ts": 172923..., "direction": "long", ...}, ...]
+    "pending_signals": [],
 }
+
+# --- V13.4: Включить режим WAIT_1215_CONFIRM ---
+# True = если фильтр не прошёл, ждём закрытия 15m свечи в 12:15 МСК
+# и входим в туже сторону если подтверждено, иначе пропуск
+BC_WAIT_1215_CONFIRM = os.environ.get("BC_WAIT_1215_CONFIRM", "1") == "1"
+BC_WAIT_HOUR_MSK = 12   # час проверки подтверждения (12:15 МСК = свеча открылась в 12:00)
+BC_WAIT_MIN_MSK  = 15   # минута закрытия 15m свечи
+
 
 # --- Статистика ---
 _stats = {
@@ -206,6 +217,8 @@ def _save_state():
             "alerts_enabled": _state["alerts_enabled"],
             "trades_today": _state.get("trades_today", 0),
             "trades_today_date": _state.get("trades_today_date", ""),
+            # V13.4: сохраняем pending_signals для восстановления после рестарта
+            "pending_signals": _state.get("pending_signals", []),
         }
         _atomic_write_json(BC_STATE_FILE, data)
 
@@ -219,8 +232,10 @@ def _load_state():
             _state["alerts_enabled"] = saved.get("alerts_enabled", True)
             _state["trades_today"] = saved.get("trades_today", 0)
             _state["trades_today_date"] = saved.get("trades_today_date", _today_msk_str())
+            _state["pending_signals"] = saved.get("pending_signals", [])
         else:
             _state["trades_today_date"] = _today_msk_str()
+            _state["pending_signals"] = []
 
 
 # =====================================================================
@@ -387,27 +402,24 @@ def _check_signal():
 
         # Фильтр SMA50 1H
         sma_value = None
+        filter_passes = True  # V13.4: по умолчанию фильтр считается пройденным
         if BC_USE_SMA50:
             sma_value = _fetch_sma_1h()
             if sma_value is None:
+                # Недостаточно данных SMA → считаем фильтр не пройденным
+                filter_passes = False
+            elif is_long and entry_price < sma_value:
+                filter_passes = False
+            elif not is_long and entry_price > sma_value:
+                filter_passes = False
+
+            # V13.4: если фильтр не прошёл — НЕ возвращаем None сразу.
+            # Сохраняем сигнал с пометкой filter_passes=False,
+            # а _scanner_loop решит: WAIT_1215_CONFIRM или пропуск.
+            if not filter_passes:
                 _stats["signals_skipped_sma"] += 1
-                return None
-            if is_long and entry_price < sma_value:
-                _stats["signals_skipped_sma"] += 1
-                if B and _state["alerts_enabled"]:
-                    B.send_telegram(
-                        f"🚨 <b>BIG CANDLE BTC</b> {'🟢 ЛОНГ' if is_long else '🔴 ШОРТ'} (×{vol_ratio:.2f})\n"
-                        f"⚠️ SMA50 1H фильтр: цена ${entry_price:.0f} < SMA ${sma_value:.0f} → пропуск"
-                    )
-                return None
-            if not is_long and entry_price > sma_value:
-                _stats["signals_skipped_sma"] += 1
-                if B and _state["alerts_enabled"]:
-                    B.send_telegram(
-                        f"🚨 <b>BIG CANDLE BTC</b> {'🟢 ЛОНГ' if is_long else '🔴 ШОРТ'} (×{vol_ratio:.2f})\n"
-                        f"⚠️ SMA50 1H фильтр: цена ${entry_price:.0f} > SMA ${sma_value:.0f} → пропуск"
-                    )
-                return None
+                # Больше НЕ шлём алерт здесь — он будет отправлен в _scanner_loop
+                # с указанием "ждём 12:15 МСК" (если включён режим WAIT_1215_CONFIRM)
 
         # Считаем ATR по 15m свечам (последние 5 = 4 TR = 1 час)
         pre_candles = candles_15m[-5:]  # 5 свечей для расчёта 4 TR
@@ -457,6 +469,8 @@ def _check_signal():
             "sma_value": sma_value,
             "signal_ts": big["ts"],
             "signal_time_msk": _to_msk(big["ts"]).strftime("%H:%M"),
+            "filter_passes": filter_passes,  # V13.4
+            "day": _to_msk(big["ts"]).strftime("%Y-%m-%d"),  # V13.4
         }
         return signal
 
@@ -819,25 +833,73 @@ def _scanner_loop():
                 _stats["signals_total"] += 1
                 _log_signal(signal)
 
-                # Алерт
-                if B and _state["alerts_enabled"]:
-                    direction_emoji = "🟢 ЛОНГ" if signal["is_long"] else "🔴 ШОРТ"
-                    B.send_telegram(
-                        f"🚨 <b>BIG CANDLE BTC {direction_emoji}</b>\n"
-                        f"Цена входа: ${signal['entry_price']:.2f}\n"
-                        f"Vol×{signal['vol_ratio']:.2f} (порог ×{BC_VOL_MULT})\n"
-                        f"ATR: ${signal['atr']:.2f} ({signal['atr_pct']:.3f}%)\n"
-                        f"Stop: ${signal['stop_price']:.2f} ({signal['stop_pct']:.3f}%)\n"
-                        f"TP: ${signal['tp_price']:.2f} ({signal['tp_pct']:.3f}%, RR 1:{signal['tp_pct']/signal['stop_pct']:.1f})"
-                        + (f"\nSMA50 1H: ${signal['sma_value']:.0f}" if signal.get("sma_value") else "")
-                    )
-
-                # Авто-торговля
-                if _state["enabled"]:
-                    _execute_signal(signal)
+                # V13.4: если фильтр не прошёл — решаем что делать
+                if not signal.get("filter_passes", True):
+                    # Фильтр не прошёл
+                    if BC_WAIT_1215_CONFIRM and _state["enabled"]:
+                        # Режим B: ждём закрытия 15m свечи в 12:15 МСК для подтверждения
+                        pending = _state.get("pending_signals", [])
+                        # Проверяем что такого же дня ещё нет в pending
+                        if not any(p.get("day") == signal.get("day") for p in pending):
+                            pending_signal = {
+                                "day": signal["day"],
+                                "ts": signal["signal_ts"],
+                                "time_msk": signal["signal_time_msk"],
+                                "direction": signal["direction"],
+                                "is_long": signal["is_long"],
+                                "vol_ratio": signal["vol_ratio"],
+                                "atr": signal["atr"],
+                                "entry_price_at_signal": signal["entry_price"],
+                                "sma_value_at_signal": signal["sma_value"],
+                                "filter_passes": False,
+                                "queued_ts": _now_ts(),
+                            }
+                            pending.append(pending_signal)
+                            _state["pending_signals"] = pending
+                            _save_state()
+                            if B:
+                                direction_emoji = "🟢 ЛОНГ" if signal["is_long"] else "🔴 ШОРТ"
+                                sma_str = f"${signal['sma_value']:.0f}" if signal.get("sma_value") else "н/д"
+                                B.send_telegram(
+                                    f"🚨 <b>BIG CANDLE BTC {direction_emoji}</b> (×{signal['vol_ratio']:.2f})\n"
+                                    f"⚠️ SMA50 1H фильтр НЕ пройден (цена ${signal['entry_price']:.0f} vs SMA {sma_str})\n"
+                                    f"⏳ Жду подтверждения закрытием 15m свечи в 12:15 МСК\n"
+                                    f"   Если close ≥ SMA → вход {direction_emoji}\n"
+                                    f"   Если close < SMA → пропуск сигнала"
+                                )
+                        else:
+                            # Уже есть pending на этот день — не дублируем
+                            pass
+                    else:
+                        # Старое поведение: просто пропуск + алерт
+                        if B and _state["alerts_enabled"]:
+                            direction_emoji = "🟢 ЛОНГ" if signal["is_long"] else "🔴 ШОРТ"
+                            sma_str = f"${signal['sma_value']:.0f}" if signal.get("sma_value") else "н/д"
+                            cmp = "<" if signal["is_long"] else ">"
+                            B.send_telegram(
+                                f"🚨 <b>BIG CANDLE BTC {direction_emoji}</b> (×{signal['vol_ratio']:.2f})\n"
+                                f"⚠️ SMA50 1H фильтр: цена ${signal['entry_price']:.0f} {cmp} SMA {sma_str} → пропуск"
+                            )
                 else:
-                    if B:
-                        B.send_telegram("ℹ️ Авто-торговля выключена (/bc_on чтобы включить)")
+                    # Фильтр прошёл → обычный алерт + вход
+                    if B and _state["alerts_enabled"]:
+                        direction_emoji = "🟢 ЛОНГ" if signal["is_long"] else "🔴 ШОРТ"
+                        B.send_telegram(
+                            f"🚨 <b>BIG CANDLE BTC {direction_emoji}</b>\n"
+                            f"Цена входа: ${signal['entry_price']:.2f}\n"
+                            f"Vol×{signal['vol_ratio']:.2f} (порог ×{BC_VOL_MULT})\n"
+                            f"ATR: ${signal['atr']:.2f} ({signal['atr_pct']:.3f}%)\n"
+                            f"Stop: ${signal['stop_price']:.2f} ({signal['stop_pct']:.3f}%)\n"
+                            f"TP: ${signal['tp_price']:.2f} ({signal['tp_pct']:.3f}%, RR 1:{signal['tp_pct']/signal['stop_pct']:.1f})"
+                            + (f"\nSMA50 1H: ${signal['sma_value']:.0f}" if signal.get("sma_value") else "")
+                        )
+
+                    # Авто-торговля
+                    if _state["enabled"]:
+                        _execute_signal(signal)
+                    else:
+                        if B:
+                            B.send_telegram("ℹ️ Авто-торговля выключена (/bc_on чтобы включить)")
 
             time.sleep(BC_CHECK_INTERVAL)
         except Exception as e:
@@ -854,6 +916,196 @@ def _manager_loop():
         except Exception as e:
             print(f"[bc] manager error: {e}")
         time.sleep(30)
+
+
+# =====================================================================
+#  V13.4: CONFIRMATION LOOP — проверка pending_signals в 12:15 МСК
+# =====================================================================
+
+_confirmation_thread = None
+_last_confirmation_day = None  # трекаем день последней проверки чтобы не повторять
+
+def _confirmation_loop():
+    """V13.4: раз в минуту проверяет pending_signals.
+    Если сейчас 12:15-12:30 МСК и есть pending_signals на сегодня — обрабатывает их.
+    Логика:
+      - close 15m свечи в 12:15 ≥ SMA50 1H (для long) → вход в LONG
+      - close 15m свечи в 12:15 ≤ SMA50 1H (для short) → вход в SHORT
+      - иначе → пропуск (не подтверждено)
+    """
+    global _last_confirmation_day
+    print(f"[bc] Confirmation loop запущен: проверка в {BC_WAIT_HOUR_MSK}:{BC_WAIT_MIN_MSK:02d} МСК каждый день")
+    while True:
+        try:
+            now_msk = _to_msk(_now_ts())
+            today_str = now_msk.strftime("%Y-%m-%d")
+
+            # Окно проверки: с 12:15 до 12:30 МСК (15 мин после закрытия свечи)
+            in_window = (now_msk.hour == BC_WAIT_HOUR_MSK and BC_WAIT_MIN_MSK <= now_msk.minute < BC_WAIT_MIN_MSK + 15)
+            already_done = (_last_confirmation_day == today_str)
+
+            if in_window and not already_done:
+                pending = _state.get("pending_signals", [])
+                if pending:
+                    today_pending = [p for p in pending if p.get("day") == today_str]
+                    if today_pending:
+                        print(f"[bc] Confirmation: обработка {len(today_pending)} pending_signals")
+                        _process_pending_confirmation(today_pending)
+                    _last_confirmation_day = today_str
+                else:
+                    _last_confirmation_day = today_str
+
+            # Чистим старые pending_signals (старше 2 дней)
+            pending = _state.get("pending_signals", [])
+            if pending:
+                cutoff_day = (_to_msk(_now_ts()) - dt.timedelta(days=2)).strftime("%Y-%m-%d")
+                fresh = [p for p in pending if p.get("day", "") >= cutoff_day]
+                if len(fresh) != len(pending):
+                    _state["pending_signals"] = fresh
+                    _save_state()
+
+            time.sleep(60)
+        except Exception as e:
+            print(f"[bc] confirmation loop error: {e}")
+            time.sleep(60)
+
+
+def _process_pending_confirmation(today_pending):
+    """Обрабатывает pending signals на сегодня: ищет свечу 12:15 МСК и проверяет подтверждение."""
+    if not B or not hasattr(B, "EXECUTOR"):
+        print("[bc] no executor — skip confirmation")
+        return
+    executor = B.EXECUTOR
+    if not executor or not executor.client:
+        print("[bc] no client — skip confirmation")
+        return
+
+    if _get_open_count() > 0:
+        if B:
+            B.send_telegram("ℹ️ BC: уже есть открытая позиция — подтверждение 12:15 пропускается")
+        return
+
+    if _state.get("trades_today", 0) >= BC_MAX_TRADES_DAY:
+        if B:
+            B.send_telegram(f"ℹ️ BC: лимит сделок на сегодня исчерпан — подтверждение пропускается")
+        return
+
+    candles_15m = _fetch_candles("BTC_USDT", interval="15m", limit=20)
+    if not candles_15m:
+        print("[bc] no 15m candles — skip")
+        return
+
+    now_msk = _to_msk(_now_ts())
+    today_str = now_msk.strftime("%Y-%m-%d")
+    c1215 = None
+    for c in candles_15m:
+        msk = _to_msk(c["ts"])
+        if msk.strftime("%Y-%m-%d") == today_str and msk.hour == BC_WAIT_HOUR_MSK and msk.minute == BC_WAIT_MIN_MSK:
+            c1215 = c
+            break
+    if c1215 is None:
+        print(f"[bc] нет 15m свечи закрытой в {BC_WAIT_HOUR_MSK}:{BC_WAIT_MIN_MSK:02d} МСК сегодня — ждём ещё")
+        return
+
+    close_1215 = c1215["close"]
+    sma_at_1215 = _fetch_sma_1h()
+    if sma_at_1215 is None:
+        print("[bc] нет SMA50 1H — skip")
+        return
+
+    pre_candles = candles_15m[-5:]
+    atr_1215 = _calc_atr(pre_candles, period=BC_ATR_PERIOD)
+    if atr_1215 <= 0:
+        print("[bc] ATR=0 на 12:15 — skip")
+        return
+
+    entry_price = close_1215
+    atr_pct = (atr_1215 / entry_price) * 100
+    stop_pct = max(BC_ATR_STOP_MIN_PCT, BC_ATR_STOP_MULT * atr_pct)
+    tp1_pct = max(BC_ATR_TP_MIN_PCT, BC_ATR_TP_MULT * atr_pct)
+    tp2_pct = max(BC_ATR_TP_MIN_PCT * 1.5, BC_ATR_TP2_MULT * atr_pct)
+    if tp1_pct < stop_pct * 1.5:
+        tp1_pct = stop_pct * 1.5
+    if tp2_pct <= tp1_pct:
+        tp2_pct = tp1_pct * 1.5
+
+    for p in today_pending:
+        original_direction = p.get("direction", "long")
+        original_is_long = p.get("is_long", True)
+        if original_is_long:
+            confirmed = close_1215 >= sma_at_1215
+        else:
+            confirmed = close_1215 <= sma_at_1215
+
+        if not confirmed:
+            if B:
+                direction_emoji = "🟢 ЛОНГ" if original_is_long else "🔴 ШОРТ"
+                cmp = "≥" if original_is_long else "≤"
+                B.send_telegram(
+                    f"⏰ <b>BC 12:15 МСК — подтверждение не получено</b>\n"
+                    f"Сигнал: {direction_emoji} (от {p.get('time_msk','?')})\n"
+                    f"close 12:15: ${close_1215:.2f} {cmp} SMA50 1H ${sma_at_1215:.0f} — НЕ подтверждено\n"
+                    f"Пропуск сигнала"
+                )
+            continue
+
+        is_long = original_is_long
+        direction = original_direction
+        if is_long:
+            stop_price = entry_price * (1 - stop_pct / 100)
+            tp1_price = entry_price * (1 + tp1_pct / 100)
+            tp2_price = entry_price * (1 + tp2_pct / 100)
+        else:
+            stop_price = entry_price * (1 + stop_pct / 100)
+            tp1_price = entry_price * (1 - tp1_pct / 100)
+            tp2_price = entry_price * (1 - tp2_pct / 100)
+
+        signal = {
+            "sym": "BTC",
+            "direction": direction,
+            "is_long": is_long,
+            "entry_price": entry_price,
+            "vol_ratio": p.get("vol_ratio", 0.0),
+            "atr": atr_1215,
+            "atr_pct": atr_pct,
+            "stop_price": stop_price,
+            "tp_price": tp1_price,
+            "tp1_price": tp1_price,
+            "tp2_price": tp2_price,
+            "stop_pct": stop_pct,
+            "tp_pct": tp1_pct,
+            "tp1_pct": tp1_pct,
+            "tp2_pct": tp2_pct,
+            "sma_value": sma_at_1215,
+            "signal_ts": int(_now_ts()),
+            "signal_time_msk": _to_msk(_now_ts()).strftime("%H:%M"),
+            "confirmed_at_1215": True,
+            "original_signal_ts": p.get("ts"),
+            "original_signal_time": p.get("time_msk"),
+        }
+
+        if B:
+            direction_emoji = "🟢 LONG" if is_long else "🔴 SHORT"
+            cmp_str = "≥" if is_long else "≤"
+            B.send_telegram(
+                f"✅ <b>BC 12:15 МСК — подтверждение получено</b>\n"
+                f"Оригинал: {p.get('time_msk','?')} (vol×{p.get('vol_ratio',0):.2f})\n"
+                f"close 12:15: ${close_1215:.2f} {cmp_str} SMA50 1H ${sma_at_1215:.0f} ✓\n\n"
+                f"🚨 <b>BIG CANDLE BTC {direction_emoji}</b>\n"
+                f"Вход: ${entry_price:.2f}\n"
+                f"Stop: ${stop_price:.2f} ({stop_pct:.3f}%)\n"
+                f"TP1: ${tp1_price:.2f} ({tp1_pct:.3f}%)\n"
+                f"TP2: ${tp2_price:.2f} ({tp2_pct:.3f}%)\n"
+                f"ATR: ${atr_1215:.2f}"
+            )
+
+        _execute_signal(signal)
+
+    # Чистим обработанные pending
+    pending = _state.get("pending_signals", [])
+    fresh = [p for p in pending if p.get("day") != today_str]
+    _state["pending_signals"] = fresh
+    _save_state()
 
 
 # =====================================================================
@@ -903,6 +1155,127 @@ def cmd_alerts_toggle():
     _save_state()
     state_str = "ВКЛ" if _state["alerts_enabled"] else "ВЫКЛ"
     return f"🔔 Алерты {state_str}"
+
+
+def cmd_manual(direction=None):
+    """Принудительный вход в сделку с теми же параметрами что auto-сигнал.
+
+    Использование:
+      /bc_manual long   — принудительный LONG
+      /bc_manual short  — принудительный SHORT
+      /bc_manual        — авто: по последней закрытой 15m свече (как auto-сигнал)
+
+    Параметры (как в auto):
+      - symbol: BTC
+      - entry: текущая цена BTC с Gate
+      - stop: 2×ATR (мин 0.30%)
+      - TP1: 3×ATR, TP2: 5×ATR
+      - leverage: 5x, risk $100
+    """
+    if not B or not hasattr(B, "EXECUTOR"):
+        return "⚠️ Executor недоступен"
+    executor = B.EXECUTOR
+    if not executor or not executor.client:
+        return "⚠️ Нет клиента Upscale"
+
+    # Лимит сделок в день
+    if _state.get("trades_today", 0) >= BC_MAX_TRADES_DAY:
+        return f"⚠️ Лимит сделок на сегодня исчерпан: {_state['trades_today']}/{BC_MAX_TRADES_DAY}"
+
+    # Уже есть открытая позиция?
+    if _get_open_count() > 0:
+        return f"⚠️ Уже есть открытая Big Candle позиция ({_get_open_count()}). Закрой её через /bc_close"
+
+    # Определяем направление
+    if direction is None or direction == "":
+        # Авто: по последней закрытой 15m свече
+        candles_15m = _fetch_candles("BTC_USDT", interval="15m", limit=10)
+        if not candles_15m or len(candles_15m) < 2:
+            return "⚠️ Не удалось получить свечи BTC"
+        last = candles_15m[-1]
+        is_long = last["close"] >= last["open"]
+        direction = "long" if is_long else "short"
+    else:
+        direction = direction.lower().strip()
+        if direction not in ("long", "short", "l", "s"):
+            return "⚠️ Использование: /bc_manual long|short"
+        if direction == "l": direction = "long"
+        if direction == "s": direction = "short"
+
+    is_long = direction == "long"
+
+    # Текущая цена BTC
+    candles_15m = _fetch_candles("BTC_USDT", interval="15m", limit=10)
+    if not candles_15m:
+        return "⚠️ Не удалось получить цену BTC"
+    entry_price = candles_15m[-1]["close"]
+
+    # SMA50 1H (только для информации, не блокируем)
+    sma_value = None
+    if BC_USE_SMA50:
+        try: sma_value = _fetch_sma_1h()
+        except: pass
+
+    # ATR по последним 5 свечам 15m
+    pre_candles = candles_15m[-5:]
+    atr_value = _calc_atr(pre_candles, period=BC_ATR_PERIOD)
+    if atr_value <= 0:
+        return "⚠️ ATR = 0, нельзя рассчитать уровни"
+
+    # Уровни стопа и тейка (как в auto)
+    atr_pct = (atr_value / entry_price) * 100
+    stop_pct = max(BC_ATR_STOP_MIN_PCT, BC_ATR_STOP_MULT * atr_pct)
+    tp1_pct = max(BC_ATR_TP_MIN_PCT, BC_ATR_TP_MULT * atr_pct)
+    tp2_pct = max(BC_ATR_TP_MIN_PCT * 1.5, BC_ATR_TP2_MULT * atr_pct)
+    if tp1_pct < stop_pct * 1.5:
+        tp1_pct = stop_pct * 1.5
+    if tp2_pct <= tp1_pct:
+        tp2_pct = tp1_pct * 1.5
+
+    if is_long:
+        stop_price = entry_price * (1 - stop_pct / 100)
+        tp1_price = entry_price * (1 + tp1_pct / 100)
+        tp2_price = entry_price * (1 + tp2_pct / 100)
+    else:
+        stop_price = entry_price * (1 + stop_pct / 100)
+        tp1_price = entry_price * (1 - tp1_pct / 100)
+        tp2_price = entry_price * (1 - tp2_pct / 100)
+
+    signal = {
+        "sym": "BTC",
+        "direction": direction,
+        "is_long": is_long,
+        "entry_price": entry_price,
+        "vol_ratio": 0.0,  # manual — без проверки объёма
+        "atr": atr_value,
+        "atr_pct": atr_pct,
+        "stop_price": stop_price,
+        "tp_price": tp1_price,
+        "tp1_price": tp1_price,
+        "tp2_price": tp2_price,
+        "stop_pct": stop_pct,
+        "tp_pct": tp1_pct,
+        "tp1_pct": tp1_pct,
+        "tp2_pct": tp2_pct,
+        "sma_value": sma_value,
+        "signal_ts": int(_now_ts()),
+        "signal_time_msk": _to_msk(_now_ts()).strftime("%H:%M"),
+    }
+
+    if B:
+        B.send_telegram(f"🔧 <b>BC MANUAL ENTRY</b> — собираю сигнал BTC {direction.upper()} @ ${entry_price:.2f}...")
+
+    ok = _execute_signal(signal)
+    if ok:
+        sma_line = f"\nSMA50 1H: ${sma_value:.0f}" if sma_value else ""
+        return (f"✅ Принудительный вход выполнен\n"
+                f"BTC {direction.upper()} @ ${entry_price:.2f}\n"
+                f"Стоп: ${stop_price:.2f} ({stop_pct:.3f}%)\n"
+                f"TP1: ${tp1_price:.2f} ({tp1_pct:.3f}%)\n"
+                f"TP2: ${tp2_price:.2f} ({tp2_pct:.3f}%)\n"
+                f"ATR: ${atr_value:.2f} ({atr_pct:.3f}%){sma_line}")
+    else:
+        return "❌ Ошибка входа — смотри логи"
 
 
 def cmd_close():
@@ -979,7 +1352,7 @@ def cmd_log():
 
 def start():
     """Запуск стратегии в отдельном потоке."""
-    global _scanner_thread, _manager_thread
+    global _scanner_thread, _manager_thread, _confirmation_thread
 
     _load_state()
 
@@ -991,9 +1364,14 @@ def start():
     _manager_thread = threading.Thread(target=_manager_loop, daemon=True, name="bc-manager")
     _manager_thread.start()
 
+    # V13.4: запускаем confirmation loop (проверяет pending_signals в 12:15 МСК)
+    _confirmation_thread = threading.Thread(target=_confirmation_loop, daemon=True, name="bc-confirmation")
+    _confirmation_thread.start()
+
     print(f"[bc] {STRATEGY_NAME} старт: окно {BC_WINDOW_START_HOUR_MSK}:00-{BC_WINDOW_END_HOUR_MSK}:{BC_WINDOW_END_MIN_MSK:02d} МСК")
     if B:
         sma_line = f"✅ SMA50 1H фильтр" if BC_USE_SMA50 else "🔴 SMA50 фильтр ВЫКЛ"
+        wait_line = f"✅ WAIT_1215_CONFIRM (ожидание подтверждения в 12:15 МСК)" if BC_WAIT_1215_CONFIRM else "🔴 WAIT_1215_CONFIRM ВЫКЛ"
         B.send_telegram(
             f"🚨 <b>{STRATEGY_NAME} запущен</b>\n"
             f"Пар: BTC only\n"
@@ -1001,11 +1379,12 @@ def start():
             f"Окно: {BC_WINDOW_START_HOUR_MSK}:00-{BC_WINDOW_END_HOUR_MSK}:{BC_WINDOW_END_MIN_MSK:02d} МСК\n"
             f"Порог: ×{BC_VOL_MULT} (среднее после {BC_EUROPEAN_START_HOUR}:00 МСК)\n"
             f"{sma_line}\n"
+            f"{wait_line}\n"
             f"ATR_15m: {BC_ATR_PERIOD} свечи (1 час)\n"
             f"Стоп: {BC_ATR_STOP_MULT}×ATR (мин {BC_ATR_STOP_MIN_PCT}%) | TP: {BC_ATR_TP_MULT}×ATR (мин {BC_ATR_TP_MIN_PCT}%)\n"
             f"Max hold: {BC_MAX_HOLD_SEC//3600}ч safety-net | Лимит: {BC_MAX_TRADES_DAY}/день\n"
             f"Авто-торговля: {'✅ ВКЛ' if _state['enabled'] else '🔴 ВЫКЛ'}\n"
-            f"Команды: /bc /bc_on /bc_off /bc_close /bc_stats /bc_log"
+            f"Команды: /bc /bc_on /bc_off /bc_close /bc_stats /bc_log /bc_manual"
         )
 
 

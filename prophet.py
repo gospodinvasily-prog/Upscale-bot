@@ -218,8 +218,9 @@ def _can_pyramid(direction: str, tracked: dict) -> tuple:
             continue
         cur_price = _fetch_current_price_for_sym(sym)
         if not cur_price:
-            # V12-fix: Не можем получить цену → НЕ блокируем (считаем OK)
-            # Прошлая логика блокировала = false positive
+            # V13.7 FIX P0-2 (audit): Network failure — НЕ можем проверить цену
+            # Раньше: auto-allow (опасно, обход риск-менеджмента)
+            # Теперь: BLOCK — лучше пропустить сигнал чем рисковать
             unknown += 1
             continue
         if side_long:
@@ -228,7 +229,7 @@ def _can_pyramid(direction: str, tracked: dict) -> tuple:
         else:
             # SHORT: прибыль если cur < entry
             pnl_pct = (entry - cur_price) / entry * 100
-        if pnl_pct > 0.1:  # мини-порог 0.1% чтобы избежать шума
+        if pnl_pct > 0.5:  # V13.7: порог 0.5% (был 0.1% — ниже комиссий+slippage)
             profitable += 1
         else:
             losing += 1
@@ -236,10 +237,11 @@ def _can_pyramid(direction: str, tracked: dict) -> tuple:
     if losing > 0:
         return False, f"в {direction} уже {n_side} позиций, {losing} в убытке — пирамидинг запрещён"
 
-    # V12-fix: если есть unknown (не смогли проверить цену) — разрешаем
-    # НЕ блокируем из-за того что не смогли получить цену
+    # V13.7 FIX P0-2 (audit): если есть unknown (network failure) — БЛОКИРУЕМ
+    # Прошлая логика разрешала = обход риск-менеджмента при сбое API
+    # Теперь: лучше пропустить сигнал чем открыть 2-ю позицию когда 1-я в убытке
     if unknown > 0:
-        return True, f"в {direction} {n_side} позиций, {profitable} в плюсе, {unknown} неизвестно (не блокируем) — пирамидинг разрешён"
+        return False, f"в {direction} {n_side} позиций, {unknown} цена неизвестна — пирамидинг заблокирован (network)"
 
     return True, f"в {direction} {n_side} позиций, все в плюсе — пирамидинг разрешён"
 
@@ -384,9 +386,16 @@ def _get_tp_mult(adx: float) -> float:
 # === ANALYSIS (V12: LONG + SHORT + Dynamic TP) ===
 
 def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
-    c4 = [c for c in c4h if c["ts"] <= scan_ts][-100:]
-    if len(c4) < 60: return None
-    last = c4[-1]; price = last["close"]
+    c4_all = [c for c in c4h if c["ts"] <= scan_ts][-100:]
+    if len(c4_all) < 60: return None
+    # V13.7 FIX look-ahead: используем только ЗАКРЫТЫЕ свечи для индикаторов
+    # c4_all[-1] — текущая формирующаяся свеча (в live), не должна входить в индикаторы
+    # Это убирает расхождение с бэктестом (где свечи закрытые)
+    c4 = c4_all[:-1] if len(c4_all) >= 2 else c4_all  # все кроме последней
+    if len(c4) < 50: return None
+    last = c4[-1]  # последняя ЗАКРЫТАЯ 4H свеча
+    # price = close последней закрытой свечи (НЕ формирующейся)
+    price = last["close"]
     atr = _atr(c4, 14); atr_pct = (atr/price)*100 if price > 0 else 0
     rsi = _rsi(c4, 14)
     adx, pdi, mdi = _adx(c4, 14)
@@ -413,7 +422,9 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
     if lcp > 6: return None
 
     # MULTI-TF
-    c1 = [c for c in c1h if c["ts"] <= scan_ts][-100:]
+    c1_all = [c for c in c1h if c["ts"] <= scan_ts][-100:]
+    # V13.7 FIX look-ahead: исключаем формирующуюся 1H свечу
+    c1 = c1_all[:-1] if len(c1_all) >= 2 else c1_all
     d1 = "NEUTRAL"
     if len(c1) >= 20:
         e20 = _ema([c["close"] for c in c1], 20)
@@ -422,9 +433,16 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
 
     c15 = [c for c in c15m if c["ts"] <= scan_ts][-50:]
     d15 = "NEUTRAL"
-    if len(c15) >= 3:
-        g = sum(1 for c in c15[-3:] if c["close"] > c["open"])
-        d15 = "LONG" if g >= 2 else ("SHORT" if g <= 1 else "NEUTRAL")
+    # V13.7 FIX P0-5 (audit): c15 NEUTRAL теперь достижим (раньше был мёртвый)
+    # Логика: смотрим 3 последних ЗАКРЫТЫХ 15m свечи (исключая формирующуюся)
+    # 3 бычьих → LONG, 3 медвежьих → SHORT, иначе NEUTRAL
+    if len(c15) >= 4:
+        # c15[-1] может быть формирующейся — берём [-4:-1] (3 закрытые)
+        closed_15 = c15[-4:-1] if len(c15) >= 4 else c15[-3:]
+        g = sum(1 for c in closed_15 if c["close"] > c["open"])
+        if g == 3: d15 = "LONG"
+        elif g == 0: d15 = "SHORT"
+        # g=1 или g=2 → NEUTRAL (нет явного направления)
 
     # V12: LONG если price > sma50*1.02 and rsi > 50
     #      SHORT если price < sma50*0.98 and rsi < 50
@@ -447,7 +465,7 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
 
     is_long = direction == "LONG"
 
-    # SCORING
+    # SCORING (V13.7: убраны day-of-week и hour-of-day бонусы — overfitting)
     score = 0; details = []
 
     # 1. Confluence (0-40)
@@ -458,8 +476,8 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
     if 2.0 <= atr_pct <= 2.5: score += 15; details.append(f"ATR{atr_pct:.1f}✓")
     elif 2.5 < atr_pct <= 3.0: score += 10; details.append(f"ATR{atr_pct:.1f}")
 
-    # 3. ADX (0-10)
-    if 30 <= adx <= 40: score += 10; details.append(f"ADX{adx:.0f}✓")
+    # 3. ADX (0-10) — V13.7: улучшено — ADX>40 тоже даёт 10 (сильный тренд)
+    if adx >= 30: score += 10; details.append(f"ADX{adx:.0f}✓")
     elif 20 <= adx < 30: score += 5; details.append(f"ADX{adx:.0f}")
     else: details.append(f"ADX{adx:.0f}")
 
@@ -473,30 +491,43 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
         elif 40 < rsi <= 50: score += 5; details.append(f"RSI{rsi:.0f}")
         else: details.append(f"RSI{rsi:.0f}")
 
-    # 5. DAY (-10 to +15)
+    # V13.7: УБРАНЫ day-of-week и hour-of-day бонусы (overfitting из бэктеста)
+    # Day/hour magic numbers не имеют фундаментального обоснования и не обобщаются
+    # на будущие периоды. Убрано в пользу market-based scoring.
     wd = scan_dt.weekday()
     wdn = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"][wd]
-    if wd == 4: score += 15; details.append("Пт✓")
-    elif wd == 5: score += 10; details.append("Сб✓")
-    elif wd == 6: score += 5; details.append("Вс")
-    elif wd == 3: score += 5; details.append("Чт")
-    elif wd in (1, 2): score -= 10; details.append(f"{wdn}штраф")
-    else: details.append("Пн")
-
-    # 6. HOUR (0-10) — V12: бонусы за все часы скана
     hm = scan_dt.hour
-    if hm in (11, 15): score += 10; details.append(f"{hm}:00✓")
-    elif hm in (7, 23): score += 5; details.append(f"{hm}:00")
-    else: details.append(f"{hm}:00")
+    details.append(f"{wdn} {hm}:00")
 
-    # Volume
-    if len(c4) >= 20:
-        av = statistics.mean([c["vol"] for c in c4[-20:]])
-        vr = last["vol"]/av if av > 0 else 1
+    # 5. V13.7 NEW: Distance from SMA50 (0-10) — penalty за extended states
+    # Если цена ушла >10% от SMA50 — это уже extended, опасно входить
+    dist_sma_pct = (price - sma50) / sma50 * 100 if sma50 > 0 else 0
+    if is_long:
+        # LONG: лучше если price близко к SMA50 (above но не overextended)
+        if 2 <= dist_sma_pct <= 8: score += 10; details.append(f"Δsma{dist_sma_pct:+.1f}%✓")
+        elif dist_sma_pct > 12:
+            score -= 10; details.append(f"Δsma{dist_sma_pct:+.1f}%штраф (overextended)")
+        else: details.append(f"Δsma{dist_sma_pct:+.1f}%")
+    else:
+        # SHORT: цена ниже SMA50 но не collapse
+        if -8 <= dist_sma_pct <= -2: score += 10; details.append(f"Δsma{dist_sma_pct:+.1f}%✓")
+        elif dist_sma_pct < -12:
+            score -= 10; details.append(f"Δsma{dist_sma_pct:+.1f}%штраф (oversold)")
+        else: details.append(f"Δsma{dist_sma_pct:+.1f}%")
+
+    # 6. V13.7 FIX P0-6 (audit): Volume — используем ЗАКРЫТУЮ свечу (c4[-2]) вместо формирующейся
+    # Раньше: last["vol"] (формирующаяся, partial) → никогда > 1.5× avg
+    # Теперь: используем c4[-2] — последнюю закрытую 4H свечу
+    if len(c4) >= 21:
+        # Используем c4[-2] — последнюю ЗАКРЫТУЮ свечу (c4[-1] формирующаяся)
+        last_closed = c4[-2]
+        # avg volume за 20 закрытых свечей ДО последней закрытой
+        av = statistics.mean([c["vol"] for c in c4[-21:-1]])
+        vr = last_closed["vol"] / av if av > 0 else 1
     else: vr = 1
     if vr > 1.5: score += 5; details.append(f"V×{vr:.1f}")
 
-    # BB
+    # 7. BB (0-5) — V13.7: используем bb_exp (expanding volatility = breakout potential)
     if bb_exp: score += 5; details.append("BB↑")
 
     # PENALTIES
@@ -723,10 +754,16 @@ def _confirm_signal(setup):
         return False
 
 def _confirmation_worker(setup, fire_ts: int):
-    """V12: воркер — ждёт 15 минут, проверяет подтверждение, исполняет если ОК."""
+    """V12: воркер — ждёт 15 минут, проверяет подтверждение, исполняет если ОК.
+    
+    V13.7 FIX P0-7: atomic check-and-execute — все проверки под _tracked_lock,
+    чтобы предотвратить race condition (2 worker'а могут пройти check → превысить MAX_OPEN).
+    """
     sym = setup["symbol"]
     direction = setup.get("direction", "LONG")
     emoji_dir = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+    # V13.7: idempotency key — если уже исполняли этот setup, не повторять
+    setup_key = f"{sym}_{direction}_{fire_ts}"
 
     # Ждём до времени подтверждения
     wait_sec = CONFIRM_WAIT_SEC - (int(_now()) - fire_ts)
@@ -734,40 +771,80 @@ def _confirmation_worker(setup, fire_ts: int):
         time.sleep(wait_sec)
 
     try:
-        # Перечитываем tracked — слот мог быть занят другим сигналом
-        tracked = _load_tracked()
-        open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
-        if open_count >= MAX_OPEN:
-            if B: B.send_telegram(f"⏭️ {sym} {emoji_dir}: подтверждение пришло, но слоты заняты ({open_count}/{MAX_OPEN})")
-            return
-
-        # V12-max5: повторная проверка пирамидинга перед самым входом
-        # (за 15 минут ожидания предыдущая позиция могла уйти в минус)
-        can_pyramid, pyramid_reason = _can_pyramid(direction, tracked)
-        if not can_pyramid:
-            if B: B.send_telegram(
-                f"⏭️ {sym} {emoji_dir}: подтверждение пришло, но пирамидинг запрещён\n"
-                f"Причина: {pyramid_reason}"
-            )
-            return
-
-        # Проверяем подтверждение свечи
-        if _confirm_signal(setup):
-            # Обновляем цену входа на текущую
-            setup["price"] = _fetch_current_price(sym) or setup["price"]
-            if B: B.send_telegram(
-                f"✅ <b>ПОДТВЕРЖДЕНО</b> — {sym} {emoji_dir}\n"
-                f"Вход по рынку: ${setup['price']:.6g}"
-            )
-            execute_trade(setup)
-        else:
+        # V13.7 FIX P0-7: проверка подтверждения свечи FIRST (без lock)
+        if not _confirm_signal(setup):
             if B: B.send_telegram(
                 f"❌ <b>НЕ ПОДТВЕРЖДЕНО</b> — {sym} {emoji_dir}\n"
                 f"15m свеча не подтвердила направление. Сигнал отменён."
             )
+            return
+
+        # V13.7 FIX P0-7: ATOMIC check-and-execute под _tracked_lock
+        # Атомарно: проверяем слот + пирамидинг + добавляем pending_ → execute
+        # Это предотвращает race condition когда 2+ worker'а проходят check одновременно
+        with _tracked_lock:
+            tracked = _load_tracked()
+            open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
+            if open_count >= MAX_OPEN:
+                if B: B.send_telegram(f"⏭️ {sym} {emoji_dir}: подтверждение пришло, но слоты заняты ({open_count}/{MAX_OPEN})")
+                return
+
+            # V13.7: проверка что этот setup ещё не исполняли (idempotency)
+            already_executed = any(
+                v.get("sym") == sym and v.get("direction", v.get("dir","")) == direction
+                and v.get("opened_ts", 0) >= fire_ts - 60
+                and v.get("status") == "open"
+                for v in tracked.values()
+            )
+            if already_executed:
+                print(f"[prophet V13.7] {sym} {direction}: уже исполнен, пропускаю (idempotency)")
+                return
+
+            # Проверка пирамидинга
+            can_pyramid, pyramid_reason = _can_pyramid(direction, tracked)
+            if not can_pyramid:
+                if B: B.send_telegram(
+                    f"⏭️ {sym} {emoji_dir}: подтверждение пришло, но пирамидинг запрещён\n"
+                    f"Причина: {pyramid_reason}"
+                )
+                return
+
+            # V13.7: РЕЗЕРВИРУЕМ слот сразу — добавляем pending_ в tracked
+            # (чтобы другой worker не прошёл проверку пока мы вызываем execute_trade)
+            setup["price"] = _fetch_current_price(sym) or setup["price"]
+            pending_key = f"pending_{sym}_{int(_now())}"
+            tracked[pending_key] = {
+                "sym": sym, "side": "long" if direction == "LONG" else "short",
+                "dir": "long" if direction == "LONG" else "short",
+                "entry": setup["price"], "opened_ts": _now(),
+                "strategy": STRATEGY_TAG, "status": "open",
+                "direction": direction,
+                "_idempotency_key": setup_key,
+            }
+            _save_tracked(tracked)
+
+        # OUTSIDE lock: execute_trade (асинхронно вызовет on_signal)
+        # pending_ уже в tracked — даже если execute_trade упадёт, при следующем
+        # sync позиция будет найдена или pending_ будет очищен через 5 мин
+        if B: B.send_telegram(
+            f"✅ <b>ПОДТВЕРЖДЕНО</b> — {sym} {emoji_dir}\n"
+            f"Вход по рынку: ${setup['price']:.6g}"
+        )
+        execute_trade(setup)
     except Exception as e:
         print(f"[prophet] confirmation_worker error: {e}")
         if B: B.send_telegram(f"⚠️ Prophet: ошибка подтверждения {sym}: {e}")
+        # V13.7: очищаем pending_ при ошибке
+        try:
+            with _tracked_lock:
+                tracked = _load_tracked()
+                # Находим наш pending_ и удаляем
+                to_del = [k for k, v in tracked.items() 
+                         if k.startswith("pending_") and v.get("_idempotency_key") == setup_key]
+                for k in to_del:
+                    del tracked[k]
+                if to_del: _save_tracked(tracked)
+        except: pass
 
 def _fetch_current_price(sym: str):
     """Получает текущую рыночную цену."""
@@ -931,7 +1008,10 @@ def manage_positions():
                     _state["short_cooldown_until"] = int(_now()) + cd_hours * 3600
                 # V12: blacklist символа на 7 дней
                 bl = _state.get("symbol_blacklist", {})
-                bl[rec["sym"]] = int(_now()) + 7*24*3600
+                # V13.7 FIX (audit): blacklist 7 дней → 48 часов
+                # 7 дней слишком долго — альткоины меняют regime за 3-7 дней,
+                # через неделю символ в совершенно другом состоянии
+                bl[rec["sym"]] = int(_now()) + 48*3600  # 48ч вместо 7д
                 _state["symbol_blacklist"] = bl
                 _save()
             # V12-max5: уведомление если сторона упёрлась в daily stop
@@ -969,13 +1049,14 @@ def manage_positions():
 # === SCAN LOOPS ===
 
 _scanner_thread = None
-_scanner_running = False  # V12-FINAL: флаг против дублирования
+_scanner_stop_event = threading.Event()  # V13.7 FIX P0-3: замена _scanner_running flag (atomic)
 _watchdog_thread = None
 
 def _scanner_loop():
     """V12-FINAL: Главный цикл — сканы в HH:30 МСК каждый час из AUTO_HOURS_MSK."""
-    global _scanner_running
-    _scanner_running = True  # V12-FINAL:标记这个线程在运行
+    # V13.7 FIX P0-3: используем threading.Event для атомарной остановки
+    # (старый flag _scanner_running был race condition)
+    _scanner_stop_event.clear()  # сбрасываем флаг остановки при запуске нового thread
     print(f"[prophet V12-max5] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
     # V12-max5: диагностика TZ — проверяем что часовой пояс правильный
     _now_diag = dt.datetime.now(MSK)
@@ -986,9 +1067,9 @@ def _scanner_loop():
         except: pass
     while True:
         try:
-            # V12-FINAL: если флаг сброшен (watchdog перезапускает) — останавливаемся
-            if not _scanner_running:
-                print(f"[prophet V12-max5] Scanner: флаг _scanner_running=False, останавливаюсь")
+            # V13.7 FIX P0-3: atomic event check — если watchdog установил event — выходим
+            if _scanner_stop_event.is_set():
+                print(f"[prophet V12-max5] Scanner: stop event установлен, останавливаюсь")
                 return  # выход из потока — watchdog создаст новый
             
             mode = _state.get("scan_mode", "off")
@@ -1317,7 +1398,23 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     markets_ok = bool(executor._mk)
     if not markets_ok:
         print(f"[prophet V12-max5] WARNING: markets не загружены, пропускаем pending_ cleanup")
-    
+
+    # V13.7 FIX P0-1 (audit): КРИТИЧНО — если live_ids пустой но в tracked есть открытые позиции,
+    # это означает API failure (transient error). НЕ удалять tracked — иначе теряем управление!
+    with _tracked_lock:
+        tracked_check = _load_tracked()
+    real_open_in_tracked = sum(1 for pid, v in tracked_check.items() 
+                                if v.get("status") == "open" and not pid.startswith("pending_"))
+    if len(live_ids) == 0 and real_open_in_tracked > 0:
+        err_msg = (f"⚠️ SYNC ABORTED: live positions empty but tracked has {real_open_in_tracked} open — "
+                   f"possibly API failure. NOT deleting tracked records.")
+        print(f"[prophet V12-max5] {err_msg}")
+        if B:
+            try: B.send_telegram(f"🚨 <b>SYNC ABORTED</b>\nAPI вернул 0 позиций, но tracked имеет {real_open_in_tracked} открытых. "
+                                f"Возможно transient failure. Записи НЕ удалены.")
+            except: pass
+        return err_msg
+
     with _tracked_lock:
         tracked = _load_tracked()
 
@@ -1570,9 +1667,19 @@ def _scanner_watchdog():
                         f"Принудительный перезапуск scanner thread."
                     )
                     except: pass
-                # V12-FINAL: сбрасываем флаг чтобы старый thread остановился
-                _scanner_running = False
-                time.sleep(5)  # даём старому потоку время остановиться
+                # V13.7 FIX P0-3: используем threading.Event для атомарной остановки
+                # Старый подход (_scanner_running = False) был race condition:
+                #   watchdog: _scanner_running = False → sleep(5)
+                #   watchdog: создаёт новый thread → он ставит _scanner_running = True
+                #   старый thread просыпается, видит _scanner_running=True → ПРОДОЛЖАЕТ
+                # Теперь: Event.set() + join(timeout) — ждём реальной остановки
+                _scanner_stop_event.set()
+                if _scanner_thread is not None:
+                    _scanner_thread.join(timeout=10)  # ждём до 10 сек реальной остановки
+                    if _scanner_thread.is_alive():
+                        print(f"[prophet V12-max5] WATCHDOG: старый scanner не остановился за 10с, всё равно запускаю новый")
+                _scanner_stop_event.clear()  # сбрасываем event для нового thread
+                time.sleep(1)
                 # Принудительно создаём новый thread
                 _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12-heartbeat-restart")
                 _scanner_thread.start()
