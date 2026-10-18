@@ -352,7 +352,7 @@ def _all_strategies_status():
                        if v.get("status") == "open" and not any(k.startswith("pending_") for k in [k for k,v2 in pp_tracked.items() if v2 == v])]
             pp_open_clean = []
             for pid, v in pp_tracked.items():
-                if v.get("status") == "open" and not pid.startswith("pending_"):
+                if v.get("status") == "open":
                     pp_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0)))
             lines.append(f"\n🔮 Prophet V12: {pp_status} | открыто: {len(pp_open_clean)}/{PP.MAX_OPEN}")
             lines.append(f"   сканов: {PP._stats['scans']} | сигналов: {PP._stats['signals']} | сделок: {PP._stats['trades']}")
@@ -375,7 +375,7 @@ def _all_strategies_status():
             an_tracked = ANOM._load_tracked()
             an_open_clean = []
             for pid, v in an_tracked.items():
-                if v.get("status") == "open" and not pid.startswith("pending_"):
+                if v.get("status") == "open":
                     an_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0), v.get("n_anomalies",0)))
             lines.append(f"\n🚨 Anomaly A+: {an_status} | открыто: {len(an_open_clean)}/{ANOM.MAX_OPEN}")
             lines.append(f"   сканов: {ANOM._stats['scans']} | сигналов: {ANOM._stats['signals']} | сделок: {ANOM._stats['trades']}")

@@ -942,6 +942,7 @@ def cmd_status():
     lines.append(f"Режим: {mode_str}")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     tracked = _load_tracked()
+    # Считаем ВСЕ открытые (включая pending_ — они тоже реальные позиции)
     open_n = sum(1 for v in tracked.values() if v.get("status") == "open")
     lines.append(f"Открыто: {open_n}/{MAX_OPEN}")
     lines.append(f"Сканирований: {_stats['scans']}")
