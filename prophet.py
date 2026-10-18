@@ -858,6 +858,155 @@ def _fetch_current_price(sym: str):
 
 # === TRADE EXECUTION (V12: LONG + SHORT) ===
 
+# V13.8: SLIPPAGE PROTECTION (как в Donchian 4H)
+SLIPPAGE_OK_PCT = 1.0       # ≤1% — ок, ничего не делаем
+SLIPPAGE_CLOSE_PCT = 5.0    # >5% — закрываем позицию
+
+def _fetch_upscale_entry_price(executor, sym: str):
+    """Получает реальный entryPrice позиции с Upscale API."""
+    try:
+        if not executor or not executor.client or not executor.account_id:
+            return None
+        executor._ensure_account()
+        if not executor.account_id: return None
+        try: executor._refresh_markets()
+        except: pass
+        live = UE._as_list(executor.client.positions(executor.account_id))
+        if not live: return None
+        for p in live:
+            if not isinstance(p, dict): continue
+            lp_mid = UE._pos_market(p)
+            if executor._mk:
+                for s, m in executor._mk.items():
+                    if str(m.get("id","")) == lp_mid and s == sym:
+                        for k in ("entryPrice", "avgEntry", "openPrice", "entry"):
+                            v = p.get(k)
+                            if v is None: continue
+                            try:
+                                t = str(v).strip()
+                                if t and t not in ("None","null","0"):
+                                    try:
+                                        if str(v).isdigit() and len(str(v)) > 9:
+                                            return float(UE.from_fp9(t))
+                                        return float(t)
+                                    except: continue
+                            except: continue
+        return None
+    except Exception as e:
+        print(f"[prophet V13.8] fetch_upscale_entry_price {sym}: {e}")
+        return None
+
+
+def _apply_slippage_protection(executor, sym: str, side: str,
+                                 planned_entry: float, planned_stop: float,
+                                 planned_tp: float, sp_pct: float, tp_pct: float,
+                                 is_long: bool) -> dict:
+    """V13.8: Проверяет реальный entryPrice с Upscale и применяет slippage protection."""
+    result = {"action": "skipped", "up_entry": None, "slippage_pct": 0,
+              "new_stop": planned_stop, "new_tp": planned_tp}
+    
+    if not planned_entry or planned_entry <= 0:
+        return result
+    
+    time.sleep(2)  # ждём появления позиции в API
+    
+    up_entry = _fetch_upscale_entry_price(executor, sym)
+    if not up_entry or up_entry <= 0:
+        print(f"[prophet V13.8] {sym}: не удалось получить up_entry")
+        return result
+    
+    slippage_pct = abs(up_entry - planned_entry) / planned_entry * 100
+    result["up_entry"] = up_entry
+    result["slippage_pct"] = slippage_pct
+    
+    print(f"[prophet V13.8] {sym} {side}: planned={planned_entry:.6g}, upscale={up_entry:.6g}, slippage={slippage_pct:.2f}%")
+    
+    if slippage_pct <= SLIPPAGE_OK_PCT:
+        result["action"] = "ok"
+        return result
+    
+    if slippage_pct > SLIPPAGE_CLOSE_PCT:
+        print(f"[prophet V13.8] {sym}: SLIPPAGE {slippage_pct:.2f}% > {SLIPPAGE_CLOSE_PCT}% — ЗАКРЫВАЕМ!")
+        try:
+            live = UE._as_list(executor.client.positions(executor.account_id))
+            for p in live:
+                if not isinstance(p, dict): continue
+                lp_mid = UE._pos_market(p)
+                if executor._mk:
+                    for s, m in executor._mk.items():
+                        if str(m.get("id","")) == lp_mid and s == sym:
+                            pid = UE._pos_id(p)
+                            dir_field = "short" if side == "short" else "long"
+                            info = {"id": pid, "mid": lp_mid, "dir": dir_field}
+                            try:
+                                res = executor.close_position(info, reason=f"SLIPPAGE_PROTECTION_{slippage_pct:.1f}%")
+                                result["action"] = "closed"
+                                if B:
+                                    B.send_telegram(
+                                        f"🚨 <b>SLIPPAGE PROTECTION: {sym} ЗАКРЫТА</b>\n"
+                                        f"Плановый вход: ${planned_entry:.6g}\n"
+                                        f"Реальный вход: ${up_entry:.6g}\n"
+                                        f"Slippage: {slippage_pct:.2f}% (>{SLIPPAGE_CLOSE_PCT}%)\n"
+                                        f"Действие: позиция закрыта для защиты от искажённого RR\n"
+                                        f"Результат: {res}"
+                                    )
+                                return result
+                            except Exception as e:
+                                print(f"[prophet V13.8] {sym}: close error: {e}")
+                                break
+        except Exception as e:
+            print(f"[prophet V13.8] {sym}: slippage close error: {e}")
+        return result
+    
+    # 1% < slippage ≤ 5% — корректируем TP/SL
+    correction = up_entry / planned_entry
+    if not (0.95 < correction < 1.05):
+        return result
+    
+    new_stop = planned_stop * correction
+    new_tp = planned_tp * correction
+    
+    try:
+        live = UE._as_list(executor.client.positions(executor.account_id))
+        for p in live:
+            if not isinstance(p, dict): continue
+            lp_mid = UE._pos_market(p)
+            if executor._mk:
+                for s, m in executor._mk.items():
+                    if str(m.get("id","")) == lp_mid and s == sym:
+                        pid = UE._pos_id(p)
+                        dir_field = "short" if side == "short" else "long"
+                        info = {"id": pid, "mid": lp_mid, "dir": dir_field}
+                        try:
+                            if hasattr(executor, "move_stop"):
+                                executor.move_stop(info, new_stop)
+                        except: pass
+                        try:
+                            if hasattr(executor, "move_tp"):
+                                executor.move_tp(info, new_tp)
+                            elif hasattr(executor, "set_tp"):
+                                executor.set_tp(info, new_tp)
+                        except: pass
+                        result["action"] = "adjusted"
+                        result["new_stop"] = new_stop
+                        result["new_tp"] = new_tp
+                        if B:
+                            B.send_telegram(
+                                f"📐 <b>SLIPPAGE ADJUST: {sym} {side.upper()}</b>\n"
+                                f"Плановый вход: ${planned_entry:.6g}\n"
+                                f"Реальный вход: ${up_entry:.6g}\n"
+                                f"Slippage: +{slippage_pct:.2f}%\n"
+                                f"Стоп: ${planned_stop:.6g} → ${new_stop:.6g}\n"
+                                f"TP: ${planned_tp:.6g} → ${new_tp:.6g}\n"
+                                f"Коррекция: ×{correction:.4f}"
+                            )
+                        return result
+    except Exception as e:
+        print(f"[prophet V13.8] {sym}: adjust error: {e}")
+    
+    return result
+
+
 def execute_trade(setup):
     if not B or not hasattr(B, "EXECUTOR"): return
     executor = B.EXECUTOR
@@ -912,6 +1061,38 @@ def execute_trade(setup):
                 "direction": direction,
             }
             _save_tracked(tr)
+        
+        # V13.8: SLIPPAGE PROTECTION — проверяем реальный entryPrice с Upscale
+        try:
+            slippage_result = _apply_slippage_protection(
+                executor=executor, sym=sym, side=side,
+                planned_entry=entry, planned_stop=stop, planned_tp=tp,
+                sp_pct=sp, tp_pct=setup.get("tp_pct", 0),
+                is_long=(direction == "LONG")
+            )
+            if slippage_result.get("action") == "adjusted":
+                with _tracked_lock:
+                    tr = _load_tracked()
+                    for k, v in tr.items():
+                        if k.startswith("pending_") and v.get("sym") == sym and v.get("status") == "open":
+                            v["stop"] = slippage_result["new_stop"]
+                            v["tp"] = slippage_result["new_tp"]
+                            v["entry"] = slippage_result.get("up_entry", entry)
+                            v["slippage_pct"] = slippage_result["slippage_pct"]
+                            v["slippage_adjusted"] = True
+                            break
+                    _save_tracked(tr)
+            elif slippage_result.get("action") == "closed":
+                with _tracked_lock:
+                    tr = _load_tracked()
+                    to_del = [k for k, v in tr.items() 
+                             if k.startswith("pending_") and v.get("sym") == sym and v.get("status") == "open"]
+                    for k in to_del:
+                        tr[k]["status"] = "closed"
+                        tr[k]["close_reason"] = "SLIPPAGE_PROTECTION"
+                    _save_tracked(tr)
+        except Exception as e:
+            print(f"[prophet V13.8] {sym}: slippage protection error: {e}")
     except Exception as e:
         if B: B.send_telegram(f"⚠️ Prophet {sym}: ошибка — {e}")
 

@@ -575,6 +575,189 @@ def do_scan(scan_ts=None):
 
 # === EXECUTE TRADE ===
 
+# V13.8: SLIPPAGE PROTECTION (как в Donchian 4H)
+# После входа market ордером проверяем реальный entryPrice с Upscale.
+# Если slippage большой — пересчитываем TP/SL под реальную цену.
+# Если slippage критичный (>5%) — закрываем позицию.
+SLIPPAGE_OK_PCT = 1.0       # ≤1% — ок, ничего не делаем
+SLIPPAGE_ADJUST_PCT = 5.0   # 1-5% — пересчитываем TP/SL
+SLIPPAGE_CLOSE_PCT = 5.0    # >5% — закрываем позицию
+
+def _fetch_upscale_entry_price(executor, sym: str):
+    """Получает реальный entryPrice позиции с Upscale API.
+    Возвращает float или None."""
+    try:
+        if not executor or not executor.client or not executor.account_id:
+            return None
+        executor._ensure_account()
+        if not executor.account_id: return None
+        # Подгружаем markets чтобы найти market_id символа
+        try: executor._refresh_markets()
+        except: pass
+        live = UE._as_list(executor.client.positions(executor.account_id))
+        if not live: return None
+        # Находим позицию по символу
+        for p in live:
+            if not isinstance(p, dict): continue
+            lp_mid = UE._pos_market(p)
+            if executor._mk:
+                for s, m in executor._mk.items():
+                    if str(m.get("id","")) == lp_mid and s == sym:
+                        # Нашли позицию символа
+                        for k in ("entryPrice", "avgEntry", "openPrice", "entry"):
+                            v = p.get(k)
+                            if v is None: continue
+                            try:
+                                t = str(v).strip()
+                                if t and t not in ("None","null","0"):
+                                    # from_fp9 для fixed-point
+                                    try:
+                                        if str(v).isdigit() and len(str(v)) > 9:
+                                            return float(UE.from_fp9(t))
+                                        return float(t)
+                                    except: continue
+                            except: continue
+        return None
+    except Exception as e:
+        print(f"[anomaly V13.8] fetch_upscale_entry_price {sym}: {e}")
+        return None
+
+
+def _apply_slippage_protection(executor, sym: str, side: str,
+                                 planned_entry: float, planned_stop: float,
+                                 planned_tp: float, sp_pct: float, tp_pct: float,
+                                 is_long: bool) -> dict:
+    """V13.8: Проверяет реальный entryPrice с Upscale и применяет slippage protection.
+    
+    Возвращает dict с результатом:
+    {
+        "action": "ok"|"adjusted"|"closed"|"skipped",
+        "up_entry": float,
+        "slippage_pct": float,
+        "new_stop": float,
+        "new_tp": float,
+    }
+    """
+    result = {"action": "skipped", "up_entry": None, "slippage_pct": 0,
+              "new_stop": planned_stop, "new_tp": planned_tp}
+    
+    if not planned_entry or planned_entry <= 0:
+        return result
+    
+    # Ждём 2 секунды чтобы позиция появилась в API
+    time.sleep(2)
+    
+    up_entry = _fetch_upscale_entry_price(executor, sym)
+    if not up_entry or up_entry <= 0:
+        # Не смогли получить цену — пропускаем коррекцию
+        print(f"[anomaly V13.8] {sym}: не удалось получить up_entry, пропускаем slippage protection")
+        return result
+    
+    # Считаем slippage (всегда положительный, без знака направления)
+    slippage_pct = abs(up_entry - planned_entry) / planned_entry * 100
+    result["up_entry"] = up_entry
+    result["slippage_pct"] = slippage_pct
+    
+    print(f"[anomaly V13.8] {sym} {side}: planned={planned_entry:.6g}, upscale={up_entry:.6g}, slippage={slippage_pct:.2f}%")
+    
+    if slippage_pct <= SLIPPAGE_OK_PCT:
+        # OK — slippage в норме, ничего не делаем
+        result["action"] = "ok"
+        return result
+    
+    if slippage_pct > SLIPPAGE_CLOSE_PCT:
+        # КРИТИЧНО — slippage >5%, закрываем позицию
+        print(f"[anomaly V13.8] {sym}: SLIPPAGE {slippage_pct:.2f}% > {SLIPPAGE_CLOSE_PCT}% — ЗАКРЫВАЕМ позицию!")
+        try:
+            # Найти позицию и закрыть
+            live = UE._as_list(executor.client.positions(executor.account_id))
+            for p in live:
+                if not isinstance(p, dict): continue
+                lp_mid = UE._pos_market(p)
+                if executor._mk:
+                    for s, m in executor._mk.items():
+                        if str(m.get("id","")) == lp_mid and s == sym:
+                            pid = UE._pos_id(p)
+                            mid = lp_mid
+                            dir_field = "short" if side == "short" else "long"
+                            info = {"id": pid, "mid": mid, "dir": dir_field}
+                            try:
+                                res = executor.close_position(info, reason=f"SLIPPAGE_PROTECTION_{slippage_pct:.1f}%")
+                                result["action"] = "closed"
+                                if B:
+                                    B.send_telegram(
+                                        f"🚨 <b>SLIPPAGE PROTECTION: {sym} ЗАКРЫТА</b>\n"
+                                        f"Плановый вход: ${planned_entry:.6g}\n"
+                                        f"Реальный вход: ${up_entry:.6g}\n"
+                                        f"Slippage: {slippage_pct:.2f}% (>{SLIPPAGE_CLOSE_PCT}%)\n"
+                                        f"Действие: позиция закрыта для защиты от искажённого RR\n"
+                                        f"Результат: {res}"
+                                    )
+                                return result
+                            except Exception as e:
+                                print(f"[anomaly V13.8] {sym}: close error: {e}")
+                                break
+        except Exception as e:
+            print(f"[anomaly V13.8] {sym}: slippage close error: {e}")
+        return result
+    
+    # 1% < slippage ≤ 5% — пересчитываем TP/SL под реальную цену
+    # Как в Donchian: new_stop = planned_stop * (up_entry / planned_entry)
+    correction = up_entry / planned_entry
+    if not (0.95 < correction < 1.05):
+        # Защита — если коррекция слишком большая, закрываем
+        print(f"[anomaly V13.8] {sym}: correction {correction} вне диапазона — пропускаем")
+        return result
+    
+    new_stop = planned_stop * correction
+    new_tp = planned_tp * correction
+    
+    # Применяем новые уровни через move_stop (если поддерживается executor'ом)
+    try:
+        live = UE._as_list(executor.client.positions(executor.account_id))
+        for p in live:
+            if not isinstance(p, dict): continue
+            lp_mid = UE._pos_market(p)
+            if executor._mk:
+                for s, m in executor._mk.items():
+                    if str(m.get("id","")) == lp_mid and s == sym:
+                        pid = UE._pos_id(p)
+                        dir_field = "short" if side == "short" else "long"
+                        info = {"id": pid, "mid": lp_mid, "dir": dir_field}
+                        # Перемещаем стоп
+                        try:
+                            if hasattr(executor, "move_stop"):
+                                executor.move_stop(info, new_stop)
+                        except: pass
+                        # Перемещаем TP (если поддерживается)
+                        try:
+                            if hasattr(executor, "move_tp"):
+                                executor.move_tp(info, new_tp)
+                            elif hasattr(executor, "set_tp"):
+                                executor.set_tp(info, new_tp)
+                        except: pass
+                        result["action"] = "adjusted"
+                        result["new_stop"] = new_stop
+                        result["new_tp"] = new_tp
+                        if B:
+                            B.send_telegram(
+                                f"📐 <b>SLIPPAGE ADJUST: {sym} {side.upper()}</b>\n"
+                                f"Плановый вход: ${planned_entry:.6g}\n"
+                                f"Реальный вход: ${up_entry:.6g}\n"
+                                f"Slippage: +{slippage_pct:.2f}%\n"
+                                f"Стоп: ${planned_stop:.6g} → ${new_stop:.6g}\n"
+                                f"TP: ${planned_tp:.6g} → ${new_tp:.6g}\n"
+                                f"Коррекция: ×{correction:.4f}"
+                            )
+                        return result
+    except Exception as e:
+        print(f"[anomaly V13.8] {sym}: adjust error: {e}")
+    
+    return result
+
+
+
+
 def execute_trade(setup):
     if not B or not hasattr(B, "EXECUTOR"): return
     executor = B.EXECUTOR
@@ -634,6 +817,42 @@ def execute_trade(setup):
                 "anomalies": setup["anomalies"],
             }
             _save_tracked(tr)
+        
+        # V13.8: SLIPPAGE PROTECTION — проверяем реальный entryPrice с Upscale
+        # и корректируем TP/SL или закрываем позицию если slippage критичный
+        try:
+            slippage_result = _apply_slippage_protection(
+                executor=executor, sym=sym, side=side,
+                planned_entry=entry, planned_stop=stop, planned_tp=tp,
+                sp_pct=sp, tp_pct=setup["tp_pct"],
+                is_long=(direction == "LONG")
+            )
+            # Если скорректировали TP/SL — обновляем tracked
+            if slippage_result.get("action") == "adjusted":
+                with _tracked_lock:
+                    tr = _load_tracked()
+                    # Находим нашу pending_ запись и обновляем stop/tp
+                    for k, v in tr.items():
+                        if k.startswith("pending_") and v.get("sym") == sym and v.get("status") == "open":
+                            v["stop"] = slippage_result["new_stop"]
+                            v["tp"] = slippage_result["new_tp"]
+                            v["entry"] = slippage_result.get("up_entry", entry)
+                            v["slippage_pct"] = slippage_result["slippage_pct"]
+                            v["slippage_adjusted"] = True
+                            break
+                    _save_tracked(tr)
+            # Если закрыли позицию из-за slippage — удаляем pending_
+            elif slippage_result.get("action") == "closed":
+                with _tracked_lock:
+                    tr = _load_tracked()
+                    to_del = [k for k, v in tr.items() 
+                             if k.startswith("pending_") and v.get("sym") == sym and v.get("status") == "open"]
+                    for k in to_del:
+                        tr[k]["status"] = "closed"
+                        tr[k]["close_reason"] = "SLIPPAGE_PROTECTION"
+                    _save_tracked(tr)
+        except Exception as e:
+            print(f"[anomaly V13.8] {sym}: slippage protection error: {e}")
     except Exception as e:
         if B: B.send_telegram(f"⚠️ Anomaly {sym}: ошибка — {e}")
 
