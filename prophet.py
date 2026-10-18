@@ -852,6 +852,9 @@ def manage_positions():
     try:
         executor._ensure_account()
         if not executor.account_id: return
+        # V13.3: подгружаем markets (иначе pending_ конвертация не сработает после рестарта)
+        try: executor._refresh_markets()
+        except: pass
         live = UE._as_list(executor.client.positions(executor.account_id))
         live_ids = {UE._pos_id(p) for p in live if isinstance(p, dict)}
     except: return
@@ -878,7 +881,12 @@ def manage_positions():
                     executor._registry_set(rid, STRATEGY_TAG)
                     changed = True; found = True; break
             if not found and now - rec.get("opened_ts", now) > 30:
-                del tracked[pid]; changed = True
+                # V13.3: НЕ удаляем pending_ если markets не загружены —
+                # иначе теряем реально открытые позиции после рестарта
+                if not executor._mk:
+                    print(f"[prophet V12-max5] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
+                else:
+                    del tracked[pid]; changed = True
             continue
 
         if pid not in live_ids:
@@ -1287,6 +1295,9 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
         executor._ensure_account()
         if not executor.account_id:
             return "⚠️ Нет account_id"
+        # V13.3: подгружаем markets (без них pending_ cleanup пропускается)
+        try: executor._refresh_markets()
+        except: pass
         live = UE._as_list(executor.client.positions(executor.account_id))
         live_ids = {UE._pos_id(p) for p in live if isinstance(p, dict)}
         # Также собираем symbol -> position для matching pending_ по символу

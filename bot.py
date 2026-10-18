@@ -347,11 +347,17 @@ def _all_strategies_status():
             pp_mode = PP._state.get("scan_mode", "off")
             pp_status = "🟢 ВКЛ" if pp_mode == "auto" else "🔴 ВЫКЛ"
             pp_tracked = PP._load_tracked()
-            # V13.1: фильтруем pending_* (предторговые записи) — показываем только реальные позиции
+            # V13.2: real позиции — отдельно от pending_ (которые ждут подтверждения биржи)
             pp_open_clean = []
+            pp_pending = []
+            _now_ts = time.time()
             for pid, v in pp_tracked.items():
-                if pid.startswith("pending_"): continue
-                if v.get("status") == "open":
+                if v.get("status") != "open": continue
+                if pid.startswith("pending_"):
+                    age_min = (_now_ts - v.get("opened_ts", _now_ts)) / 60
+                    if age_min >= 1:  # показываем только "зависшие" pending_ (старше 1 мин)
+                        pp_pending.append((v.get("sym"), v.get("direction", v.get("dir","?")), age_min))
+                else:
                     pp_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0)))
             lines.append(f"\n🔮 Prophet V12: {pp_status} | открыто: {len(pp_open_clean)}/{PP.MAX_OPEN}")
             lines.append(f"   сканов: {PP._stats['scans']} | сигналов: {PP._stats['signals']} | сделок: {PP._stats['trades']}")
@@ -361,6 +367,9 @@ def _all_strategies_status():
             for sym, dir_v, entry in pp_open_clean:
                 emoji = "🟢" if dir_v in ("LONG","long") else "🔴"
                 lines.append(f"   {emoji} {sym} @ ${entry:.4g}")
+            for sym, dir_v, age_min in pp_pending:
+                emoji = "🟢" if dir_v in ("LONG","long") else "🔴"
+                lines.append(f"   {emoji} ⏳ {sym} (pending {age_min:.0f}мин)")
         except Exception as e:
             lines.append(f"\n🔮 Prophet: ⚠️ {e}")
     else:
@@ -373,9 +382,15 @@ def _all_strategies_status():
             an_status = "🟢 ВКЛ" if an_mode == "auto" else "🔴 ВЫКЛ"
             an_tracked = ANOM._load_tracked()
             an_open_clean = []
+            an_pending = []
+            _now_ts = time.time()
             for pid, v in an_tracked.items():
-                if pid.startswith("pending_"): continue  # V13.1: фильтруем pending_*
-                if v.get("status") == "open":
+                if v.get("status") != "open": continue
+                if pid.startswith("pending_"):
+                    age_min = (_now_ts - v.get("opened_ts", _now_ts)) / 60
+                    if age_min >= 1:
+                        an_pending.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("n_anomalies",0), age_min))
+                else:
                     an_open_clean.append((v.get("sym"), v.get("direction", v.get("dir","?")), v.get("entry",0), v.get("n_anomalies",0)))
             lines.append(f"\n🚨 Anomaly A+: {an_status} | открыто: {len(an_open_clean)}/{ANOM.MAX_OPEN}")
             lines.append(f"   сканов: {ANOM._stats['scans']} | сигналов: {ANOM._stats['signals']} | сделок: {ANOM._stats['trades']}")
@@ -385,6 +400,9 @@ def _all_strategies_status():
             for sym, dir_v, entry, n_anom in an_open_clean:
                 emoji = "🟢" if dir_v in ("LONG","long") else "🔴"
                 lines.append(f"   {emoji} {sym} @ ${entry:.4g} ({n_anom}/5)")
+            for sym, dir_v, n_anom, age_min in an_pending:
+                emoji = "🟢" if dir_v in ("LONG","long") else "🔴"
+                lines.append(f"   {emoji} ⏳ {sym} (pending {age_min:.0f}мин, {n_anom}/5)")
         except Exception as e:
             lines.append(f"\n🚨 Anomaly: ⚠️ {e}")
     else:

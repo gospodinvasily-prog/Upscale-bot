@@ -623,6 +623,10 @@ def _manage_positions():
         executor._ensure_account()
         if not executor.account_id:
             return
+        # V13.3: подгружаем markets — иначе pending_ конвертация не сработает
+        # после рестарта (executor._mk пустой до первого execute())
+        try: executor._refresh_markets()
+        except: pass
         live_positions = UE._as_list(executor.client.positions(executor.account_id))
         live_ids = {UE._pos_id(p) for p in live_positions if isinstance(p, dict)}
     except Exception as e:
@@ -661,20 +665,27 @@ def _manage_positions():
                     found_real = True
                     break
             if not found_real:
-                if now - rec.get("opened_ts", now) > 30:
-                    print(f"[bc] {sym_match}: pending истёк — удаляем")
-                    if _state.get("trades_today", 0) > 0:
-                        _state["trades_today"] -= 1
-                    if _stats.get("trades_opened", 0) > 0:
-                        _stats["trades_opened"] -= 1
-                    _save_state()
-                    del tracked[pos_id]
-                    changed = True
-                    if B:
-                        B.send_telegram(
-                            f"⚠️ BC {sym_match}: позиция не открылась (отклонена Upscale)\n"
-                            f"Счётчик trades_today откатан"
-                        )
+                # V13.3: 5 минут вместо 30 сек на открытие (Upscale бывает медленным)
+                # + НЕ удаляем если markets не загружены (теряем реальные позиции)
+                age_sec = now - rec.get("opened_ts", now)
+                if age_sec > 300:
+                    if not executor._mk:
+                        print(f"[bc] WARNING: markets не загружены, сохраняем pending_ {sym_match}")
+                    else:
+                        # markets загружены, но символ не найден в live → реально отклонена
+                        print(f"[bc] {sym_match}: pending истёк ({age_sec:.0f}сек) — удаляем")
+                        if _state.get("trades_today", 0) > 0:
+                            _state["trades_today"] -= 1
+                        if _stats.get("trades_opened", 0) > 0:
+                            _stats["trades_opened"] -= 1
+                        _save_state()
+                        del tracked[pos_id]
+                        changed = True
+                        if B:
+                            B.send_telegram(
+                                f"⚠️ BC {sym_match}: позиция не открылась за 5 мин (отклонена Upscale)\n"
+                                f"Счётчик trades_today откатан"
+                            )
             continue
 
         # Позиция закрылась (TP/стоп/time-stop)
