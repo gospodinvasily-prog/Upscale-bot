@@ -404,17 +404,17 @@ def _all_strategies_status():
     else:
         lines.append(f"\n🚨 Big Candle: ❌ не загружен")
     
-    # Общий итог
+    # Общий итог — просто сумма открытых из каждого tracked
     total_open = 0
     if PP is not None:
         try:
             pp_tr = PP._load_tracked()
-            total_open += sum(1 for v in pp_tr.values() if v.get("status") == "open" and not any(k.startswith("pending_") for k in [k for k,v2 in pp_tr.items() if v2 == v]))
+            total_open += sum(1 for v in pp_tr.values() if v.get("status") == "open")
         except: pass
     if ANOM is not None:
         try:
             an_tr = ANOM._load_tracked()
-            total_open += sum(1 for v in an_tr.values() if v.get("status") == "open" and not any(k.startswith("pending_") for k in [k for k,v2 in an_tr.items() if v2 == v]))
+            total_open += sum(1 for v in an_tr.values() if v.get("status") == "open")
         except: pass
     if BCS is not None:
         try:
