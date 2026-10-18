@@ -1309,22 +1309,23 @@ def _scanner_loop():
             # Уже есть открытая позиция?
             tracked = _load_tracked()
             open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
-            if open_count >= MAX_OPEN:
-                time.sleep(60); continue
 
-            # Сканируем — отметку ставим ПОСЛЕ успешного скана, не до
-            # (если упадёт до отправки сообщения — next iter повторит)
+            # V13.9: показываем scan message ВСЕГДА, даже если MAX_OPEN достигнут
             scan_dt_str = now_dt.strftime("%H:%M")
-            # V12-max5: диагностика — показываем и MSK время и UTC для проверки TZ
             utc_dt_str = dt.datetime.now(dt.timezone.utc).strftime("%H:%M")
-            scan_started_msg = f"🔍 V12-max5 скан в {scan_dt_str} МСК (UTC={utc_dt_str}, режим={mode}, открыто={open_count}/{MAX_OPEN})"
+            skip_reason = ""
+            if open_count >= MAX_OPEN:
+                skip_reason = f" ⏸️ MAX_OPEN достигнут ({open_count}/{MAX_OPEN}), скан пропущен"
+            scan_started_msg = f"🔍 V12-max5 скан в {scan_dt_str} МСК (UTC={utc_dt_str}, режим={mode}, открыто={open_count}/{MAX_OPEN}){skip_reason}"
             print(f"[prophet V12-max5] {scan_started_msg}")
-            # V12-max5: уведомляем о старте скана чтобы не было тишины
             if B and mode == "auto":
                 try:
                     B.send_telegram(scan_started_msg)
                 except Exception as e:
                     print(f"[prophet V12-max5] send start msg error: {e}")
+
+            if open_count >= MAX_OPEN:
+                time.sleep(60); continue
 
             try:
                 setup = do_scan(now_ts)
@@ -1484,6 +1485,13 @@ def cmd_on():
     _state["scan_mode"] = "auto"
     _state["pending_signal"] = None
     _save()
+    # V13.9: проверяем что scanner thread жив, если нет — перезапускаем
+    global _scanner_thread, _scanner_stop_event
+    if _scanner_thread is None or not _scanner_thread.is_alive():
+        print(f"[prophet V13.9] cmd_on: scanner thread мёртв, перезапускаю")
+        _scanner_stop_event.clear()
+        _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-cmd-on")
+        _scanner_thread.start()
     return f"🤖 Prophet V12 включён.\nЧасы скана: {AUTO_HOURS_MSK}\nСкан в :{SCAN_MINUTE:02d} | Подтверждение: {CONFIRM_WAIT_SEC//60} мин\nПорог: ≥{AUTO_SCORE}\nMAX_OPEN: {MAX_OPEN}"
 
 def cmd_off():

@@ -1061,18 +1061,24 @@ def _scanner_loop():
                     _auto_sync_orphans()
             except: pass
 
-            tracked = _load_tracked()
-            open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
-            if open_count >= MAX_OPEN:
-                time.sleep(60); continue
-
             # Скан
             scan_dt_str = now_dt.strftime("%H:%M")
-            scan_msg = f"🔍 Anomaly A+ скан в {scan_dt_str} МСК (открыто={open_count}/{MAX_OPEN})"
+            # V13.9: показываем скан ВСЕГДА, даже если MAX_OPEN достигнут
+            tracked_now = _load_tracked()
+            open_now = sum(1 for v in tracked_now.values() if v.get("status") == "open")
+            skip_reason = ""
+            if open_now >= MAX_OPEN:
+                skip_reason = f" ⏸️ MAX_OPEN достигнут ({open_now}/{MAX_OPEN}), скан пропущен"
+            scan_msg = f"🔍 Anomaly A+ скан в {scan_dt_str} МСК (открыто={open_now}/{MAX_OPEN}){skip_reason}"
             print(f"[anomaly A+] {scan_msg}")
             if B:
                 try: B.send_telegram(scan_msg)
                 except: pass
+
+            tracked = _load_tracked()
+            open_count = sum(1 for v in tracked.values() if v.get("status") == "open")
+            if open_count >= MAX_OPEN:
+                time.sleep(60); continue
 
             try:
                 setup = do_scan(now_ts)
@@ -1363,6 +1369,13 @@ def cmd_status():
 def cmd_on():
     _state["scan_mode"] = "auto"
     _save()
+    # V13.9: проверяем что scanner thread жив, если нет — перезапускаем
+    global _scanner_thread, _scanner_running
+    if _scanner_thread is None or not _scanner_thread.is_alive():
+        print(f"[anomaly A+] cmd_on: scanner thread мёртв, перезапускаю")
+        _scanner_running = True
+        _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="anomaly-scanner-cmd-on")
+        _scanner_thread.start()
     return f"🚨 Anomaly A+ включён.\nСкан: :{SCAN_MINUTE:02d} каждого часа\nMAX_OPEN: {MAX_OPEN}\nАномалий: 5 (Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion)"
 
 def cmd_off():
