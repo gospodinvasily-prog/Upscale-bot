@@ -840,8 +840,44 @@ class Executor:
         has_tp = exit_mode != "trailing" and b.get("tp1_price") is not None
         rr1_real = abs(Decimal(str(b["tp1_price"])) - fill) / (risk_px or Decimal(1)) if has_tp else None
         info = {"id": _pos_id(pos), "mid": mid, "dir": side, "size": size, "sym": sym, "entry": fill}
+
+        # V13.10 SLIPPAGE PROTECTION (по запросу пользователя):
+        # Если slippage > 0.3% — пересчитываем stop и TP под реальную цену входа.
+        # Раньше стопы и TP оставались по плановой цене → при slippage +1.7% реальный
+        # риск мог быть $126 вместо $100, RR падал с 1:1.5 до 1:0.9.
+        # Теперь: new_stop = planned_stop × (fill / planned_price)
+        #         new_tp1 = planned_tp1 × (fill / planned_price)
+        # Аналогично price_correction в exec_donchian_4h_v22.py.
+        SLIPPAGE_CORRECT_THRESHOLD = Decimal("0.3")   # % — ниже не корректируем
+        slippage_corrected = False
+        new_stop_decimal = None
+        new_tp1_decimal = None
+        new_tp2_decimal = None
+        new_tp3_decimal = None
+        if abs(slip) > float(SLIPPAGE_CORRECT_THRESHOLD) and sig_px > 0:
+            try:
+                correction = float(fill) / float(sig_px)  # > 1 если вход хуже сигнала (slippage +)
+                # Защита от мусора
+                if 0.95 < correction < 1.05:
+                    new_stop_decimal = float(b["stop"]) * correction
+                    new_tp1_decimal = float(b["tp1_price"]) * correction if b.get("tp1_price") else None
+                    new_tp2_decimal = float(b["tp2_price"]) * correction if b.get("tp2_price") else None
+                    new_tp3_decimal = float(b["tp3_price"]) * correction if b.get("tp3_price") else None
+                    slippage_corrected = True
+                    print(f"[EXEC V13.10] {sym}: slippage {slip:+.2f}% > {SLIPPAGE_CORRECT_THRESHOLD}% — корректируем уровни (correction={correction:.4f})")
+            except Exception as e:
+                print(f"[EXEC V13.10] {sym}: slippage correction calc error: {e}")
+
         if has_tp:
-            info.update(tp1=b.get("tp1_price"), tp2=b.get("tp2_price"), tp3=b.get("tp3_price"))
+            # Обновляем info с корректированными ценами (для _place_tps)
+            if slippage_corrected:
+                info.update(
+                    tp1=new_tp1_decimal if new_tp1_decimal else b.get("tp1_price"),
+                    tp2=new_tp2_decimal if new_tp2_decimal else b.get("tp2_price"),
+                    tp3=new_tp3_decimal if new_tp3_decimal else b.get("tp3_price"),
+                )
+            else:
+                info.update(tp1=b.get("tp1_price"), tp2=b.get("tp2_price"), tp3=b.get("tp3_price"))
         with self._lock:
             self._open_risk[info["id"]] = real_risk
         if exit_mode == "trailing":
@@ -866,10 +902,47 @@ class Executor:
                       + " / ".join(f"{b[k]:.6g}" for k in ("tp1_price", "tp2_price", "tp3_price") if b.get(k))
                       + " "
                       f"(реальное RR к TP1 = 1:{float(rr1_real):.1f}) через {TP_DELAY_SEC}с.")
+
+        # V13.10: если была корректировка — переместить стоп и отправить уведомление
+        if slippage_corrected and new_stop_decimal:
+            try:
+                # Ждём 1 сек чтобы позиция полностью появилась в API
+                time.sleep(1)
+                move_result = self.move_stop(info, Decimal(str(new_stop_decimal)))
+                # Пересчитываем реальный risk и RR после корректировки
+                new_risk_px = abs(fill - Decimal(str(new_stop_decimal)))
+                new_real_stop_pct = float(new_risk_px) / float(fill) * 100
+                new_real_risk = float(notional) * new_real_stop_pct / 100
+                # Обновляем _open_risk с корректным значением
+                with self._lock:
+                    self._open_risk[info["id"]] = Decimal(str(new_real_risk))
+                new_rr1 = None
+                if has_tp and new_tp1_decimal:
+                    new_rr1 = float(abs(Decimal(str(new_tp1_decimal)) - fill) / (new_risk_px or Decimal(1)))
+                self.send(
+                    f"📐 <b>SLIPPAGE ADJUST: {sym} {side.upper()}</b>\n"
+                    f"Плановый вход: ${float(sig_px):.6g}\n"
+                    f"Реальный вход: ${float(fill):.6g}\n"
+                    f"Slippage: {slip:+.2f}%\n"
+                    f"Стоп: ${float(b['stop']):.6g} → ${new_stop_decimal:.6g}\n"
+                    f"Risk: ${real_risk:.1f} → ${new_real_risk:.1f}\n"
+                    + (f"TP1: ${float(b['tp1_price']):.6g} → ${new_tp1_decimal:.6g}\n" if new_tp1_decimal else "")
+                    + (f"TP2: ${float(b['tp2_price']):.6g} → ${new_tp2_decimal:.6g}\n" if new_tp2_decimal and b.get("tp2_price") else "")
+                    + (f"TP3: ${float(b['tp3_price']):.6g} → ${new_tp3_decimal:.6g}\n" if new_tp3_decimal and b.get("tp3_price") else "")
+                    + (f"Новый RR к TP1: 1:{new_rr1:.2f}" if new_rr1 else "")
+                    + f"\nmove_stop: {move_result}"
+                )
+                print(f"[EXEC V13.10] {sym}: slippage adjust applied — stop {b['stop']:.6g} → {new_stop_decimal:.6g}, risk ${real_risk:.1f} → ${new_real_risk:.1f}")
+            except Exception as e:
+                print(f"[EXEC V13.10] {sym}: move_stop after slippage error: {e}")
+                self.send(f"⚠️ {sym}: slippage adjust error (move_stop failed): {e}")
         if rr1_real is not None and rr1_real < Decimal("1"):
-            self.send(f"⚠️ {sym}: проскальзывание {slip:+.2f}% срезало RR до 1:{float(rr1_real):.1f} — "
-                      f"цель ближе стопа. Цели структурные, двигать их нельзя; "
-                      f"если такое повторяется, увеличивай буфер входа или стоп.")
+            # V13.10: если корректировка применена — это сообщение не нужно,
+            # RR уже восстановлен. Показываем только если корректировка не сработала.
+            if not slippage_corrected:
+                self.send(f"⚠️ {sym}: проскальзывание {slip:+.2f}% срезало RR до 1:{float(rr1_real):.1f} — "
+                          f"цель ближе стопа. Цели структурные, двигать их нельзя; "
+                          f"если такое повторяется, увеличивай буфер входа или стоп.")
         if plan["real_risk_usd"] and abs(real_risk - plan["real_risk_usd"]) / plan["real_risk_usd"] > Decimal("0.3"):
             self.send(f"⚠️ {sym}: фактический риск ${real_risk:.1f} сильно отличается от плана "
                       f"${plan['real_risk_usd']:.1f} — проверь, как API трактует amount/плечо.")
