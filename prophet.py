@@ -1350,25 +1350,21 @@ def _scanner_loop():
                 if setup["score"] >= min_s:
                     _stats["signals"] += 1
 
-                    # V12: ПОДТВЕРЖДЕНИЕ ВХОДА
-                    # В auto режиме — запускаем confirmation worker
-                    # В continuous (ручном) — отправляем сигнал с кнопками как раньше
+                    # V13.12: УБРАНО 15m подтверждение (по бэктесту: -37% PF, -6.6 п.п. WR)
+                    # Бэктест за 90 дней показал:
+                    #   A_CURRENT_15M: PF 1.24, WR 56.0%, PnL +54.9% (192 сигнала отклонено из 326)
+                    #   B_NO_CONFIRM:  PF 1.70, WR 62.6%, PnL +175.8% (0 отклонений)
+                    # Подтверждение отсекало разворотные точки — рынок только начинал разворот,
+                    # свеча ещё не была "подтверждена" цветом.
                     if mode == "auto":
+                        # V13.12: ВХОД СРАЗУ после сигнала (без ожидания 15m свечи)
                         if B:
                             B.send_telegram(
                                 f"🔮 <b>V12 — сигнал найден</b>\n"
                                 f"🎯 {setup['symbol']} {emoji_dir} score={setup['score']:.0f}\n"
-                                f"⏱️ Жду подтверждения 15 мин (закрытие 15m свечи)..."
+                                f"⚡ Вхожу сразу по рынку (V13.12: без 15m подтверждения)"
                             )
-                        # Запускаем воркер подтверждения в отдельном потоке
-                        fire_ts = int(_now())
-                        t = threading.Thread(
-                            target=_confirmation_worker,
-                            args=(setup, fire_ts),
-                            daemon=True,
-                            name=f"prophet-confirm-{setup['symbol']}-{fire_ts}"
-                        )
-                        t.start()
+                        execute_trade(setup)
                     else:
                         # Continuous (ручной режим): отправляем в Telegram с кнопками
                         print(f"[prophet V12] сигнал {setup['symbol']} score={setup['score']:.0f} → отправляю в Telegram")
@@ -1438,7 +1434,7 @@ def cmd_status():
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}" + (f" | BEAR ≥{MIN_SCORE_BEAR}" if BEAR_AWARE_ENABLED else ""))
     lines.append(f"TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
-    lines.append(f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)")
+    lines.append(f"✅ Вход: сразу по рынку (V13.12: 15m подтверждение убрано — было -37% PF)")
     # V12-counter-trend: показываем что включён
     if BEAR_AWARE_ENABLED:
         lines.append(f"🐻 Bear-aware + Counter-trend: BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER}) | BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})")
@@ -1494,7 +1490,7 @@ def cmd_on():
         _scanner_stop_event.clear()
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-cmd-on")
         _scanner_thread.start()
-    return f"🤖 Prophet V12 включён.\nЧасы скана: {AUTO_HOURS_MSK}\nСкан в :{SCAN_MINUTE:02d} | Подтверждение: {CONFIRM_WAIT_SEC//60} мин\nПорог: ≥{AUTO_SCORE}\nMAX_OPEN: {MAX_OPEN}"
+    return f"🤖 Prophet V12 включён.\nЧасы скана: {AUTO_HOURS_MSK}\nСкан в :{SCAN_MINUTE:02d} | Вход: сразу по рынку (V13.12)\nПорог: ≥{AUTO_SCORE}\nMAX_OPEN: {MAX_OPEN}"
 
 def cmd_off():
     """V12-FINAL: выключение авто-торговли."""
@@ -1903,7 +1899,7 @@ def start():
             f"📈 TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)\n"
             f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
             f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
-            f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)\n"
+            f"✅ Вход: сразу по рынку (V13.12: без 15m подтверждения)\n"
             f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (LONG/SHORT раздельно)\n"
             + (f"🐻 Bear-aware + Counter-trend:\n   BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER})\n   BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})\n   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}\n" if BEAR_AWARE_ENABLED else "")
             + f"🟢 LONG + 🔴 SHORT (в обе стороны в BULL и BEAR)\n"
