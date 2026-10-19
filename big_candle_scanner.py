@@ -75,6 +75,9 @@ except Exception as e:
 else:
     _UE_IMPORT_ERR = None
 
+# V13.10: HTTP session для запросов текущей цены (ext_atr расчёт)
+_session = requests.Session()
+
 
 # =====================================================================
 #  КОНСТАНТЫ
@@ -491,6 +494,26 @@ def _execute_signal(signal):
     stop = signal["stop_price"]
     tp = signal["tp_price"]
     stop_pct = signal["stop_pct"]
+    signal_atr = signal["atr"]  # абсолютный ATR в долларах
+
+    # V13.10 FIX: ext_atr должен быть БЕЗРАЗМЕРНОЙ величиной (кратность ATR)
+    # а не абсолютным ATR в долларах. Раньше передавали float(signal["atr"])
+    # что для BTC ($132) всегда > MAX_CHASE_ATR=0.3 → все BTC сигналы skip'ались.
+    # Теперь: получаем текущую цену, считаем отклонение в ATR.
+    # Если отклонение > 0.3 ATR — пропускаем (цена ушла).
+    cur_price = None
+    try:
+        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{sym}_USDT"}, timeout=10)
+        if r.ok:
+            cur_price = float(r.json().get("last", 0))
+    except: pass
+    
+    if cur_price and signal_atr > 0:
+        # ext_atr = |cur_price - entry| / signal_atr (кратность ATR)
+        ext_atr_value = abs(cur_price - entry) / signal_atr
+    else:
+        # Не смогли получить цену — не skip'аем (вход по плановой цене)
+        ext_atr_value = 0.0
 
     # === RISK MANAGEMENT как в 4H ===
     # risk = $100, плечо 5x
@@ -517,7 +540,7 @@ def _execute_signal(signal):
         "max_same_side": 1,  # только 1 сделка Big Candle одновременно
         "strategy": STRATEGY_TAG,
         "leverage_override": BC_LEVERAGE,
-        "ext_atr": float(signal["atr"]),
+        "ext_atr": ext_atr_value,  # V13.10 FIX: безразмерная величина (кратность ATR)
     }
 
     try:
