@@ -88,13 +88,15 @@ MAX_OPEN = 5           # V12-max5: 5 (V8 было 2, V12-max3 было 3)
 MAX_SAME_SIDE = 5      # до 5 LONG или 5 SHORT (при условии пирамидинга)
 SIDE_DAILY_STOP_USD = 300.0  # 3 убытка × $100 = $300, потом блок стороны
 # V12-counter-trend: разные TP для trend vs counter-trend сделок
-# - BULL BTC: LONG (trend) → TP=3.0×ATR, SHORT (counter) → TP=1.5×ATR
-# - BEAR BTC: SHORT (trend) → TP=3.0×ATR, LONG (counter) → TP=1.5×ATR
-TP_TREND = 3.0          # LONG в BULL, SHORT в BEAR — с трендом
-TP_COUNTER = 1.5        # SHORT в BULL, LONG в BEAR — против тренда
+# V13.11 B_SYMMETRIC (по бэктесту): TP=SL=2.0 для всех → RR 1:1
+# Бэктест показал: PF 1.71 vs 1.61 (current), WR 62.6% vs 60.6%, PnL +176% vs +145%
+# Причина: TP=3.0×ATR (trend) слишком далеко для Prophet — WR trend 62% (нужно 65%+)
+# TP=2.0×ATR для trend даёт WR 65% (лучше), counter-trend TP=2.0×ATR даёт RR 1:1 (vs 1:0.75)
+TP_TREND = 2.0          # V13.11: было 3.0 (LONG в BULL, SHORT в BEAR — с трендом)
+TP_COUNTER = 2.0        # V13.11: было 1.5 (SHORT в BULL, LONG в BEAR — против тренда)
 # V12-bear-aware: торговля в BEAR BTC режиме (обе стороны работают!)
 # - BULL BTC (+1): LONG (trend) + SHORT (counter)
-# - BEAR BTC (-1): SHORT (trend) + LONG (counter) ← LONG в BEAR разрешён с TP=1.5
+# - BEAR BTC (-1): SHORT (trend) + LONG (counter) ← LONG в BEAR разрешён с TP=2.0 (V13.11)
 # - NEUTRAL (0): не торгуем
 BEAR_AWARE_ENABLED = True
 MIN_SCORE_BEAR = 70       # в BEAR режиме строже отбор (vs 60 в BULL)

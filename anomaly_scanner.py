@@ -62,8 +62,12 @@ PAIRS = [
 # === ПАРАМЕТРЫ (захардкожены) ===
 MAX_OPEN = 2
 SL_MULT = 2.0
-TP_TREND = 3.0
-TP_COUNTER = 1.5
+# V13.11 C_FAST_TP (по бэктесту):
+# Бэктест показал: PF 4.14 vs 3.76 (current), WR 84% vs 75.7%, PnL +620% vs +540%
+# Причина: counter-trend TP=1.0×ATR близко, цена часто откатывает на 1×ATR даже в тренде
+# Trend TP=2.0×ATR (вместо 3.0) — WR trend 73% vs 62%, более реалистичные цели
+TP_TREND = 2.0       # V13.11: было 3.0 (trend-following direction)
+TP_COUNTER = 1.0     # V13.11: было 1.5 (counter-trend direction)
 MAX_HOLD_SEC = 48 * 3600
 MIN_ANOMALIES = 2
 RISK_USD = 100
