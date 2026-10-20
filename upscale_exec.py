@@ -429,16 +429,34 @@ class Executor:
     def _registry_set(self, pos_id, strategy_name):
         with self._registry_lock:
             self._strategy_registry[pos_id] = strategy_name
+            # V13.11: сохраняем в файл для переживания рестартов
+            try:
+                reg_file = os.environ.get("BOT_DATA_DIR", "/tmp") + "/strategy_registry.json"
+                with open(reg_file, "w") as f:
+                    json.dump(self._strategy_registry, f)
+            except: pass
 
     def _registry_get(self, pos_id):
         with self._registry_lock:
-            # V13.11 FIX: было .get(pos_id, "donchian_4h_v22") — все неизвестные позиции
-            # помечались как donchian. Теперь возвращаем None и в отчёте показываем как Unknown.
+            # V13.11: подгружаем из файла если в памяти пусто
+            if not self._strategy_registry:
+                try:
+                    reg_file = os.environ.get("BOT_DATA_DIR", "/tmp") + "/strategy_registry.json"
+                    if os.path.exists(reg_file):
+                        with open(reg_file) as f:
+                            self._strategy_registry = json.load(f)
+                except: pass
             return self._strategy_registry.get(pos_id, None)
 
     def _registry_del(self, pos_id):
         with self._registry_lock:
             self._strategy_registry.pop(pos_id, None)
+            # V13.11: сохраняем в файл
+            try:
+                reg_file = os.environ.get("BOT_DATA_DIR", "/tmp") + "/strategy_registry.json"
+                with open(reg_file, "w") as f:
+                    json.dump(self._strategy_registry, f)
+            except: pass
 
     # -- персистентность TP/безубытка (переживает перезапуск процесса) --
     def _pending_set(self, info, stage, due_ts=None):
@@ -1333,6 +1351,20 @@ class Executor:
             except: return None
 
         def _when(o):
+            # V13.11: ищем САМОЕ РАННЕЕ время — createdAt (когда ордер создан)
+            # это работает для ордеров входа (у них нет closedAt, но есть createdAt)
+            for k in ("createdAt", "updatedAt", "filledAt", "closedAt"):
+                v = o.get(k)
+                if not v: continue
+                try:
+                    if isinstance(v, str) and "T" in v:
+                        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                    return float(v) / (1000 if float(v) > 1e11 else 1)
+                except: continue
+            return 0
+
+        def _when_close(o):
+            # V13.11: ищем САМОЕ ПОЗДНЕЕ время — closedAt (когда ордер исполнен/закрыт)
             for k in ("closedAt", "filledAt", "updatedAt", "createdAt"):
                 v = o.get(k)
                 if not v: continue
@@ -1370,20 +1402,20 @@ class Executor:
                 n_ord += 1
                 if o.get("profitAdjustmentApplied"):
                     adj_cnt += 1
-                # V13.11 FIX: avg hold time — используем openedAt/closedAt ордеров
-                # first_ts = время первого ордера (открытие позиции)
-                # ts = время последнего ордера (закрытие позиции)
+                # V13.11: first_ts = время создания ордера, close_ts = время закрытия
+                ts_open = _when(o)      # самое раннее (создание)
+                ts_close = _when_close(o)  # самое позднее (закрытие)
                 key = o.get("positionId") or o.get("id")
-                t = trades.setdefault(key, {"sym": sym, "pnl": Decimal(0), "ts": ts, "n": 0,
-                                            "first_ts": None, "strategy": None})
+                t = trades.setdefault(key, {"sym": sym, "pnl": Decimal(0), "ts": ts_close, "n": 0,
+                                            "first_ts": ts_open, "strategy": None})
                 t["pnl"] += v
                 t["n"] += 1
                 # first_ts = минимальный ts среди всех ордеров (открытие позиции)
-                if t["first_ts"] is None or ts < t["first_ts"]:
-                    t["first_ts"] = ts
+                if ts_open and (t["first_ts"] is None or ts_open < t["first_ts"]):
+                    t["first_ts"] = ts_open
                 # ts = максимальный ts (закрытие позиции)
-                if ts > t["ts"]:
-                    t["ts"] = ts
+                if ts_close and ts_close > t["ts"]:
+                    t["ts"] = ts_close
                 # V13.11: определяем стратегию через registry
                 strat = self._registry_get(key)
                 if strat:
