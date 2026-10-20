@@ -801,6 +801,60 @@ def on_callback(data):
         _save()
         if B: B.send_telegram("⏭️ Пропущено. Жду следующий скан.")
 
+
+def cmd_config():
+    """V13.12: Возвращает текст и inline-клавиатуру для управления параметрами."""
+    cur_risk = _state.get("risk_usd_override") or RISK_USD
+    cur_tp = _state.get("tp_mult_override")
+    cur_tp_str = f"{cur_tp}×ATR" if cur_tp else "Auto (2.0/2.0)"
+    
+    typical_atr = 2.5
+    sl_pct = SL_MULT * typical_atr
+    pos_size = cur_risk / sl_pct * 100
+    
+    def calc_profit(tp_mult):
+        tp_pct = tp_mult * typical_atr
+        net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+        return net_pct * pos_size / 100
+    
+    p_10 = calc_profit(1.0)
+    p_15 = calc_profit(1.5)
+    p_20 = calc_profit(2.0)
+    p_30 = calc_profit(3.0)
+    
+    text = (
+        "⚙️ <b>Настройки Prophet V13</b>\n\n"
+        f"💰 Текущий Risk: <b>${cur_risk}</b>\n"
+        f"🎯 Текущий TP: <b>{cur_tp_str}</b>\n"
+        f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n\n"
+        "<b>💡 Прибыль с TP (при ATR=2.5%):</b>\n"
+        f"  TP 1.0×ATR → +${p_10:.0f}\n"
+        f"  TP 1.5×ATR → +${p_15:.0f}\n"
+        f"  TP 2.0×ATR → +${p_20:.0f}\n"
+        f"  TP 3.0×ATR → +${p_30:.0f}\n\n"
+        "Нажми кнопку для изменения:"
+    )
+    
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "Risk $50", "callback_data": "prophet_risk_50"},
+                {"text": "Risk $100", "callback_data": "prophet_risk_100"},
+                {"text": "Risk $200", "callback_data": "prophet_risk_200"}
+            ],
+            [
+                {"text": "TP 1.0×ATR", "callback_data": "prophet_tp_1.0"},
+                {"text": "TP 1.5×ATR", "callback_data": "prophet_tp_1.5"},
+                {"text": "TP 2.0×ATR", "callback_data": "prophet_tp_2.0"}
+            ],
+            [
+                {"text": "TP 3.0×ATR", "callback_data": "prophet_tp_3.0"},
+                {"text": "🔄 Auto", "callback_data": "prophet_tp_auto"}
+            ]
+        ]
+    }
+    return {"text": text, "markup": keyboard}
+
 # === V12 CONFIRMATION (15-min confirmation candle) ===
 
 def _confirm_signal(setup):
