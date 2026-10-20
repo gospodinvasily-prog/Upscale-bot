@@ -709,12 +709,26 @@ def on_callback(data):
         risk_val = int(data.replace("prophet_risk_", ""))
         _state["risk_usd_override"] = risk_val
         _save()
-        # Перезапуск сканера
         try:
             cmd_off()
             cmd_on()
         except: pass
-        return f"✅ Риск изменён на ${risk_val}. Стратегия перезапущена."
+        # V13.12: подробное сообщение после изменения
+        tp_ov = _state.get("tp_mult_override")
+        tp_str = f"{tp_ov}×ATR" if tp_ov else "Auto (2.0/2.0)"
+        typical_atr = 2.5
+        sl_pct = SL_MULT * typical_atr
+        pos_size = risk_val / sl_pct * 100
+        return (
+            f"✅ <b>Риск изменён на ${risk_val}</b>\n\n"
+            f"📊 <b>Текущие настройки Prophet:</b>\n"
+            f"💰 Risk: <b>${risk_val}</b>\n"
+            f"🎯 TP: <b>{tp_str}</b>\n"
+            f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
+            f"🛡️ SL: {SL_MULT}×ATR | Hold: {MAX_HOLD//3600}ч\n"
+            f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
+            f"🚀 Стратегия перезапущена"
+        )
     
     if data.startswith("prophet_tp_"):
         if data == "prophet_tp_auto":
@@ -724,7 +738,28 @@ def on_callback(data):
                 cmd_off()
                 cmd_on()
             except: pass
-            return "✅ TP сброшен к Auto (Trend/Counter). Стратегия перезапущена."
+            risk_val = _state.get("risk_usd_override") or RISK_USD
+            typical_atr = 2.5
+            sl_pct = SL_MULT * typical_atr
+            pos_size = risk_val / sl_pct * 100
+            tp_pct_trend = TP_TREND * typical_atr
+            tp_pct_counter = TP_COUNTER * typical_atr
+            net_t = tp_pct_trend - (COMMISSION_PCT * 2 + SPREAD_PCT)
+            net_c = tp_pct_counter - (COMMISSION_PCT * 2 + SPREAD_PCT)
+            p_trend = net_t * pos_size / 100
+            p_counter = net_c * pos_size / 100
+            return (
+                f"✅ <b>TP сброшен на Auto</b>\n\n"
+                f"📊 <b>Текущие настройки Prophet:</b>\n"
+                f"💰 Risk: <b>${risk_val}</b>\n"
+                f"🎯 TP: <b>Auto (Trend={TP_TREND}/Counter={TP_COUNTER})</b>\n"
+                f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
+                f"🛡️ SL: {SL_MULT}×ATR | Hold: {MAX_HOLD//3600}ч\n\n"
+                f"💡 Прибыль (ATR=2.5%):\n"
+                f"  Trend {TP_TREND}×ATR → +${p_trend:.0f}\n"
+                f"  Counter {TP_COUNTER}×ATR → +${p_counter:.0f}\n"
+                f"🚀 Стратегия перезапущена"
+            )
         tp_val = float(data.replace("prophet_tp_", ""))
         _state["tp_mult_override"] = tp_val
         _save()
@@ -732,7 +767,23 @@ def on_callback(data):
             cmd_off()
             cmd_on()
         except: pass
-        return f"✅ TP×ATR изменён на {tp_val}. Стратегия перезапущена."
+        risk_val = _state.get("risk_usd_override") or RISK_USD
+        typical_atr = 2.5
+        sl_pct = SL_MULT * typical_atr
+        pos_size = risk_val / sl_pct * 100
+        tp_pct = tp_val * typical_atr
+        net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+        profit = net_pct * pos_size / 100
+        return (
+            f"✅ <b>TP изменён на {tp_val}×ATR</b>\n\n"
+            f"📊 <b>Текущие настройки Prophet:</b>\n"
+            f"💰 Risk: <b>${risk_val}</b>\n"
+            f"🎯 TP: <b>{tp_val}×ATR (для всех сделок)</b>\n"
+            f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
+            f"🛡️ SL: {SL_MULT}×ATR | Hold: {MAX_HOLD//3600}ч\n\n"
+            f"💡 Прибыль с TP: <b>+${profit:.0f}</b> (при ATR=2.5%)\n"
+            f"🚀 Стратегия перезапущена"
+        )
 
     if not _state.get("pending_signal"): return
     sig = _state["pending_signal"]
