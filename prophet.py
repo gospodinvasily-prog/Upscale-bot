@@ -130,6 +130,8 @@ _state = {
     "long_cooldown_until": 0,    # V12: cooldown после убыточного LONG (24h)
     "short_cooldown_until": 0,   # V12: cooldown после убыточного SHORT (24h)
     "symbol_blacklist": {},     # V12: {sym: ts_until}
+    "risk_usd_override": None,   # V13.12: override RISK_USD через Telegram
+    "tp_mult_override": None,    # V13.12: override TP multiplier через Telegram
     # V12-max5: per-side daily PnL (сброс по MSK-дню)
     "long_today_pnl": 0.0,       # кумулятивный PnL LONG за сегодня
     "short_today_pnl": 0.0,      # кумулятивный PnL SHORT за сегодня
@@ -546,7 +548,11 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
     # V12-counter-trend: TP зависит от направления vs тренда BTC
     # trend direction = с трендом BTC → TP_TREND (3.0)
     # counter direction = против тренда BTC → TP_COUNTER (1.5)
-    if btc_reg == +1:
+    # V13.12: TP override через Telegram (если задан, используется для всех сделок)
+    tp_override = _state.get("tp_mult_override")
+    if tp_override:
+        tp_mult = float(tp_override)
+    elif btc_reg == +1:
         # BULL BTC: LONG=trend, SHORT=counter
         tp_mult = TP_TREND if direction == "LONG" else TP_COUNTER
     elif btc_reg == -1:
@@ -694,6 +700,36 @@ def send_signal(setup):
 
 def on_callback(data):
     """Обработка нажатия кнопки."""
+    # V13.12: обработка кнопок конфигурации
+    if data.startswith("prophet_risk_"):
+        risk_val = int(data.replace("prophet_risk_", ""))
+        _state["risk_usd_override"] = risk_val
+        _save()
+        # Перезапуск сканера
+        try:
+            cmd_off()
+            cmd_on()
+        except: pass
+        return f"✅ Риск изменён на ${risk_val}. Стратегия перезапущена."
+    
+    if data.startswith("prophet_tp_"):
+        if data == "prophet_tp_auto":
+            _state["tp_mult_override"] = None
+            _save()
+            try:
+                cmd_off()
+                cmd_on()
+            except: pass
+            return "✅ TP сброшен к Auto (Trend/Counter). Стратегия перезапущена."
+        tp_val = float(data.replace("prophet_tp_", ""))
+        _state["tp_mult_override"] = tp_val
+        _save()
+        try:
+            cmd_off()
+            cmd_on()
+        except: pass
+        return f"✅ TP×ATR изменён на {tp_val}. Стратегия перезапущена."
+
     if not _state.get("pending_signal"): return
     sig = _state["pending_signal"]
 
@@ -705,6 +741,60 @@ def on_callback(data):
         _state["pending_signal"] = None
         _save()
         if B: B.send_telegram("⏭️ Пропущено. Жду следующий скан.")
+
+
+def cmd_config():
+    """V13.12: Возвращает текст и inline-клавиатуру для управления параметрами."""
+    cur_risk = _state.get("risk_usd_override") or RISK_USD
+    cur_tp = _state.get("tp_mult_override")
+    cur_tp_str = f"{cur_tp}×ATR" if cur_tp else "Auto (2.0/2.0)"
+    
+    # V13.12: расчёт примерной прибыли для каждого TP
+    # Формула: pos_size = risk / SL% * 100; profit = (TP% - commission) * pos_size / 100
+    # При типичном ATR=2.5%: SL = 2.0 * 2.5 = 5.0%
+    typical_atr = 2.5
+    sl_pct = SL_MULT * typical_atr  # 5.0%
+    pos_size = cur_risk / sl_pct * 100  # например: 100 / 5 * 100 = $2000
+    
+    def calc_profit(tp_mult):
+        tp_pct = tp_mult * typical_atr
+        net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)  # минус комиссии
+        return net_pct * pos_size / 100
+    
+    p_10 = calc_profit(1.0)
+    p_15 = calc_profit(1.5)
+    p_20 = calc_profit(2.0)
+    p_30 = calc_profit(3.0)
+    
+    text = (
+        "⚙️ <b>Настройки Prophet V13</b>\n\n"
+        f"💰 Текущий Risk: <b>${cur_risk}</b>\n"
+        f"🎯 Текущий TP: <b>{cur_tp_str}</b>\n"
+        f"📊 Позиция (~${pos_size:.0f} при ATR 2.5%)\n\n"
+        "Выберите параметр для изменения:\n"
+        "<i>(прибыль указана ориентировочно, при типичном ATR=2.5%)</i>"
+    )
+    
+    # Inline клавиатура
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": f"💰 Risk: $50", "callback_data": "prophet_risk_50"},
+                {"text": f"💰 Risk: $100", "callback_data": "prophet_risk_100"},
+                {"text": f"💰 Risk: $200", "callback_data": "prophet_risk_200"}
+            ],
+            [
+                {"text": f"🎯 TP: 1.0×ATR (+${p_10:.0f})", "callback_data": "prophet_tp_1.0"},
+                {"text": f"🎯 TP: 1.5×ATR (+${p_15:.0f})", "callback_data": "prophet_tp_1.5"},
+                {"text": f"🎯 TP: 2.0×ATR (+${p_20:.0f})", "callback_data": "prophet_tp_2.0"}
+            ],
+            [
+                {"text": f"🎯 TP: 3.0×ATR (+${p_30:.0f})", "callback_data": "prophet_tp_3.0"},
+                {"text": "🔄 Auto (2.0/2.0)", "callback_data": "prophet_tp_auto"}
+            ]
+        ]
+    }
+    return {"text": text, "markup": keyboard}
 
 # === V12 CONFIRMATION (15-min confirmation candle) ===
 
@@ -1022,7 +1112,9 @@ def execute_trade(setup):
     tp = setup["tp_price"]
     sp = setup["stop_pct"]
 
-    pos_size = RISK_USD / sp * 100
+    # V13.12: используем override риска если задан
+    actual_risk = _state.get("risk_usd_override") or RISK_USD
+    pos_size = actual_risk / sp * 100
     margin = pos_size / LEVERAGE
     if margin > MAX_MARGIN:
         margin = MAX_MARGIN
@@ -1031,8 +1123,8 @@ def execute_trade(setup):
     sig = {
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
-        "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
-        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,  # V12-max5: 3 (было 1)
+        "exit_mode": "tp_ladder", "risk_usd": actual_risk,  # V13.12: используем override
+        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
 
@@ -1350,21 +1442,25 @@ def _scanner_loop():
                 if setup["score"] >= min_s:
                     _stats["signals"] += 1
 
-                    # V13.12: УБРАНО 15m подтверждение (по бэктесту: -37% PF, -6.6 п.п. WR)
-                    # Бэктест за 90 дней показал:
-                    #   A_CURRENT_15M: PF 1.24, WR 56.0%, PnL +54.9% (192 сигнала отклонено из 326)
-                    #   B_NO_CONFIRM:  PF 1.70, WR 62.6%, PnL +175.8% (0 отклонений)
-                    # Подтверждение отсекало разворотные точки — рынок только начинал разворот,
-                    # свеча ещё не была "подтверждена" цветом.
+                    # V12: ПОДТВЕРЖДЕНИЕ ВХОДА
+                    # В auto режиме — запускаем confirmation worker
+                    # В continuous (ручном) — отправляем сигнал с кнопками как раньше
                     if mode == "auto":
-                        # V13.12: ВХОД СРАЗУ после сигнала (без ожидания 15m свечи)
                         if B:
                             B.send_telegram(
                                 f"🔮 <b>V12 — сигнал найден</b>\n"
                                 f"🎯 {setup['symbol']} {emoji_dir} score={setup['score']:.0f}\n"
-                                f"⚡ Вхожу сразу по рынку (V13.12: без 15m подтверждения)"
+                                f"⏱️ Жду подтверждения 15 мин (закрытие 15m свечи)..."
                             )
-                        execute_trade(setup)
+                        # Запускаем воркер подтверждения в отдельном потоке
+                        fire_ts = int(_now())
+                        t = threading.Thread(
+                            target=_confirmation_worker,
+                            args=(setup, fire_ts),
+                            daemon=True,
+                            name=f"prophet-confirm-{setup['symbol']}-{fire_ts}"
+                        )
+                        t.start()
                     else:
                         # Continuous (ручной режим): отправляем в Telegram с кнопками
                         print(f"[prophet V12] сигнал {setup['symbol']} score={setup['score']:.0f} → отправляю в Telegram")
@@ -1434,7 +1530,7 @@ def cmd_status():
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}" + (f" | BEAR ≥{MIN_SCORE_BEAR}" if BEAR_AWARE_ENABLED else ""))
     lines.append(f"TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
-    lines.append(f"✅ Вход: сразу по рынку (V13.12: 15m подтверждение убрано — было -37% PF)")
+    lines.append(f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)")
     # V12-counter-trend: показываем что включён
     if BEAR_AWARE_ENABLED:
         lines.append(f"🐻 Bear-aware + Counter-trend: BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER}) | BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})")
@@ -1490,7 +1586,7 @@ def cmd_on():
         _scanner_stop_event.clear()
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-cmd-on")
         _scanner_thread.start()
-    return f"🤖 Prophet V12 включён.\nЧасы скана: {AUTO_HOURS_MSK}\nСкан в :{SCAN_MINUTE:02d} | Вход: сразу по рынку (V13.12)\nПорог: ≥{AUTO_SCORE}\nMAX_OPEN: {MAX_OPEN}"
+    return f"🤖 Prophet V12 включён.\nЧасы скана: {AUTO_HOURS_MSK}\nСкан в :{SCAN_MINUTE:02d} | Подтверждение: {CONFIRM_WAIT_SEC//60} мин\nПорог: ≥{AUTO_SCORE}\nMAX_OPEN: {MAX_OPEN}"
 
 def cmd_off():
     """V12-FINAL: выключение авто-торговли."""
@@ -1899,7 +1995,7 @@ def start():
             f"📈 TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)\n"
             f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
             f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
-            f"✅ Вход: сразу по рынку (V13.12: без 15m подтверждения)\n"
+            f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)\n"
             f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (LONG/SHORT раздельно)\n"
             + (f"🐻 Bear-aware + Counter-trend:\n   BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER})\n   BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})\n   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}\n" if BEAR_AWARE_ENABLED else "")
             + f"🟢 LONG + 🔴 SHORT (в обе стороны в BULL и BEAR)\n"

@@ -183,6 +183,20 @@ def send_telegram(text):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
+def send_telegram_with_buttons(text, markup):
+    """V13.12: Отправляет сообщение с inline-кнопками."""
+    text = _balance_html(text)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                                     "disable_web_page_preview": True,
+                                     "reply_markup": json.dumps(markup)}, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[TG BUTTONS ERROR] {e}")
+        # Fallback: отправить просто текст
+        send_telegram(text)
+
 def send_document(path, caption=""):
     if not os.path.exists(path) or os.path.getsize(path) == 0: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
@@ -282,7 +296,11 @@ def tg_updates():
             if cb:
                 cb_data = cb.get("data", "")
                 if cb_data.startswith("prophet_") and PP is not None:
-                    try: PP.on_callback(cb_data)
+                    try:
+                        result = PP.on_callback(cb_data)
+                        # V13.12: если on_callback вернул текст (для config кнопок) — отправляем
+                        if result and isinstance(result, str):
+                            send_telegram(result)
                     except: pass
                 try:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
@@ -323,6 +341,7 @@ HELP_TEXT = (
     "/prophet_off — выключить\n"
     "/prophet_close — закрыть позиции Prophet\n"
     "/prophet_clean — cleaner зависших\n"
+    "/prophet_config — ⚙️ настройки риска и TP (кнопки)\n"
     "\n<b>🚨 ANOMALY SCANNER A+</b>\n"
     "/anomaly — статус\n"
     "/anomaly_on — включить\n"
@@ -335,6 +354,7 @@ HELP_TEXT = (
     "/bc_off — выключить\n"
     "/bc_close — закрыть позицию\n"
     "/bc_stats — статистика\n"
+    "/bc_manual [long|short] — принудительный вход с параметрами auto-сигнала\n"
 )
 
 def _all_strategies_status():
@@ -493,6 +513,10 @@ def handle_command(text):
     if cmd == "/prophet_clean":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_clean()
+    if cmd == "/prophet_config":
+        if PP is None: return "⚠️ Prophet не загружен"
+        # V13.12: возвращаем словарь с текстом и inline-клавиатурой
+        return PP.cmd_config()
 
     # ─── Anomaly Scanner A+ ──────────────────────────────────────────────────
     if cmd == "/anomaly":
@@ -527,6 +551,11 @@ def handle_command(text):
     if cmd == "/bc_stats":
         if BCS is None: return "⚠️ BC не загружен"
         return BCS.cmd_stats()
+    if cmd == "/bc_manual":
+        if BCS is None: return "⚠️ BC не загружен"
+        # /bc_manual [long|short]
+        d = arg.strip() if arg else ""
+        return BCS.cmd_manual(d)
 
     if cmd in ("/help", "/start"):
         return HELP_TEXT
@@ -541,7 +570,11 @@ def poll_commands():
             answer = f"Ошибка: {esc(str(e))}"
         if answer:
             print(f"[CMD] {text}")
-            send_telegram(answer)
+            # V13.12: поддержка inline-клавиатур (если answer - словарь)
+            if isinstance(answer, dict):
+                send_telegram_with_buttons(answer.get("text", ""), answer.get("markup"))
+            else:
+                send_telegram(answer)
 
 # ─── SHUTDOWN ─────────────────────────────────────────────────────────────────
 import signal as _signal
