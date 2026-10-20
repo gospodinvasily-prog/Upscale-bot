@@ -41,7 +41,7 @@ try:
 except Exception:
     UE = None
 
-STRATEGY_TAG = "prophet_v12"
+STRATEGY_TAG = "prophet_v13"
 GATE_API = "https://api.gateio.ws/api/v4/spot"
 MSK = dt.timezone(dt.timedelta(hours=3))
 
@@ -81,8 +81,8 @@ TP_MULT_WEAK = 2.5     # ADX<25  (слабый тренд)   — TP ближе
 MIN_SCORE = 60         # V12: 60 (V8 было 70) — было env, теперь хардкод
 AUTO_SCORE = 60        # V12: 60 (V8 было 90) — было env, теперь хардкод
 # V12: максимум одновременных позиций
-MAX_OPEN = 5           # V12-max5: 5 (V8 было 2, V12-max3 было 3)
-# V12-max5: ПИРАМИДИНГ — новая позиция в сторону только если предыдущие в плюсе
+MAX_OPEN = 5           # V13.12: 5 (V8 было 2, V12-max3 было 3)
+# V13.12: ПИРАМИДИНГ — новая позиция в сторону только если предыдущие в плюсе
 # - 1-я позиция: всегда можно открыть
 # - 2-я, 3-я, 4-я, 5-я: только если ВСЕ предыдущие в этой стороне в плюсе
 MAX_SAME_SIDE = 5      # до 5 LONG или 5 SHORT (при условии пирамидинга)
@@ -135,7 +135,7 @@ _state = {
     "long_cooldown_until": 0,    # V12: cooldown после убыточного LONG (24h)
     "short_cooldown_until": 0,   # V12: cooldown после убыточного SHORT (24h)
     "symbol_blacklist": {},     # V12: {sym: ts_until}
-    # V12-max5: per-side daily PnL (сброс по MSK-дню)
+    # V13.12: per-side daily PnL (сброс по MSK-дню)
     "long_today_pnl": 0.0,       # кумулятивный PnL LONG за сегодня
     "short_today_pnl": 0.0,      # кумулятивный PnL SHORT за сегодня
     "pnl_date": "",              # для сброса в начале дня
@@ -151,7 +151,7 @@ def _save():
     except: pass
 
 def _reset_daily_pnl_if_needed():
-    """V12-max5: сброс per-side daily PnL при смене MSK-дня."""
+    """V13.12: сброс per-side daily PnL при смене MSK-дня."""
     today = _today()
     if _state.get("pnl_date") != today:
         _state["pnl_date"] = today
@@ -160,7 +160,7 @@ def _reset_daily_pnl_if_needed():
         _save()
 
 def _side_blocked(direction: str) -> bool:
-    """V12-max5: проверить, заблокирована ли сторона из-за daily stop."""
+    """V13.12: проверить, заблокирована ли сторона из-за daily stop."""
     _reset_daily_pnl_if_needed()
     if direction == "LONG":
         return _state.get("long_today_pnl", 0.0) <= -SIDE_DAILY_STOP_USD
@@ -168,7 +168,7 @@ def _side_blocked(direction: str) -> bool:
         return _state.get("short_today_pnl", 0.0) <= -SIDE_DAILY_STOP_USD
 
 def _update_side_pnl(direction: str, pnl: float):
-    """V12-max5: добавить PnL к дневному итогу по стороне."""
+    """V13.12: добавить PnL к дневному итогу по стороне."""
     _reset_daily_pnl_if_needed()
     if direction in ("LONG", "long"):
         old = _state.get("long_today_pnl", 0.0)
@@ -190,7 +190,7 @@ def _fetch_current_price_for_sym(sym: str):
 
 def _can_pyramid(direction: str, tracked: dict) -> tuple:
     """
-    V12-max5: ПИРАМИДИНГ — можно ли открыть новую позицию в эту сторону?
+    V13.12: ПИРАМИДИНГ — можно ли открыть новую позицию в эту сторону?
     Правила:
       - 1-я позиция в сторону: ВСЕГДА можно (если есть свободный слот)
       - 2-я, 3-я, 4-я, 5-я: только если ВСЕ предыдущие позиции в этой стороне В ПЛЮСЕ
@@ -632,16 +632,16 @@ def do_scan(scan_ts=None):
                 if now_ts < _state.get("long_cooldown_until", 0): continue
             else:
                 if now_ts < _state.get("short_cooldown_until", 0): continue
-            # V12-max5: per-side daily stop — блокируем убыточную сторону
+            # V13.12: per-side daily stop — блокируем убыточную сторону
             if _side_blocked(r["direction"]):
                 side_pnl = _state.get("long_today_pnl" if r["direction"]=="LONG" else "short_today_pnl", 0.0)
-                print(f"[prophet V12-max5] {r['direction']} blocked: today PnL ${side_pnl:.0f} ≤ -${SIDE_DAILY_STOP_USD:.0f}")
+                print(f"[prophet V13.12] {r['direction']} blocked: today PnL ${side_pnl:.0f} ≤ -${SIDE_DAILY_STOP_USD:.0f}")
                 continue
-            # V12-max5: ПИРАМИДИНГ — не открываем 2-ю позицию в сторону если 1-я в минусе
+            # V13.12: ПИРАМИДИНГ — не открываем 2-ю позицию в сторону если 1-я в минусе
             # (но 1-я в сторону — всегда можно)
             can_pyramid, pyramid_reason = _can_pyramid(r["direction"], tracked)
             if not can_pyramid:
-                print(f"[prophet V12-max5] {r['symbol']} {r['direction']}: пирамидинг запрещён — {pyramid_reason}")
+                print(f"[prophet V13.12] {r['symbol']} {r['direction']}: пирамидинг запрещён — {pyramid_reason}")
                 continue
             results.append(r)
         except Exception as e:
@@ -1186,7 +1186,7 @@ def execute_trade(setup):
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
-        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,  # V12-max5: 3 (было 1)
+        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,  # V13.12: 3 (было 1)
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
 
@@ -1298,7 +1298,7 @@ def manage_positions():
                 # V13.3: НЕ удаляем pending_ если markets не загружены —
                 # иначе теряем реально открытые позиции после рестарта
                 if not executor._mk:
-                    print(f"[prophet V12-max5] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
+                    print(f"[prophet V13.12] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
                 else:
                     del tracked[pid]; changed = True
             continue
@@ -1330,7 +1330,7 @@ def manage_positions():
             except: pass
 
             _stats["pnl"] += pnl
-            # V12-max5: обновляем per-side daily PnL
+            # V13.12: обновляем per-side daily PnL
             direction_field = rec.get("direction", rec.get("dir", "long"))
             _update_side_pnl(direction_field, pnl)
             side_pnl_now = _state.get("long_today_pnl" if direction_field in ("LONG","long") else "short_today_pnl", 0.0)
@@ -1351,11 +1351,11 @@ def manage_positions():
                 bl[rec["sym"]] = int(_now()) + 48*3600  # 48ч вместо 7д
                 _state["symbol_blacklist"] = bl
                 _save()
-            # V12-max5: уведомление если сторона упёрлась в daily stop
+            # V13.12: уведомление если сторона упёрлась в daily stop
             if side_pnl_now <= -SIDE_DAILY_STOP_USD:
                 side_name = "LONG" if direction_field in ("LONG","long") else "SHORT"
                 if B: B.send_telegram(
-                    f"🚫 <b>V12-max5: {side_name} заблокирован до завтра</b>\n"
+                    f"🚫 <b>V13.12: {side_name} заблокирован до завтра</b>\n"
                     f"Сегодняшний PnL по {side_name}: ${side_pnl_now:+.0f}\n"
                     f"Лимит стороны: -${SIDE_DAILY_STOP_USD:.0f}\n"
                     f"Обратная сторона продолжает работать."
@@ -1394,19 +1394,19 @@ def _scanner_loop():
     # V13.7 FIX P0-3: используем threading.Event для атомарной остановки
     # (старый flag _scanner_running был race condition)
     _scanner_stop_event.clear()  # сбрасываем флаг остановки при запуске нового thread
-    print(f"[prophet V12-max5] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
-    # V12-max5: диагностика TZ — проверяем что часовой пояс правильный
+    print(f"[prophet V13.12] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
+    # V13.12: диагностика TZ — проверяем что часовой пояс правильный
     _now_diag = dt.datetime.now(MSK)
     _utc_diag = dt.datetime.now(dt.timezone.utc)
-    print(f"[prophet V12-max5] TZ диагностика: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, разница={(_now_diag.hour - _utc_diag.hour) % 24}ч")
+    print(f"[prophet V13.12] TZ диагностика: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, разница={(_now_diag.hour - _utc_diag.hour) % 24}ч")
     if B:
-        try: B.send_telegram(f"🕐 V12-max5 TZ проверка: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, ожидаемая разница=3ч (MSK=UTC+3)")
+        try: B.send_telegram(f"🕐 V13.12 TZ проверка: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, ожидаемая разница=3ч (MSK=UTC+3)")
         except: pass
     while True:
         try:
             # V13.7 FIX P0-3: atomic event check — если watchdog установил event — выходим
             if _scanner_stop_event.is_set():
-                print(f"[prophet V12-max5] Scanner: stop event установлен, останавливаюсь")
+                print(f"[prophet V13.12] Scanner: stop event установлен, останавливаюсь")
                 return  # выход из потока — watchdog создаст новый
             
             mode = _state.get("scan_mode", "off")
@@ -1454,13 +1454,13 @@ def _scanner_loop():
                 except Exception as e:
                     print(f"[prophet] cleaner error in scanner loop: {e}")
 
-            # V12-max5: AUTO-SYNC — убираем orphan'ы перед сканом
+            # V13.12: AUTO-SYNC — убираем orphan'ы перед сканом
             # (позиция уже закрыта на Upscale, но запись осталась в tracked)
             try:
                 if B and hasattr(B, "EXECUTOR") and B.EXECUTOR and B.EXECUTOR.client:
                     _auto_sync_orphans()
             except Exception as e:
-                print(f"[prophet V12-max5] auto-sync error: {e}")
+                print(f"[prophet V13.12] auto-sync error: {e}")
 
             # Уже есть открытая позиция?
             tracked = _load_tracked()
@@ -1472,13 +1472,13 @@ def _scanner_loop():
             skip_reason = ""
             if open_count >= MAX_OPEN:
                 skip_reason = f" ⏸️ MAX_OPEN достигнут ({open_count}/{MAX_OPEN}), скан пропущен"
-            scan_started_msg = f"🔍 V12-max5 скан в {scan_dt_str} МСК (UTC={utc_dt_str}, режим={mode}, открыто={open_count}/{MAX_OPEN}){skip_reason}"
-            print(f"[prophet V12-max5] {scan_started_msg}")
+            scan_started_msg = f"🔍 V13.12 скан в {scan_dt_str} МСК (UTC={utc_dt_str}, режим={mode}, открыто={open_count}/{MAX_OPEN}){skip_reason}"
+            print(f"[prophet V13.12] {scan_started_msg}")
             if B and mode == "auto":
                 try:
                     B.send_telegram(scan_started_msg)
                 except Exception as e:
-                    print(f"[prophet V12-max5] send start msg error: {e}")
+                    print(f"[prophet V13.12] send start msg error: {e}")
 
             if open_count >= MAX_OPEN:
                 time.sleep(60); continue
@@ -1486,9 +1486,9 @@ def _scanner_loop():
             try:
                 setup = do_scan(now_ts)
             except Exception as e:
-                print(f"[prophet V12-max5] do_scan error: {e}")
+                print(f"[prophet V13.12] do_scan error: {e}")
                 if B:
-                    try: B.send_telegram(f"⚠️ V12-max5: ошибка скана в {scan_dt_str}: {e}")
+                    try: B.send_telegram(f"⚠️ V13.12: ошибка скана в {scan_dt_str}: {e}")
                     except: pass
                 setup = None
 
@@ -1504,25 +1504,15 @@ def _scanner_loop():
                 if setup["score"] >= min_s:
                     _stats["signals"] += 1
 
-                    # V12: ПОДТВЕРЖДЕНИЕ ВХОДА
-                    # В auto режиме — запускаем confirmation worker
-                    # В continuous (ручном) — отправляем сигнал с кнопками как раньше
+                    # V13.12: УБРАНО 15m подтверждение — вход сразу
                     if mode == "auto":
                         if B:
                             B.send_telegram(
                                 f"🔮 <b>V12 — сигнал найден</b>\n"
                                 f"🎯 {setup['symbol']} {emoji_dir} score={setup['score']:.0f}\n"
-                                f"⏱️ Жду подтверждения 15 мин (закрытие 15m свечи)..."
+                                f"⚡ Вхожу сразу (V13.12)"
                             )
-                        # Запускаем воркер подтверждения в отдельном потоке
-                        fire_ts = int(_now())
-                        t = threading.Thread(
-                            target=_confirmation_worker,
-                            args=(setup, fire_ts),
-                            daemon=True,
-                            name=f"prophet-confirm-{setup['symbol']}-{fire_ts}"
-                        )
-                        t.start()
+                        execute_trade(setup)
                     else:
                         # Continuous (ручной режим): отправляем в Telegram с кнопками
                         print(f"[prophet V12] сигнал {setup['symbol']} score={setup['score']:.0f} → отправляю в Telegram")
@@ -1560,7 +1550,7 @@ def _scanner_loop():
 # === COMMANDS ===
 
 def cmd_status():
-    # V12-max5: при запросе статуса — сначала синхронизируем tracked с Upscale
+    # V13.12: при запросе статуса — сначала синхронизируем tracked с Upscale
     # (молча убираем orphan'ы, чтобы статус показывал реальные позиции)
     sync_msg = None
     try:
@@ -1569,7 +1559,7 @@ def cmd_status():
         if sync_msg and ("SYNC:" in sync_msg and "убрано" in sync_msg):
             if B: B.send_telegram("🧹 " + sync_msg)
     except Exception as e:
-        print(f"[prophet V12-max5] status auto-sync error: {e}")
+        print(f"[prophet V13.12] status auto-sync error: {e}")
 
     mode = _state.get("scan_mode", "off")
     mode_str = {"off": "🔴 Выкл",
@@ -1587,7 +1577,7 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 V12-max5 часы: {AUTO_HOURS_MSK} МСК, скан в :{SCAN_MINUTE:02d}")
+    lines.append(f"\n📅 V13.12 часы: {AUTO_HOURS_MSK} МСК, скан в :{SCAN_MINUTE:02d}")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}")
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}" + (f" | BEAR ≥{MIN_SCORE_BEAR}" if BEAR_AWARE_ENABLED else ""))
     lines.append(f"TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)")
@@ -1599,7 +1589,7 @@ def cmd_status():
         lines.append(f"   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (блокирует только сторону)")
     lines.append(f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)")
-    # V12-max5: per-side daily PnL
+    # V13.12: per-side daily PnL
     _reset_daily_pnl_if_needed()
     long_pnl = _state.get("long_today_pnl", 0.0)
     short_pnl = _state.get("short_today_pnl", 0.0)
@@ -1694,7 +1684,7 @@ def cmd_clean():
 
 def cmd_sync():
     """
-    V12-max5: Принудительная синхронизация tracked.json с live позициями Upscale.
+    V13.12: Принудительная синхронизация tracked.json с live позициями Upscale.
     Удаляет orphan-записи (есть в tracked, но нет в live) БЕЗ попытки закрыть —
     позиция уже закрыта на Upscale, нужно только убрать мусор из tracked.
     Решает проблему "Открыто: 2" когда реально открыта 1.
@@ -1704,7 +1694,7 @@ def cmd_sync():
 
 def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     """
-    V12-max5: Синхронизация tracked.json с live позициями Upscale.
+    V13.12: Синхронизация tracked.json с live позициями Upscale.
     Убирает orphan-записи:
       - real orphan: pid не в live_ids → позиция закрыта на Upscale
       - pending orphan: pending_* старше 5 мин И символа точно нет в live → не открылась
@@ -1742,7 +1732,7 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     # ВАЖНО: если markets не загружены — НЕ трогаем pending_, можем снести реальные
     markets_ok = bool(executor._mk)
     if not markets_ok:
-        print(f"[prophet V12-max5] WARNING: markets не загружены, пропускаем pending_ cleanup")
+        print(f"[prophet V13.12] WARNING: markets не загружены, пропускаем pending_ cleanup")
 
     # V13.7 FIX P0-1 (audit): КРИТИЧНО — если live_ids пустой но в tracked есть открытые позиции,
     # это означает API failure (transient error). НЕ удалять tracked — иначе теряем управление!
@@ -1753,7 +1743,7 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     if len(live_ids) == 0 and real_open_in_tracked > 0:
         err_msg = (f"⚠️ SYNC ABORTED: live positions empty but tracked has {real_open_in_tracked} open — "
                    f"possibly API failure. NOT deleting tracked records.")
-        print(f"[prophet V12-max5] {err_msg}")
+        print(f"[prophet V13.12] {err_msg}")
         if B:
             try: B.send_telegram(f"🚨 <b>SYNC ABORTED</b>\nAPI вернул 0 позиций, но tracked имеет {real_open_in_tracked} открытых. "
                                 f"Возможно transient failure. Записи НЕ удалены.")
@@ -1836,14 +1826,14 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     open_n = sum(1 for v in tracked_after.values() if v.get("status") == "open")
 
     if cleaned_count > 0:
-        msg_lines = [f"🔄 V12-max5 SYNC: убрано {cleaned_count} orphan-записей:"]
+        msg_lines = [f"🔄 V13.12 SYNC: убрано {cleaned_count} orphan-записей:"]
         for c in cleaned_list:
             msg_lines.append(f"  • {c}")
         msg_lines.append(f"\n📊 Теперь открыто: {open_n}")
         msg = "\n".join(msg_lines)
         if verbose_telegram and B:
             B.send_telegram(msg)
-        print(f"[prophet V12-max5] auto-sync: убрано {cleaned_count} orphan, теперь открыто {open_n}")
+        print(f"[prophet V13.12] auto-sync: убрано {cleaned_count} orphan, теперь открыто {open_n}")
         return msg
     else:
         live_count = len(live_ids)
@@ -1957,7 +1947,7 @@ def cmd_stats():
 # === START ===
 
 def _scanner_watchdog():
-    """V12-max5: Watchdog — если scanner thread умер ИЛИ завис (heartbeat), перезапускаем.
+    """V13.12: Watchdog — если scanner thread умер ИЛИ завис (heartbeat), перезапускаем.
     
     Защита от зависания (как сегодня 13:00→15:35):
     - scanner thread технически жив (is_alive=True)
@@ -1976,9 +1966,9 @@ def _scanner_watchdog():
             
             # Проверка 1: thread умер (классический случай)
             if _scanner_thread is None or not _scanner_thread.is_alive():
-                print(f"[prophet V12-max5] WATCHDOG: scanner thread умер, перезапускаю...")
+                print(f"[prophet V13.12] WATCHDOG: scanner thread умер, перезапускаю...")
                 if B:
-                    try: B.send_telegram("🔄 V12-max5: scanner thread перезапускается (умер, watchdog)")
+                    try: B.send_telegram("🔄 V13.12: scanner thread перезапускается (умер, watchdog)")
                     except: pass
                 _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12-restart")
                 _scanner_thread.start()
@@ -2004,10 +1994,10 @@ def _scanner_watchdog():
                 last_scan_msk = dt.datetime.fromtimestamp(last_scan, tz=MSK) if last_scan else None
                 last_scan_str = last_scan_msk.strftime("%Y-%m-%d %H:%M") if last_scan_msk else "никогда"
                 age_hours = age_sec / 3600
-                print(f"[prophet V12-max5] WATCHDOG: scanner ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч назад), перезапускаю...")
+                print(f"[prophet V13.12] WATCHDOG: scanner ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч назад), перезапускаю...")
                 if B:
                     try: B.send_telegram(
-                        f"🚨 <b>V12-max5: scanner ЗАВИС!</b>\n"
+                        f"🚨 <b>V13.12: scanner ЗАВИС!</b>\n"
                         f"Последний скан: {last_scan_str} ({age_hours:.1f}ч назад)\n"
                         f"Принудительный перезапуск scanner thread."
                     )
@@ -2022,7 +2012,7 @@ def _scanner_watchdog():
                 if _scanner_thread is not None:
                     _scanner_thread.join(timeout=10)  # ждём до 10 сек реальной остановки
                     if _scanner_thread.is_alive():
-                        print(f"[prophet V12-max5] WATCHDOG: старый scanner не остановился за 10с, всё равно запускаю новый")
+                        print(f"[prophet V13.12] WATCHDOG: старый scanner не остановился за 10с, всё равно запускаю новый")
                 _scanner_stop_event.clear()  # сбрасываем event для нового thread
                 time.sleep(1)
                 # Принудительно создаём новый thread
@@ -2032,7 +2022,7 @@ def _scanner_watchdog():
                 _state["last_scan_ts"] = int(_now())
                 _save()
         except Exception as e:
-            print(f"[prophet V12-max5] watchdog error: {e}")
+            print(f"[prophet V13.12] watchdog error: {e}")
 
 def start():
     _load()
@@ -2041,16 +2031,16 @@ def start():
     if _scanner_thread is None or not _scanner_thread.is_alive():
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12")
         _scanner_thread.start()
-    # V12-max5: запускаем watchdog для авто-перезапуска scanner
+    # V13.12: запускаем watchdog для авто-перезапуска scanner
     global _watchdog_thread
     if _watchdog_thread is None:
         _watchdog_thread = threading.Thread(target=_scanner_watchdog, daemon=True, name="prophet-watchdog")
         _watchdog_thread.start()
-    print(f"[prophet V12-max5] Старт: режим={_state.get('scan_mode','off')}")
+    print(f"[prophet V13.12] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
-            f"🔮 <b>Пророк V12-max5 запущен</b>\n"
-            f"📊 Версия: V12-max5 ФИНАЛ\n"
+            f"🔮 <b>Пророк V13.12 запущен</b>\n"
+            f"📊 Версия: V13.12 (аудит-фиксы + кнопки + без 15m)\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"

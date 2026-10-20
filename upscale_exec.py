@@ -821,7 +821,25 @@ class Executor:
             try:
                 self.client.order(body)
             except UpscaleError as e:
-                return f"ордер отклонён: {e}"
+                # V13.12: если стоп слишком близко к ликвидации — расширяем на 1%
+                err_str = str(e).lower()
+                if "trigger_price" in err_str and "liquidation" in err_str:
+                    old_stop = Decimal(str(b["stop"]))
+                    entry_px = Decimal(str(b["price"]))
+                    is_long_side = side == "long"
+                    # Расширяем стоп на 1% дальше от входа
+                    if is_long_side:
+                        new_stop = old_stop * Decimal("0.99")
+                    else:
+                        new_stop = old_stop * Decimal("1.01")
+                    print(f"[EXEC V13.12] {sym}: стоп {old_stop} → {new_stop} (расширение из-за liquidation)")
+                    body = open_body(acc, mid, side, plan["margin_usd"], lev, stop=new_stop)
+                    try:
+                        self.client.order(body)
+                    except UpscaleError as e2:
+                        return f"ордер отклонён: {e2}"
+                else:
+                    return f"ордер отклонён: {e}"
             with self._lock:
                 self._day["n"] += 1
             pos = self._wait_position(mid, side, before)
