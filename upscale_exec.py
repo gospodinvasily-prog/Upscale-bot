@@ -432,7 +432,9 @@ class Executor:
 
     def _registry_get(self, pos_id):
         with self._registry_lock:
-            return self._strategy_registry.get(pos_id, "donchian_4h_v22")
+            # V13.11 FIX: было .get(pos_id, "donchian_4h_v22") — все неизвестные позиции
+            # помечались как donchian. Теперь возвращаем None и в отчёте показываем как Unknown.
+            return self._strategy_registry.get(pos_id, None)
 
     def _registry_del(self, pos_id):
         with self._registry_lock:
@@ -1312,7 +1314,12 @@ class Executor:
         if not form:
             return "\n".join(L + ["⚠️ эндпоинт истории не ответил ни на тикер, ни на id рынка"])
 
-        syms = list(self._mk.keys())
+        # V13.11: используем только пары бота (self.pairs, обычно 104), не все 152 рынка Upscale
+        # Раньше: syms = list(self._mk.keys()) → 152 запросов, много "не ответили"
+        if self.pairs and len(self.pairs) > 0:
+            syms = [s for s in self.pairs if s in self._mk]
+        else:
+            syms = list(self._mk.keys())
         if max_markets:
             syms = syms[:max_markets]
         cutoff = time.time() - days * 86400
@@ -1363,16 +1370,22 @@ class Executor:
                 n_ord += 1
                 if o.get("profitAdjustmentApplied"):
                     adj_cnt += 1
+                # V13.11 FIX: avg hold time — используем openedAt/closedAt ордеров
+                # first_ts = время первого ордера (открытие позиции)
+                # ts = время последнего ордера (закрытие позиции)
                 key = o.get("positionId") or o.get("id")
                 t = trades.setdefault(key, {"sym": sym, "pnl": Decimal(0), "ts": ts, "n": 0,
-                                            "first_ts": ts, "strategy": None})
+                                            "first_ts": None, "strategy": None})
                 t["pnl"] += v
                 t["n"] += 1
-                t["ts"] = max(t["ts"], ts)
-                t["first_ts"] = min(t["first_ts"], ts) if t["first_ts"] else ts
+                # first_ts = минимальный ts среди всех ордеров (открытие позиции)
+                if t["first_ts"] is None or ts < t["first_ts"]:
+                    t["first_ts"] = ts
+                # ts = максимальный ts (закрытие позиции)
+                if ts > t["ts"]:
+                    t["ts"] = ts
                 # V13.11: определяем стратегию через registry
-                pos_id = key
-                strat = self._registry_get(pos_id)
+                strat = self._registry_get(key)
                 if strat:
                     t["strategy"] = strat
 
