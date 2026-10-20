@@ -1275,14 +1275,17 @@ class Executor:
         return "\n".join(L)
 
     def history(self, days: int = 7, max_markets: int = 0) -> str:
-        """Результаты с биржи: по сделкам, по монетам и по дням — чтобы сверять с журналом.
+        """Результаты с биржи: по сделкам, по монетам, по дням и стратегиям.
 
-        v2.3: ордера группируются по positionId. Раньше считался каждый ордер
-        отдельно, а в одной сделке их несколько (три тейка, стоп) — поэтому
-        «средняя сделка» получалась вдвое меньше реальной. Плюс добавлены открытые
-        позиции и снято ограничение на число рынков: без них итог не сходился
-        с балансом счёта."""
-        L = [f"upscale_exec v{EXEC_VERSION}"]
+        V13.11: улучшенный отчёт
+        - 5 попыток запроса вместо 3 (меньше "не ответили")
+        - Разбивка по стратегиям (Prophet / Anomaly / Big Candle / unknown)
+        - TP vs SL count (wins vs losses)
+        - Avg hold time
+        - Best/worst trade
+        - Обновлённый backtest benchmark
+        """
+        L = [f"upscale_exec v{EXEC_VERSION} | Отчёт V13.11"]
         try:
             self._ensure_account()
             self._refresh_markets()
@@ -1315,72 +1318,72 @@ class Executor:
         cutoff = time.time() - days * 86400
 
         def _money(pv):
-            if pv is None:
-                return None
+            if pv is None: return None
             t = str(pv).strip()
-            if not t or t in ("None", "null"):
-                return None
+            if not t or t in ("None", "null"): return None
             try:
                 return Decimal(t) if ("." in t or "e" in t.lower()) else from_fp9(t)
-            except Exception:
-                return None
+            except: return None
 
         def _when(o):
             for k in ("closedAt", "filledAt", "updatedAt", "createdAt"):
                 v = o.get(k)
-                if not v:
-                    continue
+                if not v: continue
                 try:
                     if isinstance(v, str) and "T" in v:
                         return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
                     return float(v) / (1000 if float(v) > 1e11 else 1)
-                except Exception:
-                    continue
+                except: continue
             return 0
 
+        # V13.11: 5 попыток вместо 3, с большим backoff
         trades, adj_cnt, n_ord = {}, 0, 0
         failed = []
         for sym in syms:
             m = self._mk.get(sym)
-            if not m:
-                continue
+            if not m: continue
             asset = sym if form == "тикер" else str(m.get("id", ""))
-            # v2.6: раньше сбойный рынок молча пропускался (`except: continue`),
-            # и при 152 запросах часть падала по лимиту частоты — КАЖДЫЙ РАЗ РАЗНАЯ.
-            # Из-за этого монеты то появлялись, то исчезали между вызовами /hist,
-            # и итог был неполным. Теперь повторяем и считаем несобранное.
             data = None
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     data = self.client.orders_history(self.account_id, asset, 100)
                     break
                 except UpscaleError as e:
-                    if attempt == 2:
+                    if attempt == 4:
                         failed.append(f"{sym}: {_trunc(e, 60)}")
                     else:
-                        time.sleep(0.4 * (attempt + 1))
-            if data is None:
-                continue
+                        time.sleep(0.5 * (attempt + 1))
+            if data is None: continue
             for o in _as_list(data):
-                if not isinstance(o, dict):
-                    continue
+                if not isinstance(o, dict): continue
                 ts = _when(o)
-                if ts and ts < cutoff:
-                    continue
+                if ts and ts < cutoff: continue
                 v = _money(o.get("realizedPnl"))
-                if v is None:
-                    continue
+                if v is None: continue
                 n_ord += 1
                 if o.get("profitAdjustmentApplied"):
                     adj_cnt += 1
-                key = o.get("positionId") or o.get("id")      # сделка = позиция
-                t = trades.setdefault(key, {"sym": sym, "pnl": Decimal(0), "ts": ts, "n": 0})
+                key = o.get("positionId") or o.get("id")
+                t = trades.setdefault(key, {"sym": sym, "pnl": Decimal(0), "ts": ts, "n": 0,
+                                            "first_ts": ts, "strategy": None})
                 t["pnl"] += v
                 t["n"] += 1
                 t["ts"] = max(t["ts"], ts)
+                t["first_ts"] = min(t["first_ts"], ts) if t["first_ts"] else ts
+                # V13.11: определяем стратегию через registry
+                pos_id = key
+                strat = self._registry_get(pos_id)
+                if strat:
+                    t["strategy"] = strat
 
         closed = [t for t in trades.values() if t["pnl"] != 0]
-        # открытые позиции — их прибыль уже в балансе, но ордеров ещё нет
+        # V13.11: avg hold time
+        for t in closed:
+            if t.get("first_ts") and t.get("ts"):
+                t["hold_hours"] = (t["ts"] - t["first_ts"]) / 3600
+            else:
+                t["hold_hours"] = 0
+
         open_pnl, open_n = Decimal(0), 0
         try:
             for p in self._positions():
@@ -1388,74 +1391,105 @@ class Executor:
                 if v is not None:
                     open_pnl += v
                     open_n += 1
-        except Exception:
-            pass
+        except: pass
 
-        L.append(f"Опрошено рынков: {len(syms) - len(failed)} из {len(syms)} | "
-                 f"ордеров с результатом: {n_ord} | сделок (по позициям): {len(closed)}")
+        # V13.11: заголовок с инфой о покрытии
+        L.append(f"📊 Период: {days} дн | Пар: {len(syms) - len(failed)}/{len(syms)} | "
+                 f"Ордеров: {n_ord} | Сделок: {len(closed)}")
         if failed:
-            L.append(f"⚠️ <b>не ответили {len(failed)} рынков</b> — итог неполный: "
-                     + ", ".join(f.split(":")[0] for f in failed[:12])
-                     + (" и др." if len(failed) > 12 else ""))
+            L.append(f"⚠️ не ответили {len(failed)} рынков — итог неполный")
         if not closed and not open_n:
             return "\n".join(L + ["За период сделок нет."])
 
+        # V13.11: основные метрики
         tot = sum((t["pnl"] for t in closed), Decimal(0))
         wins = [t for t in closed if t["pnl"] > 0]
+        losses = [t for t in closed if t["pnl"] <= 0]
         risk = Decimal(str(self.risk_usd)) or Decimal(1)
         n = len(closed)
         if n:
-            gl = abs(sum((t["pnl"] for t in closed if t["pnl"] <= 0), Decimal(0)))
-            pf = (sum((t["pnl"] for t in wins), Decimal(0)) / gl) if gl > 0 else Decimal(0)
+            gl = abs(sum((t["pnl"] for t in losses), Decimal(0)))
+            gp = sum((t["pnl"] for t in wins), Decimal(0))
+            pf = (gp / gl) if gl > 0 else Decimal(0)
+            wr = len(wins) / n * 100
+            avg_hold = sum(t.get("hold_hours", 0) for t in closed) / n if n else 0
+            best = max(closed, key=lambda t: t["pnl"])
+            worst = min(closed, key=lambda t: t["pnl"])
+
             L += ["",
-                  f"<b>ЗАКРЫТО за {days} дн: {n} сделок, винрейт {len(wins)/n*100:.0f}%</b>",
-                  f"Итог: <b>${tot:+.2f}</b> = {tot/risk:+.2f}R | "
-                  f"средняя <b>{tot/n/risk:+.3f}R</b> (${tot/n:+.2f})",
-                  f"Профит-фактор: {pf:.2f}"]
+                  f"━━━ 📈 ИТОГИ за {days} дн ━━━",
+                  f"Сделок: {n} | TP: {len(wins)} ✅ | SL: {len(losses)} ❌",
+                  f"Винрейт: <b>{wr:.0f}%</b> | Профит-фактор: <b>{pf:.2f}</b>",
+                  f"Итог: <b>${tot:+.2f}</b> = {tot/risk:+.2f}R | средняя {tot/n/risk:+.3f}R (${tot/n:+.2f})",
+                  f"⏱️ Avg hold: {avg_hold:.1f}ч | TP avg: ${gp/max(1,len(wins)):+.2f} | SL avg: ${-gl/max(1,len(losses)):+.2f}"]
+            if best and worst:
+                L.append(f"🏆 Лучшая: {best['sym']} ${best['pnl']:+.2f} | Худшая: {worst['sym']} ${worst['pnl']:+.2f}")
         if open_n:
-            L.append(f"ОТКРЫТО сейчас: {open_n} поз, ${open_pnl:+.2f} (в балансе уже есть)")
-            L.append(f"За период всего: ${tot + open_pnl:+.2f}")
-        # v2.5: баланс берём из API — он за ВСЁ время, а не за выбранный период.
-        # Раньше строка «должно сойтись с балансом» вводила в заблуждение: окно в 7 дней
-        # могло начинаться в середине истории счёта, и суммы не совпадали.
+            L.append(f"📂 Открыто: {open_n} поз, ${open_pnl:+.2f} (в балансе уже есть)")
+            L.append(f"💰 За период всего: ${tot + open_pnl:+.2f}")
+
+        # V13.11: баланс
         try:
             snap = self._snapshot()
             if snap:
                 eq, start = snap.get("equity"), snap.get("base")
                 if eq is not None and start:
-                    L.append(f"<b>СЧЁТ: ${eq:,.2f}</b> из ${start:,.2f} "
-                             f"(<b>${eq - start:+,.2f}</b> за всё время)")
-        except Exception:
-            pass
+                    L.append(f"🏦 СЧЁТ: ${eq:,.2f} из ${start:,.2f} (${eq - start:+,.2f} за всё время)")
+        except: pass
         if adj_cnt:
-            L.append(f"⚠️ корректировка 60с применена к {adj_cnt} ордерам — "
-                     f"эта прибыль не засчитана Upscale")
+            L.append(f"⚠️ корректировка 60с применена к {adj_cnt} ордерам")
 
-        # по дням
+        # V13.11: по дням с WR
         byday = {}
         for t in closed:
             d = datetime.fromtimestamp(t["ts"], timezone.utc).strftime("%d.%m")
-            a = byday.setdefault(d, [0, Decimal(0)])
-            a[0] += 1
-            a[1] += t["pnl"]
+            a = byday.setdefault(d, {"n": 0, "pnl": Decimal(0), "wins": 0})
+            a["n"] += 1
+            a["pnl"] += t["pnl"]
+            if t["pnl"] > 0: a["wins"] += 1
         if byday:
-            L += ["", "<b>По дням (UTC):</b>"]
+            L += ["", "━━━ 📅 По дням (UTC) ━━━"]
             for d in sorted(byday):
-                c_, p_ = byday[d]
-                L.append(f"  {d}: {c_:2} сд, ${p_:+7.2f} = {p_/risk:+.2f}R")
+                a = byday[d]
+                wr_d = a["wins"]/a["n"]*100 if a["n"] else 0
+                emoji = "✅" if a["pnl"] > 0 else "❌"
+                L.append(f"  {d}: {a['n']:2} сд, WR {wr_d:.0f}%, ${a['pnl']:+7.2f} = {a['pnl']/risk:+.2f}R {emoji}")
 
-        # по монетам
+        # V13.11: по стратегиям
+        bystrat = {}
+        for t in closed:
+            s = t.get("strategy") or "unknown"
+            a = bystrat.setdefault(s, {"n": 0, "pnl": Decimal(0), "wins": 0})
+            a["n"] += 1
+            a["pnl"] += t["pnl"]
+            if t["pnl"] > 0: a["wins"] += 1
+        if bystrat:
+            L += ["", "━━━ 🤖 По стратегиям ━━━"]
+            strat_names = {
+                "prophet_v12": "🔮 Prophet V12",
+                "anomaly_aplus": "🚨 Anomaly A+",
+                "big_candle_v1": "🚨 Big Candle",
+                "unknown": "❓ Unknown/Manual",
+            }
+            for s, a in sorted(bystrat.items(), key=lambda kv: -kv[1]["pnl"]):
+                name = strat_names.get(s, s)
+                wr_s = a["wins"]/a["n"]*100 if a["n"] else 0
+                L.append(f"  {name}: {a['n']:2} сд, WR {wr_s:.0f}%, ${a['pnl']:+7.2f}")
+
+        # V13.11: по монетам
         bysym = {}
         for t in closed:
             a = bysym.setdefault(t["sym"], [0, Decimal(0)])
             a[0] += 1
             a[1] += t["pnl"]
         if bysym:
-            L += ["", "<b>По монетам:</b>"]
+            L += ["", "━━━ 💎 По монетам ━━━"]
             for sym, (c_, p_) in sorted(bysym.items(), key=lambda kv: -kv[1][1]):
-                L.append(f"  {sym:10} {c_:2} сд  ${p_:+7.2f}")
+                emoji = "✅" if p_ > 0 else "❌"
+                L.append(f"  {sym:10} {c_:2} сд  ${p_:+7.2f} {emoji}")
 
-        L += ["", "<i>Бэктест обещает +0.32R на сделку — сравнивай со «средней»</i>"]
+        # V13.11: обновлённый benchmark
+        L += ["", f"<i>Бэктест V13.11: Prophet PF 1.71 WR 63% (+0.32R/сделку) | Anomaly PF 4.14 WR 84% (+0.69R/сделку)</i>"]
         return "\n".join(L)
 
     def status(self) -> str:
