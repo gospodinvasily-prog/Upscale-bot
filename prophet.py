@@ -101,6 +101,11 @@ TP_COUNTER = 2.0        # V13.11: было 1.5 (SHORT в BULL, LONG в BEAR — 
 BEAR_AWARE_ENABLED = True
 MIN_SCORE_BEAR = 70       # в BEAR режиме строже отбор (vs 60 в BULL)
 BEAR_COOLDOWN_HOURS = 48  # в BEAR режиме 48ч cooldown (vs 24ч в BULL)
+
+# V13.12: комиссии для расчёта прибыли в cmd_config()
+COMMISSION_PCT = 0.008  # Upscale crypto: 0.008% за операцию
+SPREAD_PCT = 0.03       # рыночный спред
+
 # V12 окна сканов (15 часов, без 7/13/16 — убыточные в бэктестах)
 AUTO_HOURS_MSK = [5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 21, 22]
 SCAN_MINUTE = 30       # V12-FINAL: сканы в :30 (подтверждение в :45)
