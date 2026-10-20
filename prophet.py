@@ -101,10 +101,6 @@ TP_COUNTER = 2.0        # V13.11: было 1.5 (SHORT в BULL, LONG в BEAR — 
 BEAR_AWARE_ENABLED = True
 MIN_SCORE_BEAR = 70       # в BEAR режиме строже отбор (vs 60 в BULL)
 BEAR_COOLDOWN_HOURS = 48  # в BEAR режиме 48ч cooldown (vs 24ч в BULL)
-
-# V13.12: комиссии для расчёта прибыли в cmd_config()
-COMMISSION_PCT = 0.008  # Upscale crypto: 0.008% за операцию
-SPREAD_PCT = 0.03       # рыночный спред
 # V12 окна сканов (15 часов, без 7/13/16 — убыточные в бэктестах)
 AUTO_HOURS_MSK = [5, 6, 8, 9, 10, 11, 12, 14, 15, 17, 18, 19, 20, 21, 22]
 SCAN_MINUTE = 30       # V12-FINAL: сканы в :30 (подтверждение в :45)
@@ -134,8 +130,6 @@ _state = {
     "long_cooldown_until": 0,    # V12: cooldown после убыточного LONG (24h)
     "short_cooldown_until": 0,   # V12: cooldown после убыточного SHORT (24h)
     "symbol_blacklist": {},     # V12: {sym: ts_until}
-    "risk_usd_override": None,   # V13.12: override RISK_USD через Telegram
-    "tp_mult_override": None,    # V13.12: override TP multiplier через Telegram
     # V12-max5: per-side daily PnL (сброс по MSK-дню)
     "long_today_pnl": 0.0,       # кумулятивный PnL LONG за сегодня
     "short_today_pnl": 0.0,      # кумулятивный PnL SHORT за сегодня
@@ -552,11 +546,7 @@ def analyze(sym, scan_ts, c4h, c1h, c15m, btc_reg, scan_dt):
     # V12-counter-trend: TP зависит от направления vs тренда BTC
     # trend direction = с трендом BTC → TP_TREND (3.0)
     # counter direction = против тренда BTC → TP_COUNTER (1.5)
-    # V13.12: TP override через Telegram (если задан, используется для всех сделок)
-    tp_override = _state.get("tp_mult_override")
-    if tp_override:
-        tp_mult = float(tp_override)
-    elif btc_reg == +1:
+    if btc_reg == +1:
         # BULL BTC: LONG=trend, SHORT=counter
         tp_mult = TP_TREND if direction == "LONG" else TP_COUNTER
     elif btc_reg == -1:
@@ -702,6 +692,17 @@ def send_signal(setup):
         print(f"[prophet] send_signal error: {e}")
         B.send_telegram(msg)
 
+def _calc_profit_str(risk_val, tp_mult):
+    """V13.12: Вспомогательная функция — считает строку с прибылью."""
+    typical_atr = 2.5
+    sl_pct = SL_MULT * typical_atr
+    pos_size = risk_val / sl_pct * 100
+    tp_pct = tp_mult * typical_atr
+    net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+    profit = net_pct * pos_size / 100
+    return f"  TP {tp_mult}×ATR → +${profit:.0f}"
+
+
 def on_callback(data):
     """Обработка нажатия кнопки."""
     # V13.12: обработка кнопок конфигурации
@@ -713,12 +714,22 @@ def on_callback(data):
             cmd_off()
             cmd_on()
         except: pass
-        # V13.12: подробное сообщение после изменения
+        
+        # V13.12: подробное сообщение + расчёт прибыли
         tp_ov = _state.get("tp_mult_override")
-        tp_str = f"{tp_ov}×ATR" if tp_ov else "Auto (2.0/2.0)"
         typical_atr = 2.5
         sl_pct = SL_MULT * typical_atr
         pos_size = risk_val / sl_pct * 100
+        
+        if tp_ov:
+            tp_str = f"{tp_ov}×ATR"
+            profit_line = _calc_profit_str(risk_val, float(tp_ov))
+        else:
+            tp_str = f"Auto (Trend={TP_TREND}/Counter={TP_COUNTER})"
+            profit_trend = _calc_profit_str(risk_val, TP_TREND)
+            profit_counter = _calc_profit_str(risk_val, TP_COUNTER)
+            profit_line = f"{profit_trend}\n{profit_counter}"
+        
         return (
             f"✅ <b>Риск изменён на ${risk_val}</b>\n\n"
             f"📊 <b>Текущие настройки Prophet:</b>\n"
@@ -726,7 +737,8 @@ def on_callback(data):
             f"🎯 TP: <b>{tp_str}</b>\n"
             f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
             f"🛡️ SL: {SL_MULT}×ATR | Hold: {MAX_HOLD//3600}ч\n"
-            f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
+            f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n\n"
+            f"💡 Прибыль с TP (ATR=2.5%):\n{profit_line}\n"
             f"🚀 Стратегия перезапущена"
         )
     
@@ -742,12 +754,8 @@ def on_callback(data):
             typical_atr = 2.5
             sl_pct = SL_MULT * typical_atr
             pos_size = risk_val / sl_pct * 100
-            tp_pct_trend = TP_TREND * typical_atr
-            tp_pct_counter = TP_COUNTER * typical_atr
-            net_t = tp_pct_trend - (COMMISSION_PCT * 2 + SPREAD_PCT)
-            net_c = tp_pct_counter - (COMMISSION_PCT * 2 + SPREAD_PCT)
-            p_trend = net_t * pos_size / 100
-            p_counter = net_c * pos_size / 100
+            profit_trend = _calc_profit_str(risk_val, TP_TREND)
+            profit_counter = _calc_profit_str(risk_val, TP_COUNTER)
             return (
                 f"✅ <b>TP сброшен на Auto</b>\n\n"
                 f"📊 <b>Текущие настройки Prophet:</b>\n"
@@ -755,9 +763,7 @@ def on_callback(data):
                 f"🎯 TP: <b>Auto (Trend={TP_TREND}/Counter={TP_COUNTER})</b>\n"
                 f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
                 f"🛡️ SL: {SL_MULT}×ATR | Hold: {MAX_HOLD//3600}ч\n\n"
-                f"💡 Прибыль (ATR=2.5%):\n"
-                f"  Trend {TP_TREND}×ATR → +${p_trend:.0f}\n"
-                f"  Counter {TP_COUNTER}×ATR → +${p_counter:.0f}\n"
+                f"💡 Прибыль с TP (ATR=2.5%):\n{profit_trend}\n{profit_counter}\n"
                 f"🚀 Стратегия перезапущена"
             )
         tp_val = float(data.replace("prophet_tp_", ""))
@@ -771,9 +777,7 @@ def on_callback(data):
         typical_atr = 2.5
         sl_pct = SL_MULT * typical_atr
         pos_size = risk_val / sl_pct * 100
-        tp_pct = tp_val * typical_atr
-        net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
-        profit = net_pct * pos_size / 100
+        profit_line = _calc_profit_str(risk_val, tp_val)
         return (
             f"✅ <b>TP изменён на {tp_val}×ATR</b>\n\n"
             f"📊 <b>Текущие настройки Prophet:</b>\n"
@@ -781,7 +785,7 @@ def on_callback(data):
             f"🎯 TP: <b>{tp_val}×ATR (для всех сделок)</b>\n"
             f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
             f"🛡️ SL: {SL_MULT}×ATR | Hold: {MAX_HOLD//3600}ч\n\n"
-            f"💡 Прибыль с TP: <b>+${profit:.0f}</b> (при ATR=2.5%)\n"
+            f"💡 Прибыль с TP (ATR=2.5%):\n{profit_line}\n"
             f"🚀 Стратегия перезапущена"
         )
 
@@ -796,62 +800,6 @@ def on_callback(data):
         _state["pending_signal"] = None
         _save()
         if B: B.send_telegram("⏭️ Пропущено. Жду следующий скан.")
-
-
-def cmd_config():
-    """V13.12: Возвращает текст и inline-клавиатуру для управления параметрами."""
-    cur_risk = _state.get("risk_usd_override") or RISK_USD
-    cur_tp = _state.get("tp_mult_override")
-    cur_tp_str = f"{cur_tp}×ATR" if cur_tp else "Auto (2.0/2.0)"
-    
-    # V13.12: расчёт примерной прибыли для каждого TP
-    typical_atr = 2.5
-    sl_pct = SL_MULT * typical_atr  # 5.0%
-    pos_size = cur_risk / sl_pct * 100
-    
-    def calc_profit(tp_mult):
-        tp_pct = tp_mult * typical_atr
-        net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
-        return net_pct * pos_size / 100
-    
-    p_10 = calc_profit(1.0)
-    p_15 = calc_profit(1.5)
-    p_20 = calc_profit(2.0)
-    p_30 = calc_profit(3.0)
-    
-    text = (
-        "⚙️ <b>Настройки Prophet V13</b>\n\n"
-        f"💰 Текущий Risk: <b>${cur_risk}</b>\n"
-        f"🎯 Текущий TP: <b>{cur_tp_str}</b>\n"
-        f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n\n"
-        "<b>💡 Прибыль с TP (при ATR=2.5%):</b>\n"
-        f"  TP 1.0×ATR → +${p_10:.0f}\n"
-        f"  TP 1.5×ATR → +${p_15:.0f}\n"
-        f"  TP 2.0×ATR → +${p_20:.0f}\n"
-        f"  TP 3.0×ATR → +${p_30:.0f}\n\n"
-        "Нажми кнопку для изменения:"
-    )
-    
-    # Inline клавиатура — короткие подписи
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "Risk $50", "callback_data": "prophet_risk_50"},
-                {"text": "Risk $100", "callback_data": "prophet_risk_100"},
-                {"text": "Risk $200", "callback_data": "prophet_risk_200"}
-            ],
-            [
-                {"text": "TP 1.0×ATR", "callback_data": "prophet_tp_1.0"},
-                {"text": "TP 1.5×ATR", "callback_data": "prophet_tp_1.5"},
-                {"text": "TP 2.0×ATR", "callback_data": "prophet_tp_2.0"}
-            ],
-            [
-                {"text": "TP 3.0×ATR", "callback_data": "prophet_tp_3.0"},
-                {"text": "🔄 Auto", "callback_data": "prophet_tp_auto"}
-            ]
-        ]
-    }
-    return {"text": text, "markup": keyboard}
 
 # === V12 CONFIRMATION (15-min confirmation candle) ===
 
@@ -1169,9 +1117,7 @@ def execute_trade(setup):
     tp = setup["tp_price"]
     sp = setup["stop_pct"]
 
-    # V13.12: используем override риска если задан
-    actual_risk = _state.get("risk_usd_override") or RISK_USD
-    pos_size = actual_risk / sp * 100
+    pos_size = RISK_USD / sp * 100
     margin = pos_size / LEVERAGE
     if margin > MAX_MARGIN:
         margin = MAX_MARGIN
@@ -1180,8 +1126,8 @@ def execute_trade(setup):
     sig = {
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
-        "exit_mode": "tp_ladder", "risk_usd": actual_risk,  # V13.12: используем override
-        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,
+        "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
+        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,  # V12-max5: 3 (было 1)
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
 
