@@ -103,12 +103,10 @@ SIDE_DAILY_STOP_USD = 300.0  # 3 убытка × $100 = $300, потом бло�
 # Бэктест показал: PF 1.71 vs 1.61 (current), WR 62.6% vs 60.6%, PnL +176% vs +145%
 # Причина: TP=3.0×ATR (trend) слишком далеко для Prophet — WR trend 62% (нужно 65%+)
 # TP=2.0×ATR для trend даёт WR 65% (лучше), counter-trend TP=2.0×ATR даёт RR 1:1 (vs 1:0.75)
-TP_TREND = 2.0          # TP = 2.0×ATR
-TP_COUNTER = 2.0        # TP = 2.0×ATR (симметричный)
-# V15: Частичный TP — TP1 закрывает 70%, TP2 закрывает 30%
-# При срабатывании TP1 → стоп переставляется в безубыток (цена входа)
-TP1_FRACTION = 0.70     # 70% позиции закрывается на TP1
-TP2_FRACTION = 0.30     # 30% позиции остаётся с стопом в безубытке
+TP1_MULT = 1.0       # V15: TP1 = 1×ATR (70% закрывается)
+TP2_MULT = 2.0       # V15: TP2 = 2×ATR (30% остаётся, стоп в безубыток после TP1)
+TP_TREND = 2.0       # для совместимости со старым кодом
+TP_COUNTER = 2.0     # для совместимости со старым кодом
 # V12-bear-aware: торговля в BEAR BTC режиме (обе стороны работают!)
 # - BULL BTC (+1): LONG (trend) + SHORT (counter)
 # - BEAR BTC (-1): SHORT (trend) + LONG (counter) ← LONG в BEAR разрешён с TP=2.0 (V13.11)
@@ -1196,6 +1194,18 @@ def execute_trade(setup):
     tp = setup["tp_price"]
     sp = setup["stop_pct"]
 
+    # V15: TP1 = 1×ATR, TP2 = 2×ATR
+    atr_pct = setup.get("atr_pct", 2.5)
+    tp1_pct = TP1_MULT * atr_pct
+    tp2_pct = TP2_MULT * atr_pct
+    is_long = direction == "LONG"
+    if is_long:
+        tp1_price = entry * (1 + tp1_pct/100)
+        tp2_price = entry * (1 + tp2_pct/100)
+    else:
+        tp1_price = entry * (1 - tp1_pct/100)
+        tp2_price = entry * (1 - tp2_pct/100)
+
     pos_size = RISK_USD / sp * 100
     margin = pos_size / LEVERAGE
     if margin > MAX_MARGIN:
@@ -1204,8 +1214,8 @@ def execute_trade(setup):
 
     sig = {
         "symbol": sym, "side": side, "price": entry,
-        "stop": stop, "stop_pct": sp, "tp1_price": tp,
-        "tp2_price": tp,  # V15: TP2 на том же уровне (2×ATR)
+        "stop": stop, "stop_pct": sp, "tp1_price": tp1_price,
+        "tp2_price": tp2_price,  # V15: TP2 = 2×ATR
         "tp1_fraction": TP1_FRACTION,  # V15: 70% закрывается на TP1
         "tp2_fraction": TP2_FRACTION,  # V15: 30% остаётся с стопом в безубытке
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
@@ -1222,8 +1232,8 @@ def execute_trade(setup):
                 f"✅ <b>ПРОРОК V15: {sym} {emoji_dir} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
-                f"📊 TP1 (70%): ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
-                f"📊 TP2 (30%): ${tp:.6g} (безубыток после TP1)\n"
+                f"📊 TP1 (70%): ${tp1_price:.6g} ({tp1_pct:.1f}%)\n"
+                f"📊 TP2 (30%): ${tp2_price:.6g} ({tp2_pct:.1f}%)\n"
                 f"🛡️ При TP1 → стоп в безубыток (${entry:.6g})\n"
                 f"TP×ATR: {setup.get('tp_mult', 2.0):.1f} | SL: {SL_MULT}×ATR\n"
                 f"Маржа: ${margin:.0f} × {LEVERAGE}x\n"
@@ -1653,7 +1663,7 @@ def cmd_status():
     lines.append(f"\n📅 V15 часы: {AUTO_HOURS_MSK} МСК (без 11:00), скан в :{SCAN_MINUTE:02d}")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}")
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}" + (f" | BEAR ≥{MIN_SCORE_BEAR}" if BEAR_AWARE_ENABLED else ""))
-    lines.append(f"TP: TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR")
+    lines.append(f"TP: TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR")
     lines.append(f"🛡️ При TP1 → стоп в безубыток")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
     lines.append(f"⚡ Вход сразу (без 15m подтверждения, V15)")
@@ -1715,10 +1725,12 @@ def cmd_on():
     typical_atr = 2.5
     sl_pct = SL_MULT * typical_atr
     pos_size = RISK_USD / sl_pct * 100
-    tp_pct = TP_TREND * typical_atr
-    net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
-    tp1_profit = net_pct * pos_size * TP1_FRACTION / 100
-    tp2_profit = net_pct * pos_size * TP2_FRACTION / 100
+    tp1_pct = TP1_MULT * typical_atr
+    tp2_pct = TP2_MULT * typical_atr
+    net1 = tp1_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+    net2 = tp2_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+    tp1_profit = net1 * pos_size * TP1_FRACTION / 100
+    tp2_profit = net2 * pos_size * TP2_FRACTION / 100
     total_profit = tp1_profit + tp2_profit
     
     return (
@@ -1726,8 +1738,8 @@ def cmd_on():
         f"📊 <b>Настройки:</b>\n"
         f"💰 Risk: <b>${RISK_USD:.0f}</b>\n"
         f"🎯 SL: <b>{SL_MULT}×ATR</b> (≈{sl_pct:.1f}%)\n"
-        f"📊 TP1 (70%): <b>{TP_TREND}×ATR</b> (≈{tp_pct:.1f}%)\n"
-        f"📊 TP2 (30%): <b>{TP_TREND}×ATR</b> (безубыток после TP1)\n"
+        f"📊 TP1 (70%): <b>{TP1_MULT}×ATR</b> (≈{tp1_pct:.1f}%)\n"
+        f"📊 TP2 (30%): <b>{TP2_MULT}×ATR</b> (≈{tp2_pct:.1f}%)\n"
         f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
         f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
         f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
@@ -2143,7 +2155,7 @@ def start():
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
-            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR\n"
+            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR\n"
             f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
             f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d} (без 11:00)\n"
             f"⚡ Вход сразу (без 15m подтверждения)\n"

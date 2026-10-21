@@ -100,7 +100,10 @@ CORRELATION_PAIRS = []
 BLOCK_LONG_IN_BEAR = True
 
 # V15: Частичный TP — TP1 закрывает 70%, TP2 закрывает 30%
+# TP1 = 1×ATR, TP2 = 2×ATR
 # При срабатывании TP1 → стоп переставляется в безубыток (цена входа)
+TP1_MULT = 1.0       # V15: TP1 = 1×ATR (70% закрывается)
+TP2_MULT = 2.0       # V15: TP2 = 2×ATR (30% остаётся, стоп в безубыток)
 TP1_FRACTION = 0.70     # 70% позиции закрывается на TP1
 TP2_FRACTION = 0.30     # 30% позиции остаётся с стопом в безубытке
 
@@ -702,8 +705,19 @@ def execute_trade(setup):
     side = "long" if direction == "LONG" else "short"
     entry = setup["entry"]
     stop = setup["stop_price"]
-    tp = setup["tp_price"]
     sp = setup["stop_pct"]
+
+    # V15: TP1 = 1×ATR, TP2 = 2×ATR
+    atr_pct = setup.get("atr_pct", 2.5)
+    tp1_pct = TP1_MULT * atr_pct
+    tp2_pct = TP2_MULT * atr_pct
+    is_long = direction == "LONG"
+    if is_long:
+        tp1_price = entry * (1 + tp1_pct/100)
+        tp2_price = entry * (1 + tp2_pct/100)
+    else:
+        tp1_price = entry * (1 - tp1_pct/100)
+        tp2_price = entry * (1 - tp2_pct/100)
 
     pos_size = RISK_USD / sp * 100
     margin = pos_size / LEVERAGE
@@ -713,8 +727,8 @@ def execute_trade(setup):
 
     sig = {
         "symbol": sym, "side": side, "price": entry,
-        "stop": stop, "stop_pct": sp, "tp1_price": tp,
-        "tp2_price": tp,  # V15: TP2 на том же уровне (2×ATR)
+        "stop": stop, "stop_pct": sp, "tp1_price": tp1_price,
+        "tp2_price": tp2_price,  # V15: TP2 = 2×ATR
         "tp1_fraction": TP1_FRACTION,  # V15: 70% закрывается на TP1
         "tp2_fraction": TP2_FRACTION,  # V15: 30% остаётся с стопом в безубытке
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
@@ -734,8 +748,8 @@ def execute_trade(setup):
                 f"🚨 <b>ANOMALY V15: {sym} {emoji_dir} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
-                f"📊 TP1 (70%): ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
-                f"📊 TP2 (30%): ${tp:.6g} (безубыток после TP1)\n"
+                f"📊 TP1 (70%): ${tp1_price:.6g} ({tp1_pct:.1f}%)\n"
+                f"📊 TP2 (30%): ${tp2_price:.6g} ({tp2_pct:.1f}%)\n"
                 f"🛡️ При TP1 → стоп в безубыток (${entry:.6g})\n"
                 f"TP×ATR: {setup['tp_mult']:.1f} | SL: {SL_MULT}×ATR\n"
                 f"Маржа: ${margin:.0f} × {LEVERAGE}x\n"
@@ -1327,7 +1341,7 @@ def cmd_status():
     lines.append(f"🎯 Аномалии: LiqMagnet, TrendAlignment (2 шт)")
     lines.append(f"⚡ Вход: MIN=1 (любая аномалия = сигнал)")
     lines.append(f"🚫 LONG в BEAR: запрещён (PF 0.76 в бэктесте)")
-    lines.append(f"🎯 SL={SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR")
+    lines.append(f"🎯 SL={SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR")
     lines.append(f"🛡️ При TP1 → стоп в безубыток")
     lines.append(f"⚡ Вход: MIN=1 (любая аномалия = сигнал)")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
@@ -1369,10 +1383,12 @@ def cmd_on():
     typical_atr = 2.5
     sl_pct = SL_MULT * typical_atr
     pos_size = RISK_USD / sl_pct * 100
-    tp_pct = TP_TREND * typical_atr
-    net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
-    tp1_profit = net_pct * pos_size * TP1_FRACTION / 100
-    tp2_profit = net_pct * pos_size * TP2_FRACTION / 100
+    tp1_pct = TP1_MULT * typical_atr
+    tp2_pct = TP2_MULT * typical_atr
+    net1 = tp1_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+    net2 = tp2_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+    tp1_profit = net1 * pos_size * TP1_FRACTION / 100
+    tp2_profit = net2 * pos_size * TP2_FRACTION / 100
     total_profit = tp1_profit + tp2_profit
     
     return (
@@ -1380,8 +1396,8 @@ def cmd_on():
         f"📊 <b>Настройки:</b>\n"
         f"💰 Risk: <b>${RISK_USD}</b>\n"
         f"🎯 SL: <b>{SL_MULT}×ATR</b> (≈{sl_pct:.1f}%)\n"
-        f"📊 TP1 (70%): <b>{TP_TREND}×ATR</b> (≈{tp_pct:.1f}%)\n"
-        f"📊 TP2 (30%): <b>{TP_TREND}×ATR</b> (безубыток после TP1)\n"
+        f"📊 TP1 (70%): <b>{TP1_MULT}×ATR</b> (≈{tp1_pct:.1f}%)\n"
+        f"📊 TP2 (30%): <b>{TP2_MULT}×ATR</b> (≈{tp2_pct:.1f}%)\n"
         f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
         f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
         f"⏰ Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)\n"
@@ -1457,7 +1473,7 @@ def start():
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
             f"⚡ Вход: MIN=1 (любая аномалия = сигнал)\n"
             f"🚫 LONG в BEAR: запрещён\n"
-            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR\n"
+            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR\n"
             f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
             f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки)\n"
             f"⛔ Blacklist после стопа: 48ч\n"
