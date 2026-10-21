@@ -1325,29 +1325,38 @@ def cmd_status():
     mode_str = "🤖 Авто (вкл)" if mode == "auto" else "🔴 Выкл"
     lines = ["", "━━━ 🚨 Anomaly Scanner V15 ━━━"]
     lines.append(f"Режим: {mode_str}")
-    lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     tracked = _load_tracked()
-    # Считаем ВСЕ открытые (включая pending_ — они тоже реальные позиции)
     open_n = sum(1 for v in tracked.values() if v.get("status") == "open")
     lines.append(f"Открыто: {open_n}/{MAX_OPEN}")
+    lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     lines.append(f"Сканирований: {_stats['scans']}")
     lines.append(f"Сигналов: {_stats['signals']}")
     if _stats["trades"] > 0:
         wr = _stats["wins"]/_stats["trades"]*100
-        lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
+        lines.append(f"Сделок всего: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"📅 Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)")
+    # V15: показываем открытые позиции
+    if open_n > 0:
+        lines.append(f"\n📋 Открытые позиции:")
+        for k, v in tracked.items():
+            if v.get("status") != "open": continue
+            sym = v.get("sym", "?")
+            d = v.get("direction", v.get("dir", "long"))
+            entry = v.get("entry", 0)
+            tp1_hit = v.get("tp1_hit", False)
+            be_str = " 🛡️безубыток" if tp1_hit else ""
+            emoji = "🟢" if d in ("LONG", "long") else "🔴"
+            lines.append(f"  {emoji} {sym} ${entry:.6g}{be_str}")
+    lines.append(f"\n📅 Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
     lines.append(f"🎯 Аномалии: LiqMagnet, TrendAlignment (2 шт)")
     lines.append(f"⚡ Вход: MIN=1 (любая аномалия = сигнал)")
-    lines.append(f"🚫 LONG в BEAR: запрещён (PF 0.76 в бэктесте)")
+    lines.append(f"🚫 LONG в BEAR: запрещён")
     lines.append(f"🎯 SL={SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR")
     lines.append(f"🛡️ При TP1 → стоп в безубыток")
-    lines.append(f"⚡ Вход: MIN=1 (любая аномалия = сигнал)")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
     lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки)")
     lines.append(f"⛔ Blacklist после стопа: 48ч")
-    lines.append(f"🏷️ Версия: V15 (2 аномалии + запрет LONG в BEAR)")
     _reset_daily_pnl_if_needed()
     long_pnl = _state.get("long_today_pnl", 0.0)
     short_pnl = _state.get("short_today_pnl", 0.0)

@@ -1652,28 +1652,37 @@ def cmd_status():
                 "auto": f"🤖 Авто (V15 часы: {AUTO_HOURS_MSK}, без 11:00 МСК)"}.get(mode, mode)
     lines = ["", "━━━ 🔮 Пророк V15 ━━━"]
     lines.append(f"Режим: {mode_str}")
-    lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}/{MAX_OPEN}")
     tracked = _load_tracked()
     open_n = sum(1 for v in tracked.values() if v.get("status") == "open")
-    lines.append(f"Открыто: {open_n}")
+    lines.append(f"Открыто: {open_n}/{MAX_OPEN}")
+    lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     lines.append(f"Сканирований: {_stats['scans']}")
     lines.append(f"Сигналов: {_stats['signals']}")
     if _stats["trades"] > 0:
         wr = _stats["wins"]/_stats["trades"]*100
-        lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
+        lines.append(f"Сделок всего: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 V15 часы: {AUTO_HOURS_MSK} МСК (без 11:00), скан в :{SCAN_MINUTE:02d}")
+    # V15: показываем открытые позиции
+    if open_n > 0:
+        lines.append(f"\n📋 Открытые позиции:")
+        for k, v in tracked.items():
+            if v.get("status") != "open": continue
+            sym = v.get("sym", "?")
+            d = v.get("direction", v.get("dir", "long"))
+            entry = v.get("entry", 0)
+            tp1_hit = v.get("tp1_hit", False)
+            be_str = " 🛡️безубыток" if tp1_hit else ""
+            emoji = "🟢" if d in ("LONG", "long") else "🔴"
+            lines.append(f"  {emoji} {sym} ${entry:.6g}{be_str}")
+    lines.append(f"\n📅 Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d} (без 11:00)")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}")
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}" + (f" | BEAR ≥{MIN_SCORE_BEAR}" if BEAR_AWARE_ENABLED else ""))
-    lines.append(f"TP: TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR")
-    lines.append(f"🛡️ При TP1 → стоп в безубыток")
-    lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
-    lines.append(f"⚡ Вход сразу (без 15m подтверждения, V15)")
-    # V12-counter-trend: показываем что включён
+    lines.append(f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR")
+    lines.append(f"🛡️ При TP1 → стоп в безубыток | Hold={MAX_HOLD//3600}ч")
+    lines.append(f"⚡ Вход сразу (без 15m подтверждения)")
     if BEAR_AWARE_ENABLED:
-        lines.append(f"🐻 Bear-aware + Counter-trend: BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER}) | BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})")
-        lines.append(f"   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}")
-    lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (блокирует только сторону)")
+        lines.append(f"🐻 Bear-aware: BULL→LONG+SHORT | BEAR→SHORT+LONG | Cooldown: 24ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR")
+    lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
     lines.append(f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)")
     # V13.12: per-side daily PnL
     _reset_daily_pnl_if_needed()
@@ -1681,14 +1690,11 @@ def cmd_status():
     short_pnl = _state.get("short_today_pnl", 0.0)
     long_block = "🚫" if long_pnl <= -SIDE_DAILY_STOP_USD else "✅"
     short_block = "🚫" if short_pnl <= -SIDE_DAILY_STOP_USD else "✅"
-    # Считаем открытые позиции по сторонам
-    tracked = _load_tracked()  # перечитываем для актуального count
+    tracked = _load_tracked()
     long_open = sum(1 for v in tracked.values() if v.get("status") == "open"
-                    and v.get("direction", v.get("dir", "long")) in ("LONG", "long")
-                    and not v.get("sym", "").startswith("pending_"))
+                    and v.get("direction", v.get("dir", "long")) in ("LONG", "long"))
     short_open = sum(1 for v in tracked.values() if v.get("status") == "open"
-                     and v.get("direction", v.get("dir", "short")) in ("SHORT", "short")
-                     and not v.get("sym", "").startswith("pending_"))
+                     and v.get("direction", v.get("dir", "short")) in ("SHORT", "short"))
     lines.append(f"\n📊 Сегодня PnL:")
     lines.append(f"  🟢 LONG:  ${long_pnl:+.0f} / -${SIDE_DAILY_STOP_USD:.0f} {long_block} | открыто: {long_open}/{MAX_SAME_SIDE}")
     lines.append(f"  🔴 SHORT: ${short_pnl:+.0f} / -${SIDE_DAILY_STOP_USD:.0f} {short_block} | открыто: {short_open}/{MAX_SAME_SIDE}")
@@ -1698,18 +1704,19 @@ def cmd_status():
     long_cd = _state.get("long_cooldown_until", 0)
     short_cd = _state.get("short_cooldown_until", 0)
     if long_cd > now_ts:
-        lines.append(f"⏸️ LONG 24h cooldown: ещё {(long_cd-now_ts)//3600}ч")
+        lines.append(f"⏸️ LONG cooldown: ещё {(long_cd-now_ts)//3600}ч")
     if short_cd > now_ts:
-        lines.append(f"⏸️ SHORT 24h cooldown: ещё {(short_cd-now_ts)//3600}ч")
+        lines.append(f"⏸️ SHORT cooldown: ещё {(short_cd-now_ts)//3600}ч")
     bl = _state.get("symbol_blacklist", {})
     active_bl = {s: t for s, t in bl.items() if t > now_ts}
     if active_bl:
-        lines.append(f"⛔ Blacklist: {len(active_bl)} пар (на 7д после убытка)")
+        lines.append(f"⛔ Blacklist: {len(active_bl)} пар (48ч после убытка)")
     lines.append(f"\nКоманды:")
     lines.append(f"  /prophet_on — включить")
     lines.append(f"  /prophet_off — выключить")
     lines.append(f"  /prophet_close — закрыть позиции")
     lines.append(f"  /prophet_clean — cleaner зависших")
+    lines.append(f"  /prophet_config — ⚙️ настройки (risk/TP кнопки)")
     return "\n".join(lines)
 
 def cmd_on():
