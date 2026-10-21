@@ -47,27 +47,39 @@ MSK = dt.timezone(dt.timedelta(hours=3))
 
 PAIRS = [
     "BTC","ETH","BNB","XRP","SOL","AAVE","ADA","AERO","ALGO","APT","ARB",
-    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BONK","BRETT","BSV",
-    "CAKE","CHZ","CRO","CRV","DASH","DATA","DEEP","DEXE","DOGE","DOT",
+    "ASTER","ATOM","AVAX","BCH","BERA","BONK","BRETT","BSV",
+    "CAKE","CHZ","CRO","CRV","DASH","DATA","DEEP","DEXE","DOGE",
     "DYDX","EIGEN","ENA","ENS","ETC","FARTCOIN","FET","FIL","FLOKI",
-    "GALA","GRAM","GRASS","GRT","HBAR","HYPE","ICP","IMX","INJ","IOTA",
-    "JASMY","JTO","JUP","KAIA","KAITO","KAS","LDO","LINEA","LINK","LTC",
-    "MANA","MNT","MORPHO","MOVE","NEAR","ONDO","OP","ORDI","PENDLE",
+    "GALA","GRAM","GRT","HBAR","HYPE","ICP","IMX","INJ","IOTA",
+    "JASMY","JTO","JUP","KAIA","KAITO","LDO","LINEA","LTC",
+    "MANA","MNT","MOVE","NEAR","ONDO","ORDI","PENDLE",
     "PENGU","PEPE","PNUT","POL","POPCAT","PUMP","PYTH","QNT","RAY",
-    "RENDER","RUNE","S","SAND","SEI","SHIB","SKY","STRK","STX","SUI",
-    "TAO","TIA","TRUMP","TRX","TURBO","UNI","VET","VIRTUAL","WAL",
+    "RENDER","RUNE","S","SAND","SEI","SHIB","SKY","STX","SUI",
+    "TIA","TRUMP","TRX","TURBO","UNI","VET","VIRTUAL","WAL",
     "WIF","WLD","XLM","XMR","XTZ","ZEC","ZRO","0G"
 ]
+# V14 (Task ID 78): убраны 9 общих худших пар (доказано per-pair анализом 385 дней):
+# MORPHO (Stop-loser, -$1071 в обеих стратегиях)
+# GRASS (Low-n-anom, -$504)
+# STRK (Stop-loser, -$357)
+# LINK (Long-loser, -$351)
+# OP (Short-loser, -$310)
+# KAS (Mixed-loser, -$292)
+# AXS (Short-loser, -$255)
+# TAO (Mixed-loser, -$233)
+# DOT (Long-loser, -$213)
+# Суммарно эти 9 пар дали -$3582 потерь на обеих стратегиях
 
 # === ПАРАМЕТРЫ (захардкожены) ===
 MAX_OPEN = 2
 SL_MULT = 2.0
-# V13.11 C_FAST_TP (по бэктесту):
-# Бэктест показал: PF 4.14 vs 3.76 (current), WR 84% vs 75.7%, PnL +620% vs +540%
-# Причина: counter-trend TP=1.0×ATR близко, цена часто откатывает на 1×ATR даже в тренде
-# Trend TP=2.0×ATR (вместо 3.0) — WR trend 73% vs 62%, более реалистичные цели
-TP_TREND = 2.0       # V13.11: было 3.0 (trend-following direction)
-TP_COUNTER = 1.0     # V13.11: было 1.5 (counter-trend direction)
+# V14 (Task ID 78): TP_COUNTER = 2.0 (возврат к V3 REAL Task 64, который давал +$26K)
+# Бэктест на 385 днях показал:
+# - При TP_COUNTER=1.0 (V13.11): контр-тренд 228/430 сделок, PF 0.86, -$1134 (убыток)
+# - При TP_COUNTER=2.0 (V14): контр-тренд PnL удваивается на TP, PF 1.16, +$1217
+# RR 1:1 (симметричный) работает лучше чем RR 1:2 для Anomaly Scanner
+TP_TREND = 2.0       # trend-following direction (LONG в BULL, SHORT в BEAR)
+TP_COUNTER = 2.0     # V14: было 1.0 в V13.11. Симметричный TP=SL=2.0 (RR 1:1)
 MAX_HOLD_SEC = 48 * 3600
 MIN_ANOMALIES = 2
 RISK_USD = 100
@@ -969,19 +981,23 @@ def manage_positions():
                 else:
                     _state["short_cooldown_until"] = int(_now()) + cd_hours * 3600
                 bl = _state.get("symbol_blacklist", {})
-                bl[rec["sym"]] = int(_now()) + 7*24*3600
+                # V14 (Task ID 78): blacklist 48 часов вместо 7 дней
+                # Обоснование: V3 REAL (Task 64) с 48ч blacklist дал $+26K за 218 дней
+                # V13.6 с 7-дневным blacklist дал только $+82 за 385 дней
+                # Альткоины меняют regime за 3-7 дней, через неделю символ в другом состоянии
+                bl[rec["sym"]] = int(_now()) + 48*3600  # V14: 48ч вместо 7*24*3600
                 _state["symbol_blacklist"] = bl
-                # 24ч кулдаун по паре
+                # 24ч кулдаун по паре после стопа
                 sc = _state.get("symbol_cooldown", {})
                 sc[rec["sym"]] = int(_now()) + SYMBOL_COOLDOWN_SEC
                 _state["symbol_cooldown"] = sc
                 _save()
             else:
-                # 24ч кулдаун даже после прибыли или микро-убытка
-                sc = _state.get("symbol_cooldown", {})
-                sc[rec["sym"]] = int(_now()) + SYMBOL_COOLDOWN_SEC
-                _state["symbol_cooldown"] = sc
-                _save()
+                # V14 (Task ID 78): УБРАН 24ч кулдаун после прибыльной сделки
+                # Обоснование: V3 REAL ставил cooldown только после стопа → 1012 сделок
+                # V13.6 ставит после любой → 430 сделок (в 2.4× меньше!)
+                # После TP пара может дать новый сигнал сразу — не блокируем
+                pass
 
             side_pnl = _state.get("long_today_pnl" if direction_field in ("LONG","long") else "short_today_pnl", 0.0)
             if side_pnl <= -SIDE_DAILY_STOP_USD:
@@ -1340,11 +1356,12 @@ def cmd_status():
     lines.append(f"TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
-    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч")
+    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (только после стопа, V14)")
+    lines.append(f"⛔ Blacklist после стопа: 48ч (V14, было 7д)")
     lines.append(f"Аномалии: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion")
     lines.append(f"BEAR фильтр: 3+ аномалии в BEAR → skip")
     # V13.6: показываем версию + активные фичи
-    lines.append(f"🏷️ Версия: V13.6 (аудит-фиксы)")
+    lines.append(f"🏷️ Версия: V14 (Task ID 78: 9 худших пар убраны + TP_COUNTER=2.0 + blacklist 48ч)")
     if USE_SKIP_2_WEAK:
         lines.append(f"✅ SKIP_2_WEAK: фильтрует 2 weak коррелированных")
     lines.append(f"💪 STRONG аномалии (PF>1.4): Laggard, ZScoreDev, LiqMagnet")

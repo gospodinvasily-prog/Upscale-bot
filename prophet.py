@@ -47,17 +47,28 @@ MSK = dt.timezone(dt.timedelta(hours=3))
 
 PAIRS = [
     "BTC","ETH","BNB","XRP","SOL","AAVE","ADA","AERO","ALGO","APT","ARB",
-    "ASTER","ATOM","AVAX","AXS","BCH","BERA","BONK","BRETT","BSV",
-    "CAKE","CHZ","CRO","CRV","DASH","DATA","DEEP","DEXE","DOGE","DOT",
+    "ASTER","ATOM","AVAX","BCH","BERA","BONK","BRETT","BSV",
+    "CAKE","CHZ","CRO","CRV","DASH","DATA","DEEP","DEXE","DOGE",
     "DYDX","EIGEN","ENA","ENS","ETC","FARTCOIN","FET","FIL","FLOKI",
-    "GALA","GRAM","GRASS","GRT","HBAR","HYPE","ICP","IMX","INJ","IOTA",
-    "JASMY","JTO","JUP","KAIA","KAITO","KAS","LDO","LINEA","LINK","LTC",
-    "MANA","MNT","MORPHO","MOVE","NEAR","ONDO","OP","ORDI","PENDLE",
+    "GALA","GRAM","GRT","HBAR","HYPE","ICP","IMX","INJ","IOTA",
+    "JASMY","JTO","JUP","KAIA","KAITO","LDO","LINEA","LTC",
+    "MANA","MNT","MOVE","NEAR","ONDO","ORDI","PENDLE",
     "PENGU","PEPE","PNUT","POL","POPCAT","PUMP","PYTH","QNT","RAY",
-    "RENDER","RUNE","S","SAND","SEI","SHIB","SKY","STRK","STX","SUI",
-    "TAO","TIA","TRUMP","TRX","TURBO","UNI","VET","VIRTUAL","WAL",
+    "RENDER","RUNE","S","SAND","SEI","SHIB","SKY","STX","SUI",
+    "TIA","TRUMP","TRX","TURBO","UNI","VET","VIRTUAL","WAL",
     "WIF","WLD","XLM","XMR","XTZ","ZEC","ZRO","0G"
 ]
+# V14 (Task ID 78): убраны 9 общих худших пар (доказано per-pair анализом 385 дней):
+# MORPHO (Stop-loser, -$691 в Prophet, -$1071 всего)
+# GRASS (Low-n-anom, -$204 в Prophet)
+# STRK (Stop-loser, -$307 в Prophet)
+# LINK (Long-loser, -$292 в Prophet)
+# OP (Short-loser, -$109 в Prophet)
+# KAS (Mixed-loser, -$54 в Prophet)
+# AXS (Short-loser, -$54 в Prophet)
+# TAO (Mixed-loser, -$105 в Prophet)
+# DOT (Long-loser, -$162 в Prophet)
+# Прогноз PnL после правки: $+16059 → ~$+17500 за 385 дней
 
 # === V12 ПАРАМЕТРЫ ===
 # ВАЖНО: критичные V12 параметры захардкожены в коде (без env var override),
@@ -2039,8 +2050,8 @@ def start():
     print(f"[prophet V13.12] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
-            f"🔮 <b>Пророк V13.12 запущен</b>\n"
-            f"📊 Версия: V13.12 (аудит-фиксы + кнопки + без 15m)\n"
+            f"🔮 <b>Пророк V14 запущен</b>\n"
+            f"📊 Версия: V14 (Task ID 78: убраны 9 худших пар из PAIRS)\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
