@@ -762,7 +762,7 @@ def execute_trade(setup):
             tr = _load_tracked()
             tr[f"pending_{sym}_{int(_now())}"] = {
                 "sym": sym, "side": side, "dir": side, "entry": entry,
-                "stop": stop, "tp": tp, "opened_ts": _now(),
+                "stop": stop, "tp": tp1_price, "tp2": tp2_price, "opened_ts": _now(),
                 "strategy": STRATEGY_TAG, "status": "open",
                 "direction": direction,
                 "tp1_hit": False,  # V15: флаг что TP1 сработал (стоп в безубыток)
@@ -1475,17 +1475,20 @@ def start():
         _watchdog_thread.start()
     print(f"[anomaly A+] Старт: режим={_state.get('scan_mode','off')}")
     if B:
+        mode = _state.get('scan_mode','off')
+        mode_str = "🟢 ВКЛ (авто)" if mode == "auto" else "🔴 ВЫКЛ"
         B.send_telegram(
             f"🚨 <b>Anomaly Scanner V15 запущен</b>\n"
-            f"📊 Аномалии: LiqMagnet + TrendAlignment (2 шт)\n"
-            f"⏰ Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)\n"
+            f"📊 Стратегия: {mode_str}\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
-            f"⚡ Вход: MIN=1 (любая аномалия = сигнал)\n"
+            f"⏰ Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)\n"
+            f"🎯 Аномалии: LiqMagnet + TrendAlignment\n"
+            f"⚡ Вход: MIN=1 (любая = сигнал)\n"
             f"🚫 LONG в BEAR: запрещён\n"
-            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR\n"
-            f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
-            f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки)\n"
-            f"⛔ Blacklist после стопа: 48ч\n"
-            f"💰 Комиссии: {COMMISSION_PCT*2}% + {SPREAD_PCT}% спред\n"
+            f"🎯 SL: {SL_MULT}×ATR\n"
+            f"📊 TP1 (70%): {TP1_MULT}×ATR\n"
+            f"📊 TP2 (30%): {TP2_MULT}×ATR\n"
+            f"🛡️ При TP1 → стоп в безубыток\n"
+            f"⏱️ Кулдаун: {SYMBOL_COOLDOWN_SEC//3600}ч | Blacklist: 48ч\n"
             f"Команды: /anomaly /anomaly_on /anomaly_off /anomaly_close /anomaly_clean"
         )

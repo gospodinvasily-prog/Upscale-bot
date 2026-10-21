@@ -1249,7 +1249,7 @@ def execute_trade(setup):
             tr = _load_tracked()
             tr[f"pending_{sym}_{int(_now())}"] = {
                 "sym": sym, "side": side, "dir": side, "entry": entry,
-                "stop": stop, "tp": tp, "opened_ts": _now(),
+                "stop": stop, "tp": tp1_price, "tp2": tp2_price, "opened_ts": _now(),
                 "strategy": STRATEGY_TAG, "status": "open",
                 "direction": direction,
                 "tp1_hit": False,  # V15: флаг что TP1 сработал (стоп в безубыток)
@@ -2158,21 +2158,18 @@ def start():
         _watchdog_thread.start()
     print(f"[prophet V13.12] Старт: режим={_state.get('scan_mode','off')}")
     if B:
+        mode = _state.get('scan_mode','off')
+        mode_str = "🟢 ВКЛ (авто)" if mode == "auto" else "🔴 ВЫКЛ"
         B.send_telegram(
             f"🔮 <b>Пророк V15 запущен</b>\n"
-            f"📊 Версия: V15 (SL=2×ATR, TP1 70% + TP2 30% + безубыток)\n"
-            f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}\n"
-            f"Режим: {_state.get('scan_mode','off')}\n"
-            f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
-            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR\n"
-            f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
-            f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d} (без 11:00)\n"
-            f"⚡ Вход сразу (без 15m подтверждения)\n"
-            f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (LONG/SHORT раздельно)\n"
-            + (f"🐻 Bear-aware + Counter-trend:\n   BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER})\n   BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})\n   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}\n" if BEAR_AWARE_ENABLED else "")
-            + f"🟢 LONG + 🔴 SHORT (в обе стороны в BULL и BEAR)\n"
+            f"📊 Стратегия: {mode_str}\n"
+            f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
+            f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
+            f"🎯 SL: {SL_MULT}×ATR\n"
+            f"📊 TP1 (70%): {TP1_MULT}×ATR\n"
+            f"📊 TP2 (30%): {TP2_MULT}×ATR\n"
+            f"🛡️ При TP1 → стоп в безубыток\n"
             f"📌 Пирамидинг: новые только если предыдущие в плюсе\n"
-            f"🔄 Auto-sync orphans + watchdog scanner\n"
-            f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)\n"
-            f"Команды: /prophet /prophet_on /prophet_off /prophet_close /prophet_clean"
+            f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'}\n"
+            f"Команды: /prophet /prophet_on /prophet_off /prophet_close /prophet_clean /prophet_config"
         )
