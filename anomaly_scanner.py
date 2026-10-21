@@ -993,11 +993,13 @@ def manage_positions():
                 _state["symbol_cooldown"] = sc
                 _save()
             else:
-                # V14 (Task ID 78): УБРАН 24ч кулдаун после прибыльной сделки
-                # Обоснование: V3 REAL ставил cooldown только после стопа → 1012 сделок
-                # V13.6 ставит после любой → 430 сделок (в 2.4× меньше!)
-                # После TP пара может дать новый сигнал сразу — не блокируем
-                pass
+                # V14-final: ВОЗВРАЩЁН 24ч кулдаун после прибыльной сделки
+                # Обоснование: в live без кулдауна 2-я сделка по той же паре часто плохая
+                # (импульс исчерпан, сигнал ложный)
+                sc = _state.get("symbol_cooldown", {})
+                sc[rec["sym"]] = int(_now()) + SYMBOL_COOLDOWN_SEC
+                _state["symbol_cooldown"] = sc
+                _save()
 
             side_pnl = _state.get("long_today_pnl" if direction_field in ("LONG","long") else "short_today_pnl", 0.0)
             if side_pnl <= -SIDE_DAILY_STOP_USD:
@@ -1049,10 +1051,10 @@ def _scanner_loop():
             now_dt = dt.datetime.now(MSK)
             now_ts = int(_now())
 
-            # V14-hourfix: убраны 3 убыточных часа по per-hour анализу (Task ID 84)
-            # 07:00, 15:00, 23:00 МСК — PF 0.76-0.84, суммарный убыток -$1789
-            # Оставшиеся 21 час работают с PF 1.02-1.48
-            SKIP_HOURS_MSK = [7, 15, 23]  # V14-hourfix
+            # V14-final: убран только 23:00 МСК (стабильно убыточный час в V13.6 и V15-SAVE)
+            # По per-hour анализу: 23:00 PF 0.70-0.84 в обеих версиях
+            # 07:00 и 15:00 оставлены (в V15-SAVE с TP=3.0 они прибыльные)
+            SKIP_HOURS_MSK = [23]  # V14-final
             if now_dt.hour in SKIP_HOURS_MSK:
                 time.sleep(60); continue
 
@@ -1345,7 +1347,7 @@ def cmd_status():
 
     mode = _state.get("scan_mode", "off")
     mode_str = "🤖 Авто (вкл)" if mode == "auto" else "🔴 Выкл"
-    lines = ["", "━━━ 🚨 Anomaly Scanner A+ ━━━"]
+    lines = ["", "━━━ 🚨 Anomaly Scanner A+ V14-final ━━━"]
     lines.append(f"Режим: {mode_str}")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     tracked = _load_tracked()
@@ -1358,12 +1360,12 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"📅 Скан: :{SCAN_MINUTE:02d} каждого часа (кроме 07/15/23 МСК, V14-hourfix)")
+    lines.append(f"📅 Скан: :{SCAN_MINUTE:02d} каждого часа (кроме 23:00 МСК, V14-final)")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
     lines.append(f"TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
-    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (только после стопа, V14)")
+    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки, V14-final)")
     lines.append(f"⛔ Blacklist после стопа: 48ч (V14, было 7д)")
     lines.append(f"Аномалии: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion")
     lines.append(f"BEAR фильтр: 3+ аномалии в BEAR → skip")
@@ -1404,7 +1406,7 @@ def cmd_on():
         _scanner_running = True
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="anomaly-scanner-cmd-on")
         _scanner_thread.start()
-    return f"🚨 Anomaly A+ включён.\nСкан: :{SCAN_MINUTE:02d} каждого часа\nMAX_OPEN: {MAX_OPEN}\nАномалий: 5 (Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion)"
+    return f"🚨 Anomaly A+ (V14-final) включён.\nСкан: :{SCAN_MINUTE:02d} каждого часа (кроме 23:00 МСК)\nMAX_OPEN: {MAX_OPEN}\nАномалий: 5 (Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion)\nTP: TREND=COUNTER=2.0×ATR (RR 1:1)\n⏱️ Кулдаун по паре: 24ч (после любой сделки, V14-final)"
 
 def cmd_off():
     _state["scan_mode"] = "off"
@@ -1461,14 +1463,15 @@ def start():
     print(f"[anomaly A+] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
-            f"🚨 <b>Anomaly Scanner A+ запущен</b>\n"
+            f"🚨 <b>Anomaly Scanner A+ V14-final запущен</b>\n"
             f"📊 5 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion\n"
-            f"⏰ Скан: :{SCAN_MINUTE:02d} каждого часа (24/день)\n"
+            f"⏰ Скан: :{SCAN_MINUTE:02d} каждого часа (кроме 23:00 МСК)\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
             f"🎯 TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})\n"
             f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч\n"
             f"🐻 BEAR фильтр: 3+ аномалии в BEAR → skip\n"
-            f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч\n"
+            f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки, V14-final)\n"
+            f"⛔ Blacklist после стопа: 48ч (V14)\n"
             f"💰 Комиссии: {COMMISSION_PCT*2}% + {SPREAD_PCT}% спред\n"
             f"Команды: /anomaly /anomaly_on /anomaly_off /anomaly_close /anomaly_clean"
         )
