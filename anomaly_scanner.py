@@ -1049,6 +1049,13 @@ def _scanner_loop():
             now_dt = dt.datetime.now(MSK)
             now_ts = int(_now())
 
+            # V14-hourfix: убраны 3 убыточных часа по per-hour анализу (Task ID 84)
+            # 07:00, 15:00, 23:00 МСК — PF 0.76-0.84, суммарный убыток -$1789
+            # Оставшиеся 21 час работают с PF 1.02-1.48
+            SKIP_HOURS_MSK = [7, 15, 23]  # V14-hourfix
+            if now_dt.hour in SKIP_HOURS_MSK:
+                time.sleep(60); continue
+
             # Скан в :45-:55 (окно :50)
             if not (45 <= now_dt.minute <= 55):
                 time.sleep(30); continue
@@ -1351,7 +1358,7 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 Скан: :{SCAN_MINUTE:02d} каждого часа (24/день)")
+    lines.append(f"📅 Скан: :{SCAN_MINUTE:02d} каждого часа (кроме 07/15/23 МСК, V14-hourfix)")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
     lines.append(f"TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч")
