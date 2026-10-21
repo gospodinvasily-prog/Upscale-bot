@@ -103,8 +103,12 @@ SIDE_DAILY_STOP_USD = 300.0  # 3 убытка × $100 = $300, потом бло�
 # Бэктест показал: PF 1.71 vs 1.61 (current), WR 62.6% vs 60.6%, PnL +176% vs +145%
 # Причина: TP=3.0×ATR (trend) слишком далеко для Prophet — WR trend 62% (нужно 65%+)
 # TP=2.0×ATR для trend даёт WR 65% (лучше), counter-trend TP=2.0×ATR даёт RR 1:1 (vs 1:0.75)
-TP_TREND = 2.0          # V13.11: было 3.0 (LONG в BULL, SHORT в BEAR — с трендом)
-TP_COUNTER = 2.0        # V13.11: было 1.5 (SHORT в BULL, LONG в BEAR — против тренда)
+TP_TREND = 2.0          # TP = 2.0×ATR
+TP_COUNTER = 2.0        # TP = 2.0×ATR (симметричный)
+# V15: Частичный TP — TP1 закрывает 70%, TP2 закрывает 30%
+# При срабатывании TP1 → стоп переставляется в безубыток (цена входа)
+TP1_FRACTION = 0.70     # 70% позиции закрывается на TP1
+TP2_FRACTION = 0.30     # 30% позиции остаётся с стопом в безубытке
 # V12-bear-aware: торговля в BEAR BTC режиме (обе стороны работают!)
 # - BULL BTC (+1): LONG (trend) + SHORT (counter)
 # - BEAR BTC (-1): SHORT (trend) + LONG (counter) ← LONG в BEAR разрешён с TP=2.0 (V13.11)
@@ -1201,8 +1205,11 @@ def execute_trade(setup):
     sig = {
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
+        "tp2_price": tp,  # V15: TP2 на том же уровне (2×ATR)
+        "tp1_fraction": TP1_FRACTION,  # V15: 70% закрывается на TP1
+        "tp2_fraction": TP2_FRACTION,  # V15: 30% остаётся с стопом в безубытке
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
-        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,  # V13.12: 3 (было 1)
+        "max_pos_usd": pos_size, "max_same_side": MAX_SAME_SIDE,
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
 
@@ -1212,11 +1219,13 @@ def execute_trade(setup):
         emoji_dir = "🟢 LONG" if side == "long" else "🔴 SHORT"
         if B:
             B.send_telegram(
-                f"✅ <b>ПРОРОК V12: {sym} {emoji_dir} открыт</b>\n"
+                f"✅ <b>ПРОРОК V15: {sym} {emoji_dir} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
-                f"Тейк: ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
-                f"TP×ATR: {setup.get('tp_mult', 3.0):.1f}\n"
+                f"📊 TP1 (70%): ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
+                f"📊 TP2 (30%): ${tp:.6g} (безубыток после TP1)\n"
+                f"🛡️ При TP1 → стоп в безубыток (${entry:.6g})\n"
+                f"TP×ATR: {setup.get('tp_mult', 2.0):.1f} | SL: {SL_MULT}×ATR\n"
                 f"Маржа: ${margin:.0f} × {LEVERAGE}x\n"
                 f"Score: {setup['score']:.0f}"
             )
@@ -1231,6 +1240,7 @@ def execute_trade(setup):
                 "stop": stop, "tp": tp, "opened_ts": _now(),
                 "strategy": STRATEGY_TAG, "status": "open",
                 "direction": direction,
+                "tp1_hit": False,  # V15: флаг что TP1 сработал (стоп в безубыток)
             }
             _save_tracked(tr)
         
@@ -1380,13 +1390,60 @@ def manage_positions():
             else: _stats["losses"] += 1
             del tracked[pid]; changed = True
         else:
+            # V15: Проверка TP1 → перестановка стопа в безубыток
+            if not rec.get("tp1_hit", False):
+                # Проверяем: достигла ли цена TP1?
+                pos_data = next((p for p in live if UE._pos_id(p) == pid), None)
+                if pos_data:
+                    entry = rec.get("entry", 0)
+                    tp_price = rec.get("tp", 0)
+                    direction = rec.get("direction", rec.get("dir", "long"))
+                    is_long = direction in ("LONG", "long")
+                    
+                    # Получаем текущую цену для проверки
+                    cur_price = None
+                    try:
+                        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{rec['sym']}_USDT"}, timeout=10)
+                        if r.ok:
+                            cur_price = float(r.json().get("last", 0))
+                    except: pass
+                    
+                    if cur_price and entry and tp_price:
+                        tp1_reached = False
+                        if is_long and cur_price >= tp_price:
+                            tp1_reached = True
+                        elif not is_long and cur_price <= tp_price:
+                            tp1_reached = True
+                        
+                        if tp1_reached:
+                            # TP1 сработал! Переставляем стоп в безубыток (цена входа)
+                            mid = UE._pos_market(pos_data)
+                            if mid and hasattr(executor, "move_stop"):
+                                dir_field = "short" if not is_long else "long"
+                                info = {"id": pid, "mid": mid, "dir": dir_field}
+                                try:
+                                    executor.move_stop(info, entry)
+                                    rec["tp1_hit"] = True
+                                    rec["stop"] = entry  # обновляем в tracked
+                                    changed = True
+                                    if B:
+                                        emoji = "🟢" if is_long else "🔴"
+                                        B.send_telegram(
+                                            f"🛡️ <b>СТОП В БЕЗУБЫТОК — {rec['sym']} {emoji}</b>\n"
+                                            f"TP1 сработал (70% закрыто)\n"
+                                            f"Стоп перенесён на цену входа: ${entry:.6g}\n"
+                                            f"Остаток 30% работает без риска"
+                                        )
+                                    print(f"[prophet V15] {rec['sym']}: TP1 hit → стоп в безубыток ${entry:.6g}")
+                                except Exception as e:
+                                    print(f"[prophet V15] {rec['sym']}: move_stop error: {e}")
+            
             hold = now - rec.get("opened_ts", now)
             if hold >= MAX_HOLD:
                 pos = next((p for p in live if UE._pos_id(p) == pid), None)
                 if pos:
                     mid = UE._pos_market(pos)
                     if mid:
-                        # V12: dir из rec
                         dir_field = rec.get("dir", rec.get("direction", "long"))
                         if dir_field in ("SHORT", "short"): dir_field = "short"
                         else: dir_field = "long"
@@ -1580,8 +1637,8 @@ def cmd_status():
     mode = _state.get("scan_mode", "off")
     mode_str = {"off": "🔴 Выкл",
                 "continuous": "🔄 Непрерывный (каждый час в :15)",
-                "auto": f"🤖 Авто (V12 часы: {AUTO_HOURS_MSK})"}.get(mode, mode)
-    lines = ["", "━━━ 🔮 Пророк V12 ━━━"]
+                "auto": f"🤖 Авто (V15 часы: {AUTO_HOURS_MSK}, без 11:00 МСК)"}.get(mode, mode)
+    lines = ["", "━━━ 🔮 Пророк V15 ━━━"]
     lines.append(f"Режим: {mode_str}")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}/{MAX_OPEN}")
     tracked = _load_tracked()
@@ -1593,12 +1650,13 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 V13.12 часы: {AUTO_HOURS_MSK} МСК, скан в :{SCAN_MINUTE:02d}")
+    lines.append(f"\n📅 V15 часы: {AUTO_HOURS_MSK} МСК (без 11:00), скан в :{SCAN_MINUTE:02d}")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}")
     lines.append(f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}" + (f" | BEAR ≥{MIN_SCORE_BEAR}" if BEAR_AWARE_ENABLED else ""))
-    lines.append(f"TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)")
+    lines.append(f"TP: TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR")
+    lines.append(f"🛡️ При TP1 → стоп в безубыток")
     lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч")
-    lines.append(f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)")
+    lines.append(f"⚡ Вход сразу (без 15m подтверждения, V15)")
     # V12-counter-trend: показываем что включён
     if BEAR_AWARE_ENABLED:
         lines.append(f"🐻 Bear-aware + Counter-trend: BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER}) | BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})")
@@ -1654,7 +1712,32 @@ def cmd_on():
         _scanner_stop_event.clear()
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-cmd-on")
         _scanner_thread.start()
-    return f"🤖 Prophet V12 включён.\nЧасы скана: {AUTO_HOURS_MSK}\nСкан в :{SCAN_MINUTE:02d} | Подтверждение: {CONFIRM_WAIT_SEC//60} мин\nПорог: ≥{AUTO_SCORE}\nMAX_OPEN: {MAX_OPEN}"
+    typical_atr = 2.5
+    sl_pct = SL_MULT * typical_atr
+    pos_size = RISK_USD / sl_pct * 100
+    tp_pct = TP_TREND * typical_atr
+    net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+    tp1_profit = net_pct * pos_size * TP1_FRACTION / 100
+    tp2_profit = net_pct * pos_size * TP2_FRACTION / 100
+    total_profit = tp1_profit + tp2_profit
+    
+    return (
+        f"🤖 <b>Prophet V15 включён</b>\n\n"
+        f"📊 <b>Настройки:</b>\n"
+        f"💰 Risk: <b>${RISK_USD:.0f}</b>\n"
+        f"🎯 SL: <b>{SL_MULT}×ATR</b> (≈{sl_pct:.1f}%)\n"
+        f"📊 TP1 (70%): <b>{TP_TREND}×ATR</b> (≈{tp_pct:.1f}%)\n"
+        f"📊 TP2 (30%): <b>{TP_TREND}×ATR</b> (безубыток после TP1)\n"
+        f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
+        f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
+        f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
+        f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | Порог: ≥{AUTO_SCORE}\n\n"
+        f"💡 <b>Прибыль с TP (ATR=2.5%):</b>\n"
+        f"  TP1 (70%) → +${tp1_profit:.0f}\n"
+        f"  TP2 (30%) → +${tp2_profit:.0f}\n"
+        f"  Итого → +${total_profit:.0f}\n"
+        f"🚀 Стратегия запущена"
+    )
 
 def cmd_off():
     """V12-FINAL: выключение авто-торговли."""
@@ -1950,7 +2033,7 @@ def run_cleaner(reason="AUTO_CLEAN"):
         return 0, f"🧹 Cleaner V12 ({reason}): все открытые позиции в норме (проверено {len(open_recs)})"
 
 def cmd_stats():
-    lines = ["", "━━━ 🔮 Пророк V12 — Статистика ━━━"]
+    lines = ["", "━━━ 🔮 Пророк V15 — Статистика ━━━"]
     lines.append(f"Сканирований: {_stats['scans']}")
     lines.append(f"Сигналов: {_stats['signals']}")
     lines.append(f"Сделок: {_stats['trades']}")
@@ -2055,15 +2138,15 @@ def start():
     print(f"[prophet V13.12] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
-            f"🔮 <b>Пророк V14 запущен</b>\n"
-            f"📊 Версия: V14 (Task ID 78: убраны 9 худших пар из PAIRS)\n"
+            f"🔮 <b>Пророк V15 запущен</b>\n"
+            f"📊 Версия: V15 (SL=2×ATR, TP1 70% + TP2 30% + безубыток)\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE={MAX_SAME_SIDE}\n"
             f"Режим: {_state.get('scan_mode','off')}\n"
             f"Порог: ручной ≥{MIN_SCORE} | авто ≥{AUTO_SCORE}\n"
-            f"📈 TP: counter-trend (TREND={TP_TREND}×ATR, COUNTER={TP_COUNTER}×ATR)\n"
-            f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD//3600}ч\n"
-            f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
-            f"✅ Подтверждение входа: {CONFIRM_WAIT_SEC//60} мин (15m свеча)\n"
+            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR\n"
+            f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
+            f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d} (без 11:00)\n"
+            f"⚡ Вход сразу (без 15m подтверждения)\n"
             f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f} (LONG/SHORT раздельно)\n"
             + (f"🐻 Bear-aware + Counter-trend:\n   BULL→LONG(TP{TP_TREND})+SHORT(TP{TP_COUNTER})\n   BEAR→SHORT(TP{TP_TREND})+LONG(TP{TP_COUNTER})\n   Cooldown: 24ч BULL | {BEAR_COOLDOWN_HOURS}ч BEAR | MIN_SCORE: BULL={MIN_SCORE} BEAR={MIN_SCORE_BEAR}\n" if BEAR_AWARE_ENABLED else "")
             + f"🟢 LONG + 🔴 SHORT (в обе стороны в BULL и BEAR)\n"

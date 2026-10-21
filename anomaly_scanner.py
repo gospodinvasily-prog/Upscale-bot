@@ -73,15 +73,13 @@ PAIRS = [
 # === ПАРАМЕТРЫ (захардкожены) ===
 MAX_OPEN = 2
 SL_MULT = 2.0
-# V14 (Task ID 78): TP_COUNTER = 2.0 (возврат к V3 REAL Task 64, который давал +$26K)
-# Бэктест на 385 днях показал:
-# - При TP_COUNTER=1.0 (V13.11): контр-тренд 228/430 сделок, PF 0.86, -$1134 (убыток)
-# - При TP_COUNTER=2.0 (V14): контр-тренд PnL удваивается на TP, PF 1.16, +$1217
-# RR 1:1 (симметричный) работает лучше чем RR 1:2 для Anomaly Scanner
-TP_TREND = 2.0       # trend-following direction (LONG в BULL, SHORT в BEAR)
-TP_COUNTER = 2.0     # V14: было 1.0 в V13.11. Симметричный TP=SL=2.0 (RR 1:1)
+# V15: только 2 аномалии (LiqMagnet + TrendAlignment) — лучшие из 12 протестированных
+# MIN_ANOMALIES = 1 — любая из двух = сигнал к входу
+# Запрет LONG в BEAR (по результатам бэктеста: LONG в BEAR PF 0.76, убыточен)
+TP_TREND = 2.0       # с трендом BTC
+TP_COUNTER = 2.0     # против тренда BTC
 MAX_HOLD_SEC = 48 * 3600
-MIN_ANOMALIES = 2
+MIN_ANOMALIES = 1    # V15: 1 (было 2) — вход по любой из 2 аномалий
 RISK_USD = 100
 LEVERAGE = 5
 MAX_MARGIN = 3000.0
@@ -90,22 +88,21 @@ SYMBOL_COOLDOWN_SEC = 24 * 3600
 SIDE_DAILY_STOP_USD = 300.0
 BEAR_AWARE_ENABLED = True
 
-# V13.6: SKIP_2_WEAK логика комбо (по аудиту + идея пользователя)
-# Бэктест V13.6 показал: SKIP_2_WEAK даёт +$8,559 vs WEIGHTED_SCORE -$2,360 vs CURRENT +$903
-# Причина: после фиксов аномалий (ZScoreDev look-ahead + Divergence sign-based)
-# они стали менее коррелированы → WEIGHTED_SCORE penalty за корреляцию стал излишним
-# SKIP_2_WEAK просто фильтрует редкие combos из 2 weak коррелированных
-USE_SKIP_2_WEAK = os.environ.get("ANOMALY_SKIP_2_WEAK", "1") == "1"
-# Классификация аномалий по PF (для SKIP_2_WEAK фильтра)
-STRONG_ANOMALIES = {"Laggard", "ZScoreDev", "LiqMagnet"}  # PF > 1.4
-WEAK_ANOMALIES = {"Divergence", "Exhaustion"}              # PF < 1.4
-# Коррелированные пары (если combo = ровно эти 2 → skip)
-# Это защищает от дублирования сигнала в MR-кластере
-CORRELATION_PAIRS = [
-    ("Laggard", "ZScoreDev"),     # оба Z-score MR
-    ("ZScoreDev", "Exhaustion"),  # Z-score MR + streak MR
-    ("Laggard", "Exhaustion"),    # отстающая монета падала 5+ свечей
-]
+# V15: SKIP_2_WEAK не нужен — всего 2 аномалии, обе STRONG
+USE_SKIP_2_WEAK = False
+STRONG_ANOMALIES = {"LiqMagnet", "TrendAlignment"}
+WEAK_ANOMALIES = set()
+CORRELATION_PAIRS = []
+
+# V15: запретить LONG в BEAR-режиме
+# По бэктесту: LONG в BEAR = PF 0.76, -$718; LONG в BULL = PF 1.42, +$1490
+# SHORT работает в обоих режимах (PF 2.14 / 2.21)
+BLOCK_LONG_IN_BEAR = True
+
+# V15: Частичный TP — TP1 закрывает 70%, TP2 закрывает 30%
+# При срабатывании TP1 → стоп переставляется в безубыток (цена входа)
+TP1_FRACTION = 0.70     # 70% позиции закрывается на TP1
+TP2_FRACTION = 0.30     # 30% позиции остаётся с стопом в безубытке
 
 # Реальные комиссии Upscale
 COMMISSION_PCT = 0.008  # 0.008% за операцию
@@ -247,7 +244,9 @@ def _fetch_current_price(sym):
 # === DETECT ANOMALIES ===
 
 def detect_anomalies(sym, scan_ts, c4h, market_returns, btc_reg):
-    """Возвращает список: [(anomaly_name, direction, details)]"""
+    """V15: только 2 аномалии — LiqMagnet + TrendAlignment.
+    Возвращает список: [(anomaly_name, direction, details)]
+    """
     anomalies = []
     # Только ЗАКРЫТЫЕ 4H свечи (ts + 14400 <= scan_ts)
     c4 = [c for c in c4h if c["ts"] + 14400 <= scan_ts][-100:]
@@ -261,81 +260,15 @@ def detect_anomalies(sym, scan_ts, c4h, market_returns, btc_reg):
     if atr_pct < 0.5 or atr_pct > 10:
         return anomalies
 
-    # 1. LAGGARD
-    if market_returns:
-        market_avg = statistics.mean(market_returns)
-        market_std = statistics.stdev(market_returns) if len(market_returns) > 1 else 1
-        if market_std > 0 and len(c4) >= 7:
-            ret_24h = (price - c4[-7]["close"]) / c4[-7]["close"] * 100
-            z_score = (ret_24h - market_avg) / market_std
-            if z_score <= -1.5:
-                anomalies.append(("Laggard", "LONG", f"Z={z_score:+.2f}"))
-            elif z_score >= 1.5:
-                anomalies.append(("Laggard", "SHORT", f"Z={z_score:+.2f}"))
-
-    # 2. ZSCOREDEV (V13.6 audit fix: убран look-ahead bias)
-    # Раньше: c4[-1].close входил в sma20/std_20 → микро-смещение Z на ~5%
-    # Теперь: stats считаются по c4[-21:-1] (без последней свечи), затем z от текущей price
-    if len(c4) >= 21:
-        prev_closes = [c["close"] for c in c4[-21:-1]]  # 20 свечей ДО последней
-        sma20 = statistics.mean(prev_closes)
-        std_20 = statistics.stdev(prev_closes) if len(prev_closes) > 1 else 0
-        if std_20 > 0:
-            z = (price - sma20) / std_20
-            if z <= -2.0:
-                anomalies.append(("ZScoreDev", "LONG", f"Z={z:+.2f}"))
-            elif z >= 2.0:
-                anomalies.append(("ZScoreDev", "SHORT", f"Z={z:+.2f}"))
-
-    # 3. DIVERGENCE (V13.6 audit fix: нормализация объёмов + sign-based logic)
-    # Раньше: баг знаков — если obv_past отрицательный, формула obv_now < obv_past*0.7
-    #         работала неправильно (ловила false positives при конвергенции)
-    #         + магические 0.7/1.3 без обоснования + ненормализованные объёмы
-    # Теперь: volume flow в [-1, +1] (нормализованный), сравнение по знакам
-    if len(c4) >= 10:
-        recent = c4[-5:]
-        older = c4[-10:-5]
-        price_up = recent[-1]["close"] > recent[0]["close"]
-        
-        def vol_flow(window):
-            """Нормализованный volume flow в [-1, +1]."""
-            if not window or len(window) < 2: return 0.0
-            total_vol = sum(abs(c["vol"]) for c in window)
-            if total_vol <= 0: return 0.0
-            signed = 0.0
-            for i in range(1, len(window)):
-                if window[i]["close"] > window[i-1]["close"]:
-                    signed += window[i]["vol"]
-                elif window[i]["close"] < window[i-1]["close"]:
-                    signed -= window[i]["vol"]
-            return signed / total_vol  # [-1, +1]
-        
-        vf_now = vol_flow(recent)    # [-1, +1]
-        vf_past = vol_flow(older)    # [-1, +1]
-        
-        # Истинная дивергенция: price direction ≠ volume flow direction
-        # SHORT: price↑ но volume flow отрицательный (продажи доминируют) → SHORT
-        # LONG:  price↓ но volume flow положительный (покупки доминируют) → LONG
-        if price_up and vf_now < -0.1 and vf_now < vf_past - 0.2:
-            anomalies.append(("Divergence", "SHORT", f"цена↑ VF={vf_now:+.2f}"))
-        elif not price_up and vf_now > 0.1 and vf_now > vf_past + 0.2:
-            anomalies.append(("Divergence", "LONG", f"цена↓ VF={vf_now:+.2f}"))
-
-    # 4. LIQUIDATION MAGNET (V13.5 audit fix #3: ATR-нормализация порога)
-    # Раньше: фиксированный порог 1.5% (магическое число)
-    # Теперь: порог = 1.0 × ATR_pct (волатильно-адаптивный)
-    # На волатильных монетах (ATR=3%) порог = 3%, на спокойных (ATR=0.5%) порог = 0.5%
-    # Дополнительно: добавлен breakout-confirmation — цена должна быть CLOSE к экстремуму,
-    # а не просто wick (close ≥ prev_close или close > prev 4h high для LONG)
+    # === АНОМАЛИЯ 1: LiqMagnet ===
+    # Цена около 48h high/low → ожидаем пробой
     if len(c4) >= 12:
         recent_48h = c4[-12:]
         high_48h = max(c["high"] for c in recent_48h)
         low_48h = min(c["low"] for c in recent_48h)
         dist_to_high = (high_48h - price) / price * 100
         dist_to_low = (price - low_48h) / price * 100
-        # ATR-нормализованный порог (1.0×ATR_pct, не менее 0.5%, не более 3%)
         liq_threshold = max(0.5, min(3.0, atr_pct * 1.0))
-        # Breakout-confirmation: последняя свеча должна быть в направлении сигнала
         last_candle = c4[-1]
         last_bullish = last_candle["close"] >= last_candle["open"]
         if dist_to_high <= liq_threshold and dist_to_high >= 0 and last_bullish:
@@ -343,22 +276,26 @@ def detect_anomalies(sym, scan_ts, c4h, market_returns, btc_reg):
         elif dist_to_low <= liq_threshold and dist_to_low >= 0 and not last_bullish:
             anomalies.append(("LiqMagnet", "SHORT", f"около 48h low (-{dist_to_low:.2f}%, thr={liq_threshold:.2f}%)"))
 
-    # 5. EXHAUSTION
-    if len(c4) >= 7:
-        last_color = None
-        consecutive = 0
-        for c in reversed(c4[-7:]):
-            color = "green" if c["close"] >= c["open"] else "red"
-            if last_color is None:
-                last_color = color; consecutive = 1
-            elif color == last_color:
-                consecutive += 1
-            else:
-                break
-        if consecutive >= 5 and last_color == "green":
-            anomalies.append(("Exhaustion", "SHORT", f"{consecutive} зелёных подряд"))
-        elif consecutive >= 5 and last_color == "red":
-            anomalies.append(("Exhaustion", "LONG", f"{consecutive} красных подряд"))
+    # === АНОМАЛИЯ 2: TrendAlignment ===
+    # Stacked MA (SMA13 > SMA34 > SMA89) + ADX растёт = подтверждённый тренд
+    if len(c4) >= 89:
+        closes = [c["close"] for c in c4]
+        sma13 = _sma(closes, 13)
+        sma34 = _sma(closes, 34)
+        sma89 = _sma(closes, 89)
+        if sma13 and sma34 and sma89:
+            adx_now, pdi, mdi = _adx(c4, 14)
+            # ADX предыдущий (для проверки роста)
+            adx_prev = 0
+            if len(c4) > 30:
+                adx_prev, _, _ = _adx(c4[:-1], 14)
+            last_close = c4[-1]["close"]
+            # Bullish: SMA13 > SMA34 > SMA89, close > SMA13, ADX > 20, ADX растёт
+            if sma13 > sma34 > sma89 and last_close > sma13 and adx_now > 20 and adx_now > adx_prev:
+                anomalies.append(("TrendAlignment", "LONG", f"ADX={adx_now:.0f}↑ stack✓"))
+            # Bearish: SMA13 < SMA34 < SMA89, close < SMA13, ADX > 20, ADX растёт
+            if sma13 < sma34 < sma89 and last_close < sma13 and adx_now > 20 and adx_now > adx_prev:
+                anomalies.append(("TrendAlignment", "SHORT", f"ADX={adx_now:.0f}↑ stack✓"))
 
     return anomalies
 
@@ -503,36 +440,17 @@ def do_scan(scan_ts=None):
         direction = None
         active = []
         
-        if USE_SKIP_2_WEAK:
-            # V13.6: SKIP_2_WEAK логика комбо
-            # Skip если combo состоит только из 2 weak коррелированных аномалий
-            if _is_2_weak_combo(long_anom) or _is_2_weak_combo(short_anom):
-                continue
-            
-            if len(long_anom) >= MIN_ANOMALIES:
-                # BEAR фильтр: 3+ uncorrelated LONG в BEAR → skip
-                if btc_reg == -1 and _count_uncorrelated(long_anom) >= 3:
-                    continue
+        # V15: простая логика — любая аномалия (MIN=1) даёт сигнал
+        # V15: запрет LONG в BEAR (PF 0.76 в бэктесте, убыточен)
+        if len(long_anom) >= MIN_ANOMALIES:
+            if BLOCK_LONG_IN_BEAR and btc_reg == -1:
+                pass  # пропускаем LONG в BEAR
+            else:
                 direction = "LONG"
                 active = long_anom
-            elif len(short_anom) >= MIN_ANOMALIES:
-                if btc_reg == -1 and _count_uncorrelated(short_anom) >= 3:
-                    continue
-                direction = "SHORT"
-                active = short_anom
-        else:
-            # Старая логика: ≥2 аномалии в одну сторону
-            if len(long_anom) >= MIN_ANOMALIES:
-                # BEAR фильтр: 3+ аномалии в BEAR → skip
-                if btc_reg == -1 and len(long_anom) >= 3:
-                    continue
-                direction = "LONG"
-                active = long_anom
-            elif len(short_anom) >= MIN_ANOMALIES:
-                if btc_reg == -1 and len(short_anom) >= 3:
-                    continue
-                direction = "SHORT"
-                active = short_anom
+        if not direction and len(short_anom) >= MIN_ANOMALIES:
+            direction = "SHORT"
+            active = short_anom
 
         if not direction: continue
 
@@ -796,6 +714,9 @@ def execute_trade(setup):
     sig = {
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
+        "tp2_price": tp,  # V15: TP2 на том же уровне (2×ATR)
+        "tp1_fraction": TP1_FRACTION,  # V15: 70% закрывается на TP1
+        "tp2_fraction": TP2_FRACTION,  # V15: 30% остаётся с стопом в безубытке
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
         "max_pos_usd": pos_size, "max_same_side": 1,
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
@@ -810,14 +731,15 @@ def execute_trade(setup):
         strong_str = " | STRONG✓" if setup.get("has_strong") else ""
         if B:
             B.send_telegram(
-                f"🚨 <b>ANOMALY A+: {sym} {emoji_dir} открыт</b>\n"
+                f"🚨 <b>ANOMALY V15: {sym} {emoji_dir} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
-                f"Тейк: ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
-                f"TP×ATR: {setup['tp_mult']:.1f}\n"
+                f"📊 TP1 (70%): ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
+                f"📊 TP2 (30%): ${tp:.6g} (безубыток после TP1)\n"
+                f"🛡️ При TP1 → стоп в безубыток (${entry:.6g})\n"
+                f"TP×ATR: {setup['tp_mult']:.1f} | SL: {SL_MULT}×ATR\n"
                 f"Маржа: ${margin:.0f} × {LEVERAGE}x\n"
-                f"📊 Аномалий: {setup['n_anomalies']}/5 ({score_label}){strong_str}\n"
-                f"📋 {setup['anomalies']}"
+                f"📋 Аномалии: {setup['anomalies']}"
             )
         _state["trades_today"] += 1
         _stats["trades"] += 1
@@ -829,8 +751,7 @@ def execute_trade(setup):
                 "stop": stop, "tp": tp, "opened_ts": _now(),
                 "strategy": STRATEGY_TAG, "status": "open",
                 "direction": direction,
-                "n_anomalies": setup["n_anomalies"],
-                "anomalies": setup["anomalies"],
+                "tp1_hit": False,  # V15: флаг что TP1 сработал (стоп в безубыток)
             }
             _save_tracked(tr)
         
@@ -993,13 +914,11 @@ def manage_positions():
                 _state["symbol_cooldown"] = sc
                 _save()
             else:
-                # V14-final: ВОЗВРАЩЁН 24ч кулдаун после прибыльной сделки
-                # Обоснование: в live без кулдауна 2-я сделка по той же паре часто плохая
-                # (импульс исчерпан, сигнал ложный)
-                sc = _state.get("symbol_cooldown", {})
-                sc[rec["sym"]] = int(_now()) + SYMBOL_COOLDOWN_SEC
-                _state["symbol_cooldown"] = sc
-                _save()
+                # V14 (Task ID 78): УБРАН 24ч кулдаун после прибыльной сделки
+                # Обоснование: V3 REAL ставил cooldown только после стопа → 1012 сделок
+                # V13.6 ставит после любой → 430 сделок (в 2.4× меньше!)
+                # После TP пара может дать новый сигнал сразу — не блокируем
+                pass
 
             side_pnl = _state.get("long_today_pnl" if direction_field in ("LONG","long") else "short_today_pnl", 0.0)
             if side_pnl <= -SIDE_DAILY_STOP_USD:
@@ -1013,6 +932,51 @@ def manage_positions():
             else: _stats["losses"] += 1
             del tracked[pid]; changed = True
         else:
+            # V15: Проверка TP1 → перестановка стопа в безубыток
+            if not rec.get("tp1_hit", False):
+                pos_data = next((p for p in live if UE._pos_id(p) == pid), None)
+                if pos_data:
+                    entry = rec.get("entry", 0)
+                    tp_price = rec.get("tp", 0)
+                    direction = rec.get("direction", rec.get("dir", "long"))
+                    is_long = direction in ("LONG", "long")
+                    
+                    cur_price = None
+                    try:
+                        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{rec['sym']}_USDT"}, timeout=10)
+                        if r.ok:
+                            cur_price = float(r.json().get("last", 0))
+                    except: pass
+                    
+                    if cur_price and entry and tp_price:
+                        tp1_reached = False
+                        if is_long and cur_price >= tp_price:
+                            tp1_reached = True
+                        elif not is_long and cur_price <= tp_price:
+                            tp1_reached = True
+                        
+                        if tp1_reached:
+                            mid = UE._pos_market(pos_data)
+                            if mid and hasattr(executor, "move_stop"):
+                                dir_field = "short" if not is_long else "long"
+                                info = {"id": pid, "mid": mid, "dir": dir_field}
+                                try:
+                                    executor.move_stop(info, entry)
+                                    rec["tp1_hit"] = True
+                                    rec["stop"] = entry
+                                    changed = True
+                                    if B:
+                                        emoji = "🟢" if is_long else "🔴"
+                                        B.send_telegram(
+                                            f"🛡️ <b>СТОП В БЕЗУБЫТОК — {rec['sym']} {emoji}</b>\n"
+                                            f"TP1 сработал (70% закрыто)\n"
+                                            f"Стоп перенесён на цену входа: ${entry:.6g}\n"
+                                            f"Остаток 30% работает без риска"
+                                        )
+                                    print(f"[anomaly V15] {rec['sym']}: TP1 hit → стоп в безубыток ${entry:.6g}")
+                                except Exception as e:
+                                    print(f"[anomaly V15] {rec['sym']}: move_stop error: {e}")
+            
             hold = now - rec.get("opened_ts", now)
             if hold >= MAX_HOLD_SEC:
                 pos = next((p for p in live if UE._pos_id(p) == pid), None)
@@ -1051,11 +1015,9 @@ def _scanner_loop():
             now_dt = dt.datetime.now(MSK)
             now_ts = int(_now())
 
-            # V14-final: убран только 23:00 МСК (стабильно убыточный час в V13.6 и V15-SAVE)
-            # По per-hour анализу: 23:00 PF 0.70-0.84 в обеих версиях
-            # 07:00 и 15:00 оставлены (в V15-SAVE с TP=3.0 они прибыльные)
-            SKIP_HOURS_MSK = [23]  # V14-final
-            if now_dt.hour in SKIP_HOURS_MSK:
+            # V15: скан с 04:00 до 22:00 МСК, пропускаем 07:00 и 15:00 (PF 0.76-0.84)
+            SCAN_HOURS_MSK = [4,5,6,8,9,10,11,12,13,14,16,17,18,19,20,21,22]
+            if now_dt.hour not in SCAN_HOURS_MSK:
                 time.sleep(60); continue
 
             # Скан в :45-:55 (окно :50)
@@ -1347,7 +1309,7 @@ def cmd_status():
 
     mode = _state.get("scan_mode", "off")
     mode_str = "🤖 Авто (вкл)" if mode == "auto" else "🔴 Выкл"
-    lines = ["", "━━━ 🚨 Anomaly Scanner A+ V14-final ━━━"]
+    lines = ["", "━━━ 🚨 Anomaly Scanner V15 ━━━"]
     lines.append(f"Режим: {mode_str}")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     tracked = _load_tracked()
@@ -1360,20 +1322,18 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"📅 Скан: :{SCAN_MINUTE:02d} каждого часа (кроме 23:00 МСК, V14-final)")
+    lines.append(f"📅 Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)")
     lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
-    lines.append(f"TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})")
-    lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч")
+    lines.append(f"🎯 Аномалии: LiqMagnet, TrendAlignment (2 шт)")
+    lines.append(f"⚡ Вход: MIN=1 (любая аномалия = сигнал)")
+    lines.append(f"🚫 LONG в BEAR: запрещён (PF 0.76 в бэктесте)")
+    lines.append(f"🎯 SL={SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR")
+    lines.append(f"🛡️ При TP1 → стоп в безубыток")
+    lines.append(f"⚡ Вход: MIN=1 (любая аномалия = сигнал)")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
-    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки, V14-final)")
-    lines.append(f"⛔ Blacklist после стопа: 48ч (V14, было 7д)")
-    lines.append(f"Аномалии: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion")
-    lines.append(f"BEAR фильтр: 3+ аномалии в BEAR → skip")
-    # V13.6: показываем версию + активные фичи
-    lines.append(f"🏷️ Версия: V14 (Task ID 78: 9 худших пар убраны + TP_COUNTER=2.0 + blacklist 48ч)")
-    if USE_SKIP_2_WEAK:
-        lines.append(f"✅ SKIP_2_WEAK: фильтрует 2 weak коррелированных")
-    lines.append(f"💪 STRONG аномалии (PF>1.4): Laggard, ZScoreDev, LiqMagnet")
+    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки)")
+    lines.append(f"⛔ Blacklist после стопа: 48ч")
+    lines.append(f"🏷️ Версия: V15 (2 аномалии + запрет LONG в BEAR)")
     _reset_daily_pnl_if_needed()
     long_pnl = _state.get("long_today_pnl", 0.0)
     short_pnl = _state.get("short_today_pnl", 0.0)
@@ -1406,7 +1366,35 @@ def cmd_on():
         _scanner_running = True
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="anomaly-scanner-cmd-on")
         _scanner_thread.start()
-    return f"🚨 Anomaly A+ (V14-final) включён.\nСкан: :{SCAN_MINUTE:02d} каждого часа (кроме 23:00 МСК)\nMAX_OPEN: {MAX_OPEN}\nАномалий: 5 (Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion)\nTP: TREND=COUNTER=2.0×ATR (RR 1:1)\n⏱️ Кулдаун по паре: 24ч (после любой сделки, V14-final)"
+    typical_atr = 2.5
+    sl_pct = SL_MULT * typical_atr
+    pos_size = RISK_USD / sl_pct * 100
+    tp_pct = TP_TREND * typical_atr
+    net_pct = tp_pct - (COMMISSION_PCT * 2 + SPREAD_PCT)
+    tp1_profit = net_pct * pos_size * TP1_FRACTION / 100
+    tp2_profit = net_pct * pos_size * TP2_FRACTION / 100
+    total_profit = tp1_profit + tp2_profit
+    
+    return (
+        f"🚨 <b>Anomaly V15 включён</b>\n\n"
+        f"📊 <b>Настройки:</b>\n"
+        f"💰 Risk: <b>${RISK_USD}</b>\n"
+        f"🎯 SL: <b>{SL_MULT}×ATR</b> (≈{sl_pct:.1f}%)\n"
+        f"📊 TP1 (70%): <b>{TP_TREND}×ATR</b> (≈{tp_pct:.1f}%)\n"
+        f"📊 TP2 (30%): <b>{TP_TREND}×ATR</b> (безубыток после TP1)\n"
+        f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
+        f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
+        f"⏰ Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)\n"
+        f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
+        f"🎯 Аномалии: LiqMagnet + TrendAlignment\n"
+        f"⚡ Вход: MIN=1 (любая = сигнал)\n"
+        f"🚫 LONG в BEAR: запрещён\n\n"
+        f"💡 <b>Прибыль с TP (ATR=2.5%):</b>\n"
+        f"  TP1 (70%) → +${tp1_profit:.0f}\n"
+        f"  TP2 (30%) → +${tp2_profit:.0f}\n"
+        f"  Итого → +${total_profit:.0f}\n"
+        f"🚀 Стратегия запущена"
+    )
 
 def cmd_off():
     _state["scan_mode"] = "off"
@@ -1463,15 +1451,16 @@ def start():
     print(f"[anomaly A+] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         B.send_telegram(
-            f"🚨 <b>Anomaly Scanner A+ V14-final запущен</b>\n"
-            f"📊 5 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion\n"
-            f"⏰ Скан: :{SCAN_MINUTE:02d} каждого часа (кроме 23:00 МСК)\n"
+            f"🚨 <b>Anomaly Scanner V15 запущен</b>\n"
+            f"📊 Аномалии: LiqMagnet + TrendAlignment (2 шт)\n"
+            f"⏰ Скан: :{SCAN_MINUTE:02d} с 04:00 до 22:00 МСК (пропуск 07:00 и 15:00)\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
-            f"🎯 TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})\n"
-            f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч\n"
-            f"🐻 BEAR фильтр: 3+ аномалии в BEAR → skip\n"
-            f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки, V14-final)\n"
-            f"⛔ Blacklist после стопа: 48ч (V14)\n"
+            f"⚡ Вход: MIN=1 (любая аномалия = сигнал)\n"
+            f"🚫 LONG в BEAR: запрещён\n"
+            f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP_TREND}×ATR | TP2({int(TP2_FRACTION*100)}%)={TP_COUNTER}×ATR\n"
+            f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
+            f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (после любой сделки)\n"
+            f"⛔ Blacklist после стопа: 48ч\n"
             f"💰 Комиссии: {COMMISSION_PCT*2}% + {SPREAD_PCT}% спред\n"
             f"Команды: /anomaly /anomaly_on /anomaly_off /anomaly_close /anomaly_clean"
         )
