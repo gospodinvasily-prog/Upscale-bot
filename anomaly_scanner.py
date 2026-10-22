@@ -760,7 +760,7 @@ def execute_trade(setup):
         "tp1_fraction": TP1_FRACTION,  # V15: 70% закрывается на TP1
         "tp2_fraction": TP2_FRACTION,  # V15: 30% остаётся с стопом в безубытке
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
-        "max_pos_usd": pos_size, "max_same_side": 1,
+        "max_pos_usd": pos_size, "max_same_side": 2,  # V15-fix: было 1 → блокировало 2-ю сделку в ту же сторону. Теперь 2 (= MAX_OPEN).
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
 
