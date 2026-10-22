@@ -204,6 +204,34 @@ def _atr(c, p=14):
     trs = [max(c[i]["high"]-c[i]["low"], abs(c[i]["high"]-c[i-1]["close"]), abs(c[i]["low"]-c[i-1]["close"])) for i in range(1, len(c))]
     return statistics.mean(trs[-p:]) if len(trs) >= p else statistics.mean(trs)
 
+def _adx(c, p=14):
+    """ADX (Average Directional Index) + Plus DI + Minus DI.
+    Возвращает (adx, plus_di, minus_di). При недостатке данных — (0, 0, 0).
+    Та же реализация, что в prophet_V15.py — для 6-й аномалии TrendAlignment.
+    """
+    if len(c) < p*2: return 0, 0, 0
+    pdm, mdm, trs = [], [], []
+    for i in range(1, len(c)):
+        h, l = c[i]["high"], c[i]["low"]
+        ph, pl = c[i-1]["high"], c[i-1]["low"]
+        u, d = h-ph, pl-l
+        pdm.append(u if (u>d and u>0) else 0)
+        mdm.append(d if (d>u and d>0) else 0)
+        pc = c[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    av = statistics.mean(trs[:p]); ps = statistics.mean(pdm[:p]); ms = statistics.mean(mdm[:p])
+    dxs = []
+    for i in range(p, len(trs)):
+        av = (av*(p-1)+trs[i])/p; ps = (ps*(p-1)+pdm[i])/p; ms = (ms*(p-1)+mdm[i])/p
+        if av > 0:
+            pdi = 100*ps/av; mdi = 100*ms/av
+            s = pdi+mdi
+            dxs.append(100*abs(pdi-mdi)/s if s > 0 else 0)
+    if len(dxs) < p: return 0, 0, 0
+    ax = statistics.mean(dxs[:p])
+    for dx in dxs[p:]: ax = (ax*(p-1)+dx)/p
+    return ax, 100*ps/av if av > 0 else 0, 100*ms/av if av > 0 else 0
+
 # === FETCH ===
 
 def _fetch(sym, iv, start_ts, end_ts):
