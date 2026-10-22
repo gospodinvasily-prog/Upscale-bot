@@ -199,12 +199,34 @@ def _update_side_pnl(direction: str, pnl: float):
     _save()
 
 def _fetch_current_price_for_sym(sym: str):
-    """Получить текущую рыночную цену для символа."""
+    """Получить текущую рыночную цену для символа.
+
+    V15-fix: Gate.io /ticker endpoint теперь требует заголовок Timestamp (поломан).
+    Используем /candlesticks (последняя свеча close) — работает без auth.
+    Fallback: Binance /ticker/price (работает без auth).
+    """
+    # Способ 1: Gate.io candlesticks — последняя свеча close
     try:
-        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{sym}_USDT"}, timeout=10)
+        r = _session.get(
+            f"{GATE_API}/candlesticks",
+            params={"currency_pair": f"{sym}_USDT", "interval": "15m", "limit": 1},
+            timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            if isinstance(data, list) and data:
+                # Gate.io candle: [ts, vol, close, high, low, open, base_vol, ok]
+                return float(data[0][2])
+    except: pass
+    # Способ 2: Binance как fallback
+    try:
+        r = _session.get(
+            f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT",
+            timeout=10
+        )
         if r.ok:
             d = r.json()
-            return float(d.get("last", 0))
+            return float(d.get("price", 0))
     except: pass
     return None
 
