@@ -183,20 +183,6 @@ def send_telegram(text):
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
-def send_telegram_with_buttons(text, markup):
-    """V13.12: Отправляет сообщение с inline-кнопками."""
-    text = _balance_html(text)
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                                     "disable_web_page_preview": True,
-                                     "reply_markup": json.dumps(markup)}, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[TG BUTTONS ERROR] {e}")
-        # Fallback: отправить просто текст
-        send_telegram(text)
-
 def send_document(path, caption=""):
     if not os.path.exists(path) or os.path.getsize(path) == 0: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
@@ -296,11 +282,7 @@ def tg_updates():
             if cb:
                 cb_data = cb.get("data", "")
                 if cb_data.startswith("prophet_") and PP is not None:
-                    try:
-                        result = PP.on_callback(cb_data)
-                        # V13.12: если on_callback вернул текст (для config кнопок) — отправляем
-                        if result and isinstance(result, str):
-                            send_telegram(result)
+                    try: PP.on_callback(cb_data)
                     except: pass
                 try:
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
@@ -339,19 +321,21 @@ HELP_TEXT = (
     "/prophet — статус\n"
     "/prophet_on — включить\n"
     "/prophet_off — выключить\n"
+    "/prophet_alerts — вкл/выкл уведомления (входы/TP1/TP2/SL)\n"
     "/prophet_close — закрыть позиции Prophet\n"
     "/prophet_clean — cleaner зависших\n"
-    "/prophet_config — ⚙️ настройки риска и TP (кнопки)\n"
     "\n<b>🚨 ANOMALY SCANNER A+</b>\n"
     "/anomaly — статус\n"
     "/anomaly_on — включить\n"
     "/anomaly_off — выключить\n"
+    "/anomaly_alerts — вкл/выкл уведомления (входы/TP1/TP2/SL)\n"
     "/anomaly_close — закрыть позиции Anomaly\n"
     "/anomaly_clean — cleaner зависших\n"
     "\n<b>🚨 BIG CANDLE (BTC скальпер)</b>\n"
     "/bc — статус\n"
     "/bc_on — включить\n"
     "/bc_off — выключить\n"
+    "/bc_alerts — вкл/выкл уведомления (входы/TP/SL)\n"
     "/bc_close — закрыть позицию\n"
     "/bc_stats — статистика\n"
     "/bc_manual [long|short] — принудительный вход с параметрами auto-сигнала\n"
@@ -507,16 +491,15 @@ def handle_command(text):
     if cmd == "/prophet_off":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_off()
+    if cmd == "/prophet_alerts":
+        if PP is None: return "⚠️ Prophet не загружен"
+        return PP.cmd_alerts_toggle()
     if cmd == "/prophet_close":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_close()
     if cmd == "/prophet_clean":
         if PP is None: return "⚠️ Prophet не загружен"
         return PP.cmd_clean()
-    if cmd == "/prophet_config":
-        if PP is None: return "⚠️ Prophet не загружен"
-        # V13.12: возвращаем словарь с текстом и inline-клавиатурой
-        return PP.cmd_config()
 
     # ─── Anomaly Scanner A+ ──────────────────────────────────────────────────
     if cmd == "/anomaly":
@@ -528,6 +511,9 @@ def handle_command(text):
     if cmd == "/anomaly_off":
         if ANOM is None: return "⚠️ Anomaly не загружен"
         return ANOM.cmd_off()
+    if cmd == "/anomaly_alerts":
+        if ANOM is None: return "⚠️ Anomaly не загружен"
+        return ANOM.cmd_alerts_toggle()
     if cmd == "/anomaly_close":
         if ANOM is None: return "⚠️ Anomaly не загружен"
         return ANOM.cmd_close()
@@ -545,6 +531,9 @@ def handle_command(text):
     if cmd == "/bc_off":
         if BCS is None: return "⚠️ BC не загружен"
         return BCS.cmd_off()
+    if cmd == "/bc_alerts":
+        if BCS is None: return "⚠️ BC не загружен"
+        return BCS.cmd_alerts_toggle()
     if cmd == "/bc_close":
         if BCS is None: return "⚠️ BC не загружен"
         return BCS.cmd_close()
@@ -570,11 +559,7 @@ def poll_commands():
             answer = f"Ошибка: {esc(str(e))}"
         if answer:
             print(f"[CMD] {text}")
-            # V13.12: поддержка inline-клавиатур (если answer - словарь)
-            if isinstance(answer, dict):
-                send_telegram_with_buttons(answer.get("text", ""), answer.get("markup"))
-            else:
-                send_telegram(answer)
+            send_telegram(answer)
 
 # ─── SHUTDOWN ─────────────────────────────────────────────────────────────────
 import signal as _signal

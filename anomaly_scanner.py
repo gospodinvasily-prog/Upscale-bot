@@ -123,6 +123,7 @@ _tracked_lock = threading.Lock()
 
 _state = {
     "scan_mode": "off",
+    "alerts_enabled": True,  # V15-fix: уведомления в TG (можно вкл/выкл через /anomaly_alerts)
     "last_scan_ts": 0,
     "trades_today": 0,
     "trades_today_date": "",
@@ -138,6 +139,7 @@ _stats = {"scans": 0, "signals": 0, "trades": 0, "wins": 0, "losses": 0, "pnl": 
 
 _scanner_thread = None
 _watchdog_thread = None
+_manager_thread = None
 _scanner_running = False
 
 # === УТИЛИТЫ ===
@@ -264,11 +266,22 @@ def _btc_regime(at_ts):
     return +1 if bc[-1]["close"] > sma else -1
 
 def _fetch_current_price(sym):
+    """V15-fix: Gate.io /ticker endpoint поломан (требует Timestamp header).
+    Используем /candlesticks (последняя свеча close) + Binance fallback.
+    """
     try:
-        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{sym}_USDT"}, timeout=10)
+        r = _session.get(f"{GATE_API}/candlesticks",
+                         params={"currency_pair": f"{sym}_USDT", "interval": "15m", "limit": 1},
+                         timeout=10)
         if r.ok:
-            d = r.json()
-            return float(d.get("last", 0))
+            data = r.json()
+            if isinstance(data, list) and data:
+                return float(data[0][2])
+    except: pass
+    try:
+        r = _session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT", timeout=10)
+        if r.ok:
+            return float(r.json().get("price", 0))
     except: pass
     return None
 
@@ -972,6 +985,39 @@ def manage_positions():
                 )
             if pnl > 0: _stats["wins"] += 1
             else: _stats["losses"] += 1
+            # V15-fix: уведомление о закрытии позиции (TP2/SL/timeout)
+            if _state.get("alerts_enabled", True) and B:
+                sym_name = rec.get("sym", "?")
+                direction = rec.get("direction", rec.get("dir", "long"))
+                emoji_dir = "🟢 LONG" if direction in ("LONG", "long") else "🔴 SHORT"
+                entry_price = rec.get("entry", 0)
+                hold_sec = int(now - rec.get("opened_ts", now))
+                hold_min = hold_sec // 60
+                tp1_hit = rec.get("tp1_hit", False)
+                if pnl > 0:
+                    # Прибыльное закрытие
+                    if tp1_hit:
+                        # Был TP1 → это TP2 (финальное закрытие runner)
+                        tp2_str = " (TP2 — финал runner)"
+                    else:
+                        tp2_str = " (TP1+TP2 сразу)"
+                    B.send_telegram(
+                        f"✅ <b>ANOMALY: {sym_name} {emoji_dir} ЗАКРЫТА В ПЛЮС</b>\n"
+                        f"💰 PnL: ${pnl:+.2f}\n"
+                        f"📍 Вход: ${entry_price:.6g}\n"
+                        f"⏱️ Hold: {hold_min}мин{tp2_str}"
+                    )
+                else:
+                    # Убыточное закрытие (SL или timeout)
+                    hold_h = hold_sec // 3600
+                    reason = f"тайм-аут {hold_h}ч" if hold_sec >= MAX_HOLD_SEC else "стоп-лосс"
+                    B.send_telegram(
+                        f"❌ <b>ANOMALY: {sym_name} {emoji_dir} ЗАКРЫТА В УБЫТОК</b>\n"
+                        f"💸 PnL: ${pnl:+.2f}\n"
+                        f"📍 Вход: ${entry_price:.6g}\n"
+                        f"⏱️ Hold: {hold_min}мин\n"
+                        f"📝 Причина: {reason}"
+                    )
             del tracked[pid]; changed = True
         else:
             # V15: Проверка TP1 → перестановка стопа в безубыток
@@ -983,12 +1029,7 @@ def manage_positions():
                     direction = rec.get("direction", rec.get("dir", "long"))
                     is_long = direction in ("LONG", "long")
                     
-                    cur_price = None
-                    try:
-                        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{rec['sym']}_USDT"}, timeout=10)
-                        if r.ok:
-                            cur_price = float(r.json().get("last", 0))
-                    except: pass
+                    cur_price = _fetch_current_price(rec['sym'])
                     
                     if cur_price and entry and tp_price:
                         tp1_reached = False
@@ -1083,10 +1124,8 @@ def _scanner_loop():
                 _state["trades_today_date"] = _today()
                 _save()
 
-            # Manage positions
-            try: manage_positions()
-            except Exception as e:
-                print(f"[anomaly A+] manage_positions error: {e}")
+            # V15-fix: manage_positions() вызывается из отдельного _manager_loop() потока,
+            # который работает ВСЕГДА (даже при mode="off"). Здесь убран вызов из скан-лупа.
 
             # Auto-sync orphans
             try:
@@ -1454,6 +1493,13 @@ def cmd_off():
     _save()
     return "🔴 Anomaly A+ выключен. Открытые позиции продолжают работать."
 
+def cmd_alerts_toggle():
+    """V15-fix: Переключение уведомлений в Telegram (входы/TP1/TP2/SL)."""
+    _state["alerts_enabled"] = not _state.get("alerts_enabled", True)
+    _save()
+    state_str = "ВКЛ ✅" if _state["alerts_enabled"] else "ВЫКЛ 🔕"
+    return f"🔔 Anomaly уведомления: {state_str}"
+
 def cmd_close():
     if not B or not hasattr(B, "EXECUTOR"): return "⚠️ Executor недоступен"
     executor = B.EXECUTOR
@@ -1490,6 +1536,18 @@ def cmd_clean():
 
 # === START ===
 
+def _manager_loop():
+    """V15-fix: Отдельный поток управления позициями — работает ВСЕГДА,
+    даже при mode='off'. Проверяет TP1, двигает стоп в безубыток,
+    проверяет тайм-ауты. Интервал 30с (как в Big Candle)."""
+    print(f"[anomaly A+] Manager запущен: интервал 30с (работает даже при OFF)")
+    while True:
+        try:
+            manage_positions()
+        except Exception as e:
+            print(f"[anomaly A+] manager error: {e}")
+        time.sleep(30)
+
 def start():
     _load()
     _reset_daily_pnl_if_needed()
@@ -1501,6 +1559,11 @@ def start():
     if _watchdog_thread is None:
         _watchdog_thread = threading.Thread(target=_scanner_watchdog, daemon=True, name="anomaly-watchdog")
         _watchdog_thread.start()
+    # V15-fix: запускаем manager thread — работает ВСЕГДА (даже при mode='off')
+    global _manager_thread
+    if _manager_thread is None or not _manager_thread.is_alive():
+        _manager_thread = threading.Thread(target=_manager_loop, daemon=True, name="anomaly-manager")
+        _manager_thread.start()
     print(f"[anomaly A+] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         mode = _state.get('scan_mode','off')
@@ -1516,7 +1579,7 @@ def start():
             f"🎯 SL: {SL_MULT}×ATR\n"
             f"📊 TP1 (70%): {TP1_MULT}×ATR\n"
             f"📊 TP2 (30%): {TP2_MULT}×ATR\n"
-            f"🛡️ При TP1 → стоп в безубыток\n"
+            f"🛡️ При TP1 → стоп в безубыток (работает даже при OFF)\n"
             f"⏱️ Кулдаун: {SYMBOL_COOLDOWN_SEC//3600}ч | Blacklist: 48ч\n"
             f"Команды: /anomaly /anomaly_on /anomaly_off /anomaly_close /anomaly_clean"
         )

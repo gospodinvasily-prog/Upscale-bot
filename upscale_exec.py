@@ -1439,8 +1439,35 @@ class Executor:
                 if strat:
                     t["strategy"] = strat
 
-        closed = [t for t in trades.values() if t["pnl"] != 0]
-        # V13.11: avg hold time
+        # === V15-fix: ИСКЛЮЧАЕМ ОТКРЫТЫЕ ПОЗИЦИИ ИЗ "ЗАКРЫТЫХ" ===
+        # Раньше: позиция с TP1 hit (70% закрыто, 30% ещё работает) считалась
+        # "закрытой" по order history (realizedPnl ≠ 0). Это завышало счётчик
+        # сделок и WinRate — фактически открытый runner попадал в итоги.
+        # Теперь: получаем live position IDs и исключаем их.
+        live_pos_ids = set()
+        try:
+            for p in self._positions():
+                pid = _pos_id(p)
+                if pid:
+                    live_pos_ids.add(pid)
+        except: pass
+
+        # Все закрытые сделки (pnl ≠ 0) + исключаем те что ещё открыты
+        all_closed = [t for t in trades.values() if t["pnl"] != 0 and t.get("sym") is not None]
+        # V15-fix: исключаем позиции которые ещё открыты (TP1 hit но TP2/SL ещё не сработал)
+        closed = []
+        for t in all_closed:
+            # Проверяем по positionId — если он есть в live, значит позиция ещё активна
+            key = None
+            for k, v in trades.items():
+                if v is t:
+                    key = k
+                    break
+            if key and key in live_pos_ids:
+                continue  # позиция ещё открыта — не считаем как закрытую
+            closed.append(t)
+
+        # avg hold time
         for t in closed:
             if t.get("first_ts") and t.get("ts"):
                 t["hold_hours"] = (t["ts"] - t["first_ts"]) / 3600
@@ -1456,42 +1483,69 @@ class Executor:
                     open_n += 1
         except: pass
 
-        # V13.11: заголовок с инфой о покрытии
+        # === V15-fix: РАЗДЕЛЯЕМ АВТО И РУЧНЫЕ СДЕЛКИ ===
+        # auto_closed = позиции с известной стратегией (зарегистрированы в registry)
+        # manual_closed = позиции без стратегии (входили руками через приложение)
+        auto_closed = [t for t in closed if t.get("strategy")]
+        manual_closed = [t for t in closed if not t.get("strategy")]
+
+        # V15-fix: заголовок с инфой о покрытии
         L.append(f"📊 Период: {days} дн | Пар: {len(syms) - len(failed)}/{len(syms)} | "
-                 f"Ордеров: {n_ord} | Сделок: {len(closed)}")
+                 f"Ордеров: {n_ord} | Сделок: {len(closed)} (авто: {len(auto_closed)} | ручных: {len(manual_closed)})")
         if failed:
             L.append(f"⚠️ не ответили {len(failed)} рынков — итог неполный")
         if not closed and not open_n:
             return "\n".join(L + ["За период сделок нет."])
 
-        # V13.11: основные метрики
-        tot = sum((t["pnl"] for t in closed), Decimal(0))
-        wins = [t for t in closed if t["pnl"] > 0]
-        losses = [t for t in closed if t["pnl"] <= 0]
+        # === V15-fix: ОСНОВНЫЕ МЕТРИКИ — ТОЛЬКО АВТОМАТИЧЕСКИЕ СДЕЛКИ ===
         risk = Decimal(str(self.risk_usd)) or Decimal(1)
-        n = len(closed)
-        if n:
+        n_auto = len(auto_closed)
+        if n_auto:
+            tot_auto = sum((t["pnl"] for t in auto_closed), Decimal(0))
+            wins = [t for t in auto_closed if t["pnl"] > 0]
+            losses = [t for t in auto_closed if t["pnl"] <= 0]
             gl = abs(sum((t["pnl"] for t in losses), Decimal(0)))
             gp = sum((t["pnl"] for t in wins), Decimal(0))
             pf = (gp / gl) if gl > 0 else Decimal(0)
-            wr = len(wins) / n * 100
-            avg_hold = sum(t.get("hold_hours", 0) for t in closed) / n if n else 0
-            best = max(closed, key=lambda t: t["pnl"])
-            worst = min(closed, key=lambda t: t["pnl"])
+            wr = len(wins) / n_auto * 100
+            avg_hold = sum(t.get("hold_hours", 0) for t in auto_closed) / n_auto
+            best = max(auto_closed, key=lambda t: t["pnl"])
+            worst = min(auto_closed, key=lambda t: t["pnl"])
 
             L += ["",
-                  f"━━━ 📈 ИТОГИ за {days} дн ━━━",
-                  f"Сделок: {n} | TP: {len(wins)} ✅ | SL: {len(losses)} ❌",
+                  f"━━━ 🤖 АВТО-ТОРГОВЛЯ за {days} дн ━━━",
+                  f"Сделок: {n_auto} | TP: {len(wins)} ✅ | SL: {len(losses)} ❌",
                   f"Винрейт: <b>{wr:.0f}%</b> | Профит-фактор: <b>{pf:.2f}</b>",
-                  f"Итог: <b>${tot:+.2f}</b> = {tot/risk:+.2f}R | средняя {tot/n/risk:+.3f}R (${tot/n:+.2f})",
+                  f"Итог: <b>${tot_auto:+.2f}</b> = {tot_auto/risk:+.2f}R | средняя {tot_auto/n_auto/risk:+.3f}R (${tot_auto/n_auto:+.2f})",
                   f"⏱️ Avg hold: {avg_hold:.1f}ч | TP avg: ${gp/max(1,len(wins)):+.2f} | SL avg: ${-gl/max(1,len(losses)):+.2f}"]
             if best and worst:
                 L.append(f"🏆 Лучшая: {best['sym']} ${best['pnl']:+.2f} | Худшая: {worst['sym']} ${worst['pnl']:+.2f}")
-        if open_n:
-            L.append(f"📂 Открыто: {open_n} поз, ${open_pnl:+.2f} (в балансе уже есть)")
-            L.append(f"💰 За период всего: ${tot + open_pnl:+.2f}")
+        else:
+            L += ["", "━━━ 🤖 АВТО-ТОРГОВЛЯ ━━━", "Автоматических сделок за период нет."]
 
-        # V13.11: баланс
+        # === V15-fix: РУЧНЫЕ СДЕЛКИ — ОТДЕЛЬНО ===
+        if manual_closed:
+            tot_manual = sum((t["pnl"] for t in manual_closed), Decimal(0))
+            m_wins = [t for t in manual_closed if t["pnl"] > 0]
+            m_losses = [t for t in manual_closed if t["pnl"] <= 0]
+            m_wr = len(m_wins) / len(manual_closed) * 100 if manual_closed else 0
+            L += ["",
+                  f"━━━ ✋ РУЧНЫЕ СДЕЛКИ ━━━",
+                  f"Сделок: {len(manual_closed)} | TP: {len(m_wins)} ✅ | SL: {len(m_losses)} ❌",
+                  f"Винрейт: {m_wr:.0f}% | Итог: <b>${tot_manual:+.2f}</b>"]
+        else:
+            L += ["", "━━━ ✋ РУЧНЫЕ СДЕЛКИ ━━━", "Ручных сделок за период нет."]
+
+        # === ОБЩИЙ ИТОГ ===
+        tot_all = sum((t["pnl"] for t in closed), Decimal(0))
+        if open_n:
+            L.append(f"\n📂 Открыто: {open_n} поз, ${open_pnl:+.2f} (в балансе уже есть)")
+            L.append(f"💰 За период всего: ${tot_all + open_pnl:+.2f} (авто ${tot_auto if n_auto else 0:+.2f} + ручные ${tot_manual if manual_closed else 0:+.2f} + открытые ${open_pnl:+.2f})")
+        else:
+            if n_auto and manual_closed:
+                L.append(f"\n💰 За период всего: ${tot_all:+.2f} (авто ${tot_auto:+.2f} + ручные ${tot_manual:+.2f})")
+
+        # баланс
         try:
             snap = self._snapshot()
             if snap:
@@ -1502,26 +1556,26 @@ class Executor:
         if adj_cnt:
             L.append(f"⚠️ корректировка 60с применена к {adj_cnt} ордерам")
 
-        # V13.11: по дням с WR
+        # === V15-fix: ПО ДНЯМ — только авто-сделки ===
         byday = {}
-        for t in closed:
+        for t in auto_closed:
             d = datetime.fromtimestamp(t["ts"], timezone.utc).strftime("%d.%m")
             a = byday.setdefault(d, {"n": 0, "pnl": Decimal(0), "wins": 0})
             a["n"] += 1
             a["pnl"] += t["pnl"]
             if t["pnl"] > 0: a["wins"] += 1
         if byday:
-            L += ["", "━━━ 📅 По дням (UTC) ━━━"]
+            L += ["", "━━━ 📅 По дням (UTC) — авто ━━━"]
             for d in sorted(byday):
                 a = byday[d]
                 wr_d = a["wins"]/a["n"]*100 if a["n"] else 0
                 emoji = "✅" if a["pnl"] > 0 else "❌"
                 L.append(f"  {d}: {a['n']:2} сд, WR {wr_d:.0f}%, ${a['pnl']:+7.2f} = {a['pnl']/risk:+.2f}R {emoji}")
 
-        # V13.11: по стратегиям
+        # === V15-fix: ПО СТРАТЕГИЯМ ===
         bystrat = {}
-        for t in closed:
-            s = t.get("strategy") or "unknown"
+        for t in auto_closed:
+            s = t.get("strategy", "unknown")
             a = bystrat.setdefault(s, {"n": 0, "pnl": Decimal(0), "wins": 0})
             a["n"] += 1
             a["pnl"] += t["pnl"]
@@ -1529,30 +1583,27 @@ class Executor:
         if bystrat:
             L += ["", "━━━ 🤖 По стратегиям ━━━"]
             strat_names = {
-                "prophet_v12": "🔮 Prophet V12",
-                "anomaly_aplus": "🚨 Anomaly A+",
+                "prophet_v13": "🔮 Prophet V15",
+                "anomaly_v1": "🚨 Anomaly A+",
                 "big_candle_v1": "🚨 Big Candle",
-                "unknown": "❓ Unknown/Manual",
             }
             for s, a in sorted(bystrat.items(), key=lambda kv: -kv[1]["pnl"]):
                 name = strat_names.get(s, s)
                 wr_s = a["wins"]/a["n"]*100 if a["n"] else 0
                 L.append(f"  {name}: {a['n']:2} сд, WR {wr_s:.0f}%, ${a['pnl']:+7.2f}")
 
-        # V13.11: по монетам
+        # === V15-fix: ПО МОНЕТАМ — все сделки (авто + ручные) ===
         bysym = {}
         for t in closed:
             a = bysym.setdefault(t["sym"], [0, Decimal(0)])
             a[0] += 1
             a[1] += t["pnl"]
         if bysym:
-            L += ["", "━━━ 💎 По монетам ━━━"]
+            L += ["", "━━━ 💎 По монетам (все сделки) ━━━"]
             for sym, (c_, p_) in sorted(bysym.items(), key=lambda kv: -kv[1][1]):
                 emoji = "✅" if p_ > 0 else "❌"
                 L.append(f"  {sym:10} {c_:2} сд  ${p_:+7.2f} {emoji}")
 
-        # V13.11: обновлённый benchmark
-        L += ["", f"<i>Бэктест V13.11: Prophet PF 1.71 WR 63% (+0.32R/сделку) | Anomaly PF 4.14 WR 84% (+0.69R/сделку)</i>"]
         return "\n".join(L)
 
     def status(self) -> str:

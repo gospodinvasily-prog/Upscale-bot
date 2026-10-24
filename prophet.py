@@ -147,6 +147,7 @@ _pending_signals_lock = threading.Lock()  # V12: lock для pending confirmatio
 
 _state = {
     "scan_mode": "off",  # off / single / continuous / auto
+    "alerts_enabled": True,  # V15-fix: уведомления в TG (входы/TP1/TP2/SL)
     "last_scan_ts": 0,
     "last_signal_ts": 0,
     "pending_signal": None,  # ждёт ответа по кнопке (старый flow, для single)
@@ -1045,14 +1046,10 @@ def _confirmation_worker(setup, fire_ts: int):
         except: pass
 
 def _fetch_current_price(sym: str):
-    """Получает текущую рыночную цену."""
-    try:
-        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{sym}_USDT"}, timeout=10)
-        if r.ok:
-            d = r.json()
-            return float(d.get("last", 0))
-    except: pass
-    return None
+    """V15-fix: Redirect to _fetch_current_price_for_sym() which uses candlesticks + Binance.
+    Старая версия использовала сломанный Gate.io /ticker endpoint.
+    """
+    return _fetch_current_price_for_sym(sym)
 
 # === TRADE EXECUTION (V12: LONG + SHORT) ===
 
@@ -1422,6 +1419,36 @@ def manage_positions():
                 )
             if pnl > 0: _stats["wins"] += 1
             else: _stats["losses"] += 1
+            # V15-fix: уведомление о закрытии позиции (TP2/SL/timeout)
+            if _state.get("alerts_enabled", True) and B:
+                sym_name = rec.get("sym", "?")
+                direction = rec.get("direction", rec.get("dir", "long"))
+                emoji_dir = "🟢 LONG" if direction in ("LONG", "long") else "🔴 SHORT"
+                entry_price = rec.get("entry", 0)
+                hold_sec = int(now - rec.get("opened_ts", now))
+                hold_min = hold_sec // 60
+                tp1_hit = rec.get("tp1_hit", False)
+                if pnl > 0:
+                    if tp1_hit:
+                        tp2_str = " (TP2 — финал runner)"
+                    else:
+                        tp2_str = " (TP1+TP2 сразу)"
+                    B.send_telegram(
+                        f"✅ <b>PROPHET: {sym_name} {emoji_dir} ЗАКРЫТА В ПЛЮС</b>\n"
+                        f"💰 PnL: ${pnl:+.2f}\n"
+                        f"📍 Вход: ${entry_price:.6g}\n"
+                        f"⏱️ Hold: {hold_min}мин{tp2_str}"
+                    )
+                else:
+                    hold_h = hold_sec // 3600
+                    reason = f"тайм-аут {hold_h}ч" if hold_sec >= MAX_HOLD else "стоп-лосс"
+                    B.send_telegram(
+                        f"❌ <b>PROPHET: {sym_name} {emoji_dir} ЗАКРЫТА В УБЫТОК</b>\n"
+                        f"💸 PnL: ${pnl:+.2f}\n"
+                        f"📍 Вход: ${entry_price:.6g}\n"
+                        f"⏱️ Hold: {hold_min}мин\n"
+                        f"📝 Причина: {reason}"
+                    )
             del tracked[pid]; changed = True
         else:
             # V15: Проверка TP1 → перестановка стопа в безубыток
@@ -1434,13 +1461,8 @@ def manage_positions():
                     direction = rec.get("direction", rec.get("dir", "long"))
                     is_long = direction in ("LONG", "long")
                     
-                    # Получаем текущую цену для проверки
-                    cur_price = None
-                    try:
-                        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{rec['sym']}_USDT"}, timeout=10)
-                        if r.ok:
-                            cur_price = float(r.json().get("last", 0))
-                    except: pass
+                    # V15-fix: используем _fetch_current_price_for_sym (candlesticks + Binance)
+                    cur_price = _fetch_current_price_for_sym(rec['sym'])
                     
                     if cur_price and entry and tp_price:
                         tp1_reached = False
@@ -1495,6 +1517,7 @@ def manage_positions():
 _scanner_thread = None
 _scanner_stop_event = threading.Event()  # V13.7 FIX P0-3: замена _scanner_running flag (atomic)
 _watchdog_thread = None
+_manager_thread = None  # V15-fix: отдельный поток для manage_positions()
 
 def _scanner_loop():
     """V12-FINAL: Главный цикл — сканы в HH:30 МСК каждый час из AUTO_HOURS_MSK."""
@@ -1788,6 +1811,13 @@ def cmd_off():
     _state["pending_signal"] = None
     _save()
     return "🔴 Prophet V12 выключен. Открытые позиции продолжают работать."
+
+def cmd_alerts_toggle():
+    """V15-fix: Переключение уведомлений в Telegram (входы/TP1/TP2/SL)."""
+    _state["alerts_enabled"] = not _state.get("alerts_enabled", True)
+    _save()
+    state_str = "ВКЛ ✅" if _state["alerts_enabled"] else "ВЫКЛ 🔕"
+    return f"🔔 Prophet уведомления: {state_str}"
 
 def cmd_close():
     if not B or not hasattr(B, "EXECUTOR"): return "⚠️ Executor недоступен"
@@ -2166,6 +2196,22 @@ def _scanner_watchdog():
         except Exception as e:
             print(f"[prophet V13.12] watchdog error: {e}")
 
+def _manager_loop():
+    """V15-fix: Отдельный поток управления позициями — работает ВСЕГДА,
+    даже при mode='off'. Проверяет TP1, двигает стоп в безубыток,
+    проверяет тайм-ауты. Интервал 30с (как в Big Candle).
+
+    ДО ФИКСА: manage_positions() вообще нигде не вызывалась →
+    TP1→безубыток в Prophet никогда не работал автоматически.
+    """
+    print(f"[prophet V15] Manager запущен: интервал 30с (работает даже при OFF)")
+    while True:
+        try:
+            manage_positions()
+        except Exception as e:
+            print(f"[prophet V15] manager error: {e}")
+        time.sleep(30)
+
 def start():
     _load()
     _reset_daily_pnl_if_needed()
@@ -2178,7 +2224,12 @@ def start():
     if _watchdog_thread is None:
         _watchdog_thread = threading.Thread(target=_scanner_watchdog, daemon=True, name="prophet-watchdog")
         _watchdog_thread.start()
-    print(f"[prophet V13.12] Старт: режим={_state.get('scan_mode','off')}")
+    # V15-fix: запускаем manager thread — работает ВСЕГДА (даже при mode='off')
+    global _manager_thread
+    if _manager_thread is None or not _manager_thread.is_alive():
+        _manager_thread = threading.Thread(target=_manager_loop, daemon=True, name="prophet-manager")
+        _manager_thread.start()
+    print(f"[prophet V15] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         mode = _state.get('scan_mode','off')
         mode_str = "🟢 ВКЛ (авто)" if mode == "auto" else "🔴 ВЫКЛ"
@@ -2190,7 +2241,7 @@ def start():
             f"🎯 SL: {SL_MULT}×ATR\n"
             f"📊 TP1 (70%): {TP1_MULT}×ATR\n"
             f"📊 TP2 (30%): {TP2_MULT}×ATR\n"
-            f"🛡️ При TP1 → стоп в безубыток\n"
+            f"🛡️ При TP1 → стоп в безубыток (работает даже при OFF)\n"
             f"📌 Пирамидинг: новые только если предыдущие в плюсе\n"
             f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'}\n"
             f"Команды: /prophet /prophet_on /prophet_off /prophet_close /prophet_clean /prophet_config"
