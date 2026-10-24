@@ -41,7 +41,7 @@ try:
 except Exception:
     UE = None
 
-STRATEGY_TAG = "prophet_v13"
+STRATEGY_TAG = "prophet_v16"
 GATE_API = "https://api.gateio.ws/api/v4/spot"
 MSK = dt.timezone(dt.timedelta(hours=3))
 
@@ -1250,7 +1250,7 @@ def execute_trade(setup):
         emoji_dir = "🟢 LONG" if side == "long" else "🔴 SHORT"
         if B:
             B.send_telegram(
-                f"✅ <b>ПРОРОК V15: {sym} {emoji_dir} открыт</b>\n"
+                f"✅ <b>ПРОРОК V16: {sym} {emoji_dir} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
                 f"📊 TP1 (70%): ${tp1_price:.6g} ({tp1_pct:.1f}%)\n"
@@ -1311,6 +1311,120 @@ def execute_trade(setup):
 
 # === POSITION MANAGEMENT ===
 
+def _fetch_realized_pnl(executor, rec, pid):
+    """V16: правильно ищет realized PnL позиции в orders_history.
+    
+    Что исправлено vs старого кода:
+    1. from_fp9 — Upscale хранит PnL как fixed-point9 ("24300000000" = $24.30).
+       float() давал 24e9, нужно UE.from_fp9().
+    2. Retry до 3 раз — API часто возвращает пустой список с первого раза.
+    3. Пробуем ОБА варианта asset: market_id И тикер (sym).
+    4. Суммируем PnL ВСЕХ ордеров после opened_ts (TP1, TP2, финал — это разные ордера).
+    
+    Реальный кейс 2026-10-24: SUI SHORT — TP в 03:47 (+$24.30) и закрытие
+    в 14:28 (+$43.37) = $67.67. Старый код возвращал $0.00.
+    """
+    if not executor or not executor.client or not executor.account_id:
+        return 0.0
+    
+    sym = rec.get("sym", "")
+    opened_ts = rec.get("opened_ts", 0)
+    if not sym or not opened_ts:
+        return 0.0
+    
+    # Готовим варианты asset: market_id и тикер
+    assets_to_try = []
+    try:
+        if executor._mk:
+            m = executor._mk.get(sym)
+            if m:
+                mid = str(m.get("id", "")).strip()
+                if mid:
+                    assets_to_try.append(mid)
+    except: pass
+    if sym and sym not in assets_to_try:
+        assets_to_try.append(sym)
+    
+    if not assets_to_try:
+        return 0.0
+    
+    # Helper: парсинг PnL (как _money в upscale_exec.py history)
+    def _parse_pnl(pv):
+        if pv is None: return None
+        t = str(pv).strip()
+        if not t or t in ("None", "null", "0"):
+            # "0" — это входной ордер (entry), PnL = 0, пропускаем
+            return None
+        try:
+            # Если число с точкой или экспонентой — это уже float
+            if "." in t or "e" in t.lower():
+                return float(t)
+            # Иначе это fixed-point9 — конвертируем
+            return float(UE.from_fp9(t))
+        except:
+            return None
+    
+    # Helper: парсинг ts (как _when в upscale_exec.py)
+    def _parse_ts(o):
+        for k in ("closedAt", "filledAt", "updatedAt", "createdAt"):
+            v = o.get(k)
+            if not v: continue
+            try:
+                if isinstance(v, str) and "T" in v:
+                    return dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                fv = float(v)
+                return fv / 1000 if fv > 1e11 else fv
+            except: continue
+        return 0
+    
+    total_pnl = 0.0
+    found_any = False
+    
+    for asset in assets_to_try:
+        data = None
+        # V16: 3 попытки с backoff (как в upscale_exec.py history)
+        for attempt in range(3):
+            try:
+                data = executor.client.orders_history(executor.account_id, asset, 100)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"[prophet V16] orders_history({asset}) failed 3x: {e}")
+                else:
+                    time.sleep(0.5 * (attempt + 1))
+        
+        if data is None:
+            continue
+        
+        orders = UE._as_list(data)
+        if not orders:
+            continue
+        
+        # V16: суммируем все ордера после opened_ts - 60 (TP1, TP2, финал)
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            ts = _parse_ts(o)
+            if not ts:
+                continue
+            if ts < opened_ts - 60:
+                continue
+            pv = _parse_pnl(o.get("realizedPnl"))
+            if pv is None:
+                continue
+            total_pnl += pv
+            found_any = True
+            o_pid = str(o.get("positionId", "") or o.get("id", "") or "")
+            print(f"[prophet V16] {sym} asset={asset}: order ts={ts:.0f} "
+                  f"pid={o_pid[:8] if o_pid else '-'} pnl=${pv:+.2f} "
+                  f"running=${total_pnl:+.2f}")
+        
+        if found_any:
+            break
+    
+    return total_pnl
+
+
 def manage_positions():
     if not B or not hasattr(B, "EXECUTOR"): return
     executor = B.EXECUTOR
@@ -1361,30 +1475,25 @@ def manage_positions():
             continue
 
         if pid not in live_ids:
-            pnl = 0
-            try:
-                m = executor._mk.get(rec["sym"]) if executor._mk else None
-                if m:
-                    asset = str(m.get("id","")) or rec["sym"]
-                    data = executor.client.orders_history(executor.account_id, asset, 50)
-                    for o in UE._as_list(data):
-                        if isinstance(o, dict):
-                            ts_str = o.get("closedAt") or o.get("filledAt") or o.get("updatedAt") or o.get("createdAt")
-                            if ts_str:
-                                try:
-                                    if isinstance(ts_str, str) and "T" in ts_str:
-                                        ots = dt.datetime.fromisoformat(ts_str.replace("Z","+00:00")).timestamp()
-                                    elif float(ts_str) > 1e11: ots = float(ts_str)/1000
-                                    else: ots = float(ts_str)
-                                    if ots >= rec.get("opened_ts", 0) - 60:
-                                        pv = o.get("realizedPnl")
-                                        if pv is not None:
-                                            t = str(pv).strip()
-                                            if t and t not in ("None","null"):
-                                                try: pnl += float(t)
-                                                except: pass
-                                except: pass
-            except: pass
+            # V16 FIX: правильный поиск realized PnL через orders_history.
+            # Старый код парсил realizedPnl как float() — но на Upscale PnL хранится
+            # как fixed-point9 ("24300000000" = $24.30), и float() давал 24e9 вместо $24.30.
+            # Также: один вызов orders_history без retry часто возвращает пустой список.
+            # Также: TP1, TP2 и финальное закрытие — это разные ордера, их надо
+            # суммировать (Multi-TP логика Prophet).
+            # Реальный кейс 2026-10-24: SUI SHORT — TP в 03:47 (+$24.30) и закрытие
+            # в 14:28 (+$43.37) = $67.67. Бот показал $0.00.
+            pnl = _fetch_realized_pnl(executor, rec, pid)
+            debug_pnl_source = pnl  # для лога ниже
+
+            # V16 DEBUG: логируем найденный PnL
+            if abs(debug_pnl_source) < 0.01:
+                print(f"[prophet V16] ⚠ {rec.get('sym','?')} pid={pid}: "
+                      f"realizedPnl не найден в orders_history! gross=$0.00 — "
+                      f"проверь API Upscale / формат asset")
+            else:
+                print(f"[prophet V16] {rec.get('sym','?')} pid={pid}: "
+                      f"realized gross=${debug_pnl_source:+.2f}")
 
             _stats["pnl"] += pnl
             # V13.12: обновляем per-side daily PnL
@@ -1490,9 +1599,9 @@ def manage_positions():
                                             f"Стоп перенесён на цену входа: ${entry:.6g}\n"
                                             f"Остаток 30% работает без риска"
                                         )
-                                    print(f"[prophet V15] {rec['sym']}: TP1 hit → стоп в безубыток ${entry:.6g}")
+                                    print(f"[prophet V16] {rec['sym']}: TP1 hit → стоп в безубыток ${entry:.6g}")
                                 except Exception as e:
-                                    print(f"[prophet V15] {rec['sym']}: move_stop error: {e}")
+                                    print(f"[prophet V16] {rec['sym']}: move_stop error: {e}")
             
             hold = now - rec.get("opened_ts", now)
             if hold >= MAX_HOLD:
@@ -1694,8 +1803,8 @@ def cmd_status():
     mode = _state.get("scan_mode", "off")
     mode_str = {"off": "🔴 Выкл",
                 "continuous": "🔄 Непрерывный (каждый час в :15)",
-                "auto": f"🤖 Авто (V15 часы: {AUTO_HOURS_MSK}, без 11:00 МСК)"}.get(mode, mode)
-    lines = ["", "━━━ 🔮 Пророк V15 ━━━"]
+                "auto": f"🤖 Авто (V16 часы: {AUTO_HOURS_MSK}, без 11:00 МСК)"}.get(mode, mode)
+    lines = ["", "━━━ 🔮 Пророк V16 ━━━"]
     lines.append(f"Режим: {mode_str}")
     tracked = _load_tracked()
     open_n = sum(1 for v in tracked.values() if v.get("status") == "open")
@@ -1788,7 +1897,7 @@ def cmd_on():
     total_profit = tp1_profit + tp2_profit
     
     return (
-        f"🤖 <b>Prophet V15 включён</b>\n\n"
+        f"🤖 <b>Prophet V16 включён</b>\n\n"
         f"📊 <b>Настройки:</b>\n"
         f"💰 Risk: <b>${RISK_USD:.0f}</b>\n"
         f"🎯 SL: <b>{SL_MULT}×ATR</b> (≈{sl_pct:.1f}%)\n"
@@ -2106,7 +2215,7 @@ def run_cleaner(reason="AUTO_CLEAN"):
         return 0, f"🧹 Cleaner V12 ({reason}): все открытые позиции в норме (проверено {len(open_recs)})"
 
 def cmd_stats():
-    lines = ["", "━━━ 🔮 Пророк V15 — Статистика ━━━"]
+    lines = ["", "━━━ 🔮 Пророк V16 — Статистика ━━━"]
     lines.append(f"Сканирований: {_stats['scans']}")
     lines.append(f"Сигналов: {_stats['signals']}")
     lines.append(f"Сделок: {_stats['trades']}")
@@ -2204,12 +2313,12 @@ def _manager_loop():
     ДО ФИКСА: manage_positions() вообще нигде не вызывалась →
     TP1→безубыток в Prophet никогда не работал автоматически.
     """
-    print(f"[prophet V15] Manager запущен: интервал 30с (работает даже при OFF)")
+    print(f"[prophet V16] Manager запущен: интервал 30с (работает даже при OFF)")
     while True:
         try:
             manage_positions()
         except Exception as e:
-            print(f"[prophet V15] manager error: {e}")
+            print(f"[prophet V16] manager error: {e}")
         time.sleep(30)
 
 def start():
@@ -2229,12 +2338,12 @@ def start():
     if _manager_thread is None or not _manager_thread.is_alive():
         _manager_thread = threading.Thread(target=_manager_loop, daemon=True, name="prophet-manager")
         _manager_thread.start()
-    print(f"[prophet V15] Старт: режим={_state.get('scan_mode','off')}")
+    print(f"[prophet V16] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         mode = _state.get('scan_mode','off')
         mode_str = "🟢 ВКЛ (авто)" if mode == "auto" else "🔴 ВЫКЛ"
         B.send_telegram(
-            f"🔮 <b>Пророк V15 запущен</b>\n"
+            f"🔮 <b>Пророк V16 запущен</b>\n"
             f"📊 Стратегия: {mode_str}\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
             f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
