@@ -796,6 +796,12 @@ def execute_trade(setup):
 
     # V16: Simple TP — один TP (без разделения 70/30)
     # Бэктест: Simple TP PF 1.16 (+$776) > Multi-TP PF 1.10 (+$481)
+    # V16-FIX: используем tp1_price (НЕ tp_price) — upscale_exec.py executor
+    # ожидает tp1_price во многих местах (has_tp, build_plan, _place_tps).
+    # Без tp2_price/tp3_price и tp1_fraction/tp2_fraction → executor ставит
+    # ОДИН TP на всю позицию (n=1 в _place_tps), без breakeven — это и есть
+    # настоящий Simple TP. exit_mode="tp_ladder" оставлен для совместимости
+    # (executor использует его как "есть TP", не как "trailing").
     tp_pct = setup["tp_pct"]  # уже посчитан в do_scan через _get_tp_mult
     is_long = direction == "LONG"
     if is_long:
@@ -812,9 +818,10 @@ def execute_trade(setup):
     sig = {
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp,
-        "tp_price": tp_price,  # V16: один TP (Simple TP)
+        "tp1_price": tp_price,  # V16-FIX: один TP через tp1_price (executor совместим)
         "tp_pct": tp_pct,
-        "exit_mode": "tp_single", "risk_usd": RISK_USD,
+        "exit_mode": "tp_ladder",  # V16-FIX: tp_ladder работает с одним tp1_price
+        "risk_usd": RISK_USD,
         "max_pos_usd": pos_size, "max_same_side": 2,  # V16: = MAX_OPEN
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
@@ -854,7 +861,7 @@ def execute_trade(setup):
         try:
             slippage_result = _apply_slippage_protection(
                 executor=executor, sym=sym, side=side,
-                planned_entry=entry, planned_stop=stop, planned_tp=tp,
+                planned_entry=entry, planned_stop=stop, planned_tp=tp_price,
                 sp_pct=sp, tp_pct=setup["tp_pct"],
                 is_long=(direction == "LONG")
             )
