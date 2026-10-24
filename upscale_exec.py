@@ -1010,11 +1010,6 @@ class Executor:
     def _place_tps(self, info):
         try:
             if self.halted or not self.client:
-                # _fire_scheduled_tp уже снял pending-запись до вызова (чтобы обычный
-                # таймер и восстановление после перезапуска не поставили TP дважды) —
-                # возвращаем её назад с due_ts=сейчас, иначе при остановленном боте
-                # эта TP безвозвратно пропадёт из PENDING_TP_FILE и не восстановится
-                # даже после /resume + перезапуска процесса.
                 self._pending_set(info, "pending_tp", due_ts=time.time())
                 return
             cur = next((p for p in self._positions() if _pos_id(p) == info["id"]), None)
@@ -1026,9 +1021,32 @@ class Executor:
             tps = [t for t in (info.get("tp1"), info.get("tp2"), info.get("tp3")) if t]
             n = len(tps)
             if n >= 2:
-                part = size // n
-                legs = [(part, tps[i], f"TP{i+1}") for i in range(n - 1)]
-                legs.append((size - part * (n - 1), tps[-1], f"TP{n}"))
+                # V15-fix: читаем tp1_fraction/tp2_fraction из сигнала (если есть)
+                # Prophet/Anomaly передают 70/30, Big Candle — без полей (50/50)
+                fracs = [info.get("tp1_fraction"), info.get("tp2_fraction"), info.get("tp3_fraction")]
+                has_fracs = any(f is not None for f in fracs[:n])
+                if has_fracs:
+                    # Пропорциональное деление по fractions
+                    total_frac = sum(f for f in fracs[:n] if f is not None)
+                    if total_frac > 0:
+                        legs = []
+                        remaining = size
+                        for i in range(n - 1):
+                            f = fracs[i] if fracs[i] is not None else (1.0 / n)
+                            amt = int(size * f / total_frac)
+                            legs.append((amt, tps[i], f"TP{i+1}"))
+                            remaining -= amt
+                        legs.append((remaining, tps[-1], f"TP{n}"))
+                    else:
+                        # Fallback: делим поровну
+                        part = size // n
+                        legs = [(part, tps[i], f"TP{i+1}") for i in range(n - 1)]
+                        legs.append((size - part * (n - 1), tps[-1], f"TP{n}"))
+                else:
+                    # Нет fractions — делим поровну (Big Candle)
+                    part = size // n
+                    legs = [(part, tps[i], f"TP{i+1}") for i in range(n - 1)]
+                    legs.append((size - part * (n - 1), tps[-1], f"TP{n}"))
             else:
                 legs = [(size, tps[0], "TP1")] if tps else []
             done = []
@@ -1047,8 +1065,6 @@ class Executor:
                 self._watching_be.add(info["id"])
                 threading.Thread(target=self._watch_breakeven, args=(info,), daemon=True).start()
             else:
-                # TP поставлены (или не принялись вовсе) и безубыток не нужен —
-                # больше нечего восстанавливать при перезапуске.
                 self._pending_drop(info["id"])
         except Exception as e:
             print(f"[EXEC] place_tps: {traceback.format_exc()}")
