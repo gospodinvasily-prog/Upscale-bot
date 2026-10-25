@@ -1,25 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-anomaly_scanner.py — Anomaly Scanner A+ (5 аномалий)
-====================================================
-Производственный модуль для авто-торговли.
+anomaly_scanner.py — Anomaly Scanner V17b (6 аномалий, Simple TP, без BTC)
+==========================================================================
+Производственный модуль для авто-торговли. V17b = V16 + убран BTC.
 
-5 аномалий:
+6 аномалий:
   1. Laggard — Z-score return пары vs рынок
   2. ZScoreDev — Z-score price vs SMA20
-  3. Divergence — расхождение цены и OBV
+  3. Divergence — расхождение цены и volume flow
   4. LiqMagnet — цена около 48h high/low
   5. Exhaustion — 5+ одноцветных свечей
+  6. TrendAlignment — Stacked MA + ADX растёт (новая в V16)
 
-Логика:
-  - Скан в :50 каждого часа (24 скана/день)
-  - Вход при ≥2 аномалиях в одну сторону
-  - BEAR фильтр: 3+ аномалии в BEAR → skip (хуже работают)
-  - Counter-trend TP (trend=3.0, counter=1.5)
+Логика V17b:
+  - Скан в :50 каждого часа, 04:00-22:00 МСК (пропуск 07:00, 15:00)
+  - Вход при ≥2 аномалиях в одну сторону (MIN=2, комбо-подтверждение)
+  - SKIP_2_WEAK: combo из 2 слабых (Divergence+Exhaustion) → skip
+  - BLOCK_LONG_IN_BEAR: LONG в BEAR-режиме запрещён полностью
+  - Simple TP: trend=1.5×ATR, counter=1.0×ATR (без Multi-TP)
+  - SL=2.0×ATR, SL всегда первый
   - 24ч кулдаун по паре после любой сделки
+  - 48ч blacklist после стопа
   - MAX_OPEN = 2
-  - Проверяет занятость пары Prophet перед входом
+  - 94 пары (без BTC + без 9 худших)
   - Без confirmation (вход сразу)
+
+Бэктест на 94 парах за 90 дней: PF 1.59, WR 69.3%, +$3918/90д (~$1306/мес)
 
 Команды:
   /anomaly — статус
@@ -27,6 +33,7 @@ anomaly_scanner.py — Anomaly Scanner A+ (5 аномалий)
   /anomaly_off — выключить
   /anomaly_close — закрыть позиции
   /anomaly_clean — cleaner зависших
+  /anomaly_alerts — вкл/выкл уведомления
 """
 
 import os, sys, json, time, threading, statistics, datetime as dt, requests
@@ -1078,7 +1085,7 @@ def manage_positions():
                 # V13.3: НЕ удаляем pending_ если markets не загружены —
                 # иначе теряем реально открытые позиции после рестарта
                 if not executor._mk:
-                    print(f"[anomaly A+] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
+                    print(f"[anomaly V17b] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
                 else:
                     # markets загружены, но символ не найден в live → реально нет позиции
                     del tracked[pid]; changed = True
@@ -1102,7 +1109,7 @@ def manage_positions():
                 cost_usd = pos_size_usd * (COMMISSION_PCT * 2 + SPREAD_PCT) / 100.0
                 pnl -= cost_usd
             except Exception as _e:
-                print(f"[anomaly A+] commission calc error: {_e}")
+                print(f"[anomaly V17b] commission calc error: {_e}")
 
             _stats["pnl"] += pnl
             direction_field = rec.get("direction", rec.get("dir", "long"))
@@ -1173,12 +1180,12 @@ def manage_positions():
 def _scanner_loop():
     global _scanner_running
     _scanner_running = True
-    print(f"[anomaly A+] Scanner запущен. Скан в :{SCAN_MINUTE:02d} каждого часа")
+    print(f"[anomaly V17b] Scanner запущен. Скан в :{SCAN_MINUTE:02d} каждого часа")
 
     while True:
         try:
             if not _scanner_running:
-                print(f"[anomaly A+] Scanner: флаг _scanner_running=False, останавливаюсь")
+                print(f"[anomaly V17b] Scanner: флаг _scanner_running=False, останавливаюсь")
                 return
 
             mode = _state.get("scan_mode", "off")
@@ -1212,7 +1219,7 @@ def _scanner_loop():
             # Manage positions
             try: manage_positions()
             except Exception as e:
-                print(f"[anomaly A+] manage_positions error: {e}")
+                print(f"[anomaly V17b] manage_positions error: {e}")
 
             # Auto-sync orphans
             try:
@@ -1228,8 +1235,8 @@ def _scanner_loop():
             skip_reason = ""
             if open_now >= MAX_OPEN:
                 skip_reason = f" ⏸️ MAX_OPEN достигнут ({open_now}/{MAX_OPEN}), скан пропущен"
-            scan_msg = f"🔍 Anomaly A+ скан в {scan_dt_str} МСК (открыто={open_now}/{MAX_OPEN}){skip_reason}"
-            print(f"[anomaly A+] {scan_msg}")
+            scan_msg = f"🔍 Anomaly V17b скан в {scan_dt_str} МСК (открыто={open_now}/{MAX_OPEN}){skip_reason}"
+            print(f"[anomaly V17b] {scan_msg}")
             if B:
                 try: B.send_telegram(scan_msg)
                 except: pass
@@ -1242,7 +1249,7 @@ def _scanner_loop():
             try:
                 setup = do_scan(now_ts)
             except Exception as e:
-                print(f"[anomaly A+] do_scan error: {e}")
+                print(f"[anomaly V17b] do_scan error: {e}")
                 setup = None
 
             _stats["scans"] += 1
@@ -1253,7 +1260,7 @@ def _scanner_loop():
                 emoji_dir = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
                 score_label = "🔥 СИЛЬНЫЙ" if setup["n_anomalies"] >= 4 else ("⭐ Приоритет" if setup["n_anomalies"] >= 3 else "обычный")
                 strong_str = " | STRONG✓" if setup.get("has_strong") else ""
-                print(f"[anomaly A+] сигнал: {setup['symbol']} {direction} ({setup['n_anomalies']}/5 {score_label})")
+                print(f"[anomaly V17b] сигнал: {setup['symbol']} {direction} ({setup['n_anomalies']}/5 {score_label})")
                 _stats["signals"] += 1
 
                 if B:
@@ -1267,14 +1274,14 @@ def _scanner_loop():
             else:
                 if B:
                     B.send_telegram(
-                        f"🔍 Anomaly A+ скан {scan_dt_str}\n"
+                        f"🔍 Anomaly V17b скан {scan_dt_str}\n"
                         f"❌ Аномалий не найдено\n"
                         f"Открыто: {open_count}/{MAX_OPEN}"
                     )
 
             time.sleep(60)
         except Exception as e:
-            print(f"[anomaly A+] loop error: {e}")
+            print(f"[anomaly V17b] loop error: {e}")
             time.sleep(60)
 
 # === AUTO-SYNC ORPHANS ===
@@ -1364,7 +1371,7 @@ def _auto_sync_orphans(verbose_telegram=False):
     if cleaned > 0:
         msg = f"🔄 Anomaly SYNC: убрано {cleaned} orphan"
         if verbose_telegram and B: B.send_telegram(msg)
-        print(f"[anomaly A+] {msg}")
+        print(f"[anomaly V17b] {msg}")
         return msg
     return "✅ Anomaly SYNC: чисто"
 
@@ -1440,7 +1447,7 @@ def _scanner_watchdog():
             global _scanner_thread
 
             if _scanner_thread is None or not _scanner_thread.is_alive():
-                print(f"[anomaly A+] WATCHDOG: scanner умер, перезапускаю...")
+                print(f"[anomaly V17b] WATCHDOG: scanner умер, перезапускаю...")
                 if B:
                     try: B.send_telegram("🔄 Anomaly: scanner перезапускается (умер)")
                     except: pass
@@ -1456,7 +1463,7 @@ def _scanner_watchdog():
             if age_sec > HEARTBEAT_TIMEOUT_SEC and 5 <= now_msk.hour <= 23:
                 last_scan_str = dt.datetime.fromtimestamp(last_scan, tz=MSK).strftime("%Y-%m-%d %H:%M") if last_scan else "никогда"
                 age_hours = age_sec / 3600
-                print(f"[anomaly A+] WATCHDOG: ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч)")
+                print(f"[anomaly V17b] WATCHDOG: ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч)")
                 if B:
                     try: B.send_telegram(f"🚨 Anomaly: scanner ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч). Перезапуск.")
                     except: pass
@@ -1467,7 +1474,7 @@ def _scanner_watchdog():
                 _state["last_scan_ts"] = int(_now())
                 _save()
         except Exception as e:
-            print(f"[anomaly A+] watchdog error: {e}")
+            print(f"[anomaly V17b] watchdog error: {e}")
 
 # === COMMANDS ===
 
@@ -1477,7 +1484,7 @@ def cmd_status():
 
     mode = _state.get("scan_mode", "off")
     mode_str = "🤖 Авто (вкл)" if mode == "auto" else "🔴 Выкл"
-    lines = ["", "━━━ 🚨 Anomaly Scanner A+ ━━━"]
+    lines = ["", "━━━ 🚨 Anomaly V17b ━━━"]
     lines.append(f"Режим: {mode_str}")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     tracked = _load_tracked()
@@ -1490,20 +1497,20 @@ def cmd_status():
         wr = _stats["wins"]/_stats["trades"]*100
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
-    lines.append(f"\n📅 Скан: :{SCAN_MINUTE:02d} каждого часа (24/день)")
-    lines.append(f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}")
-    lines.append(f"TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})")
-    lines.append(f"SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч")
+    lines.append(f"\n📅 Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)")
+    lines.append(f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}")
+    lines.append(f"🎯 Аномалии: 6 шт (Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion, TrendAlignment)")
+    lines.append(f"⚡ Вход: MIN={MIN_ANOMALIES} (комбо-подтверждение)")
+    lines.append(f"🛡️ SKIP_2_WEAK: combo из 2 слабых → skip")
+    lines.append(f"🚫 LONG в BEAR: запрещён полностью")
+    lines.append(f"🎯 Simple TP: trend={TP_TREND}×ATR, counter={TP_COUNTER}×ATR | SL={SL_MULT}×ATR")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
-    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч (только после стопа, V14)")
-    lines.append(f"⛔ Blacklist после стопа: 48ч (V14, было 7д)")
-    lines.append(f"Аномалии: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion")
-    lines.append(f"BEAR фильтр: 3+ аномалии в BEAR → skip")
-    # V13.6: показываем версию + активные фичи
-    lines.append(f"🏷️ Версия: V14 (Task ID 78: 9 худших пар убраны + TP_COUNTER=2.0 + blacklist 48ч)")
+    lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч")
+    lines.append(f"⛔ Blacklist после стопа: 48ч")
+    lines.append(f"🏷️ Версия: V17b (без BTC + 6 аномалий + Simple TP)")
     if USE_SKIP_2_WEAK:
         lines.append(f"✅ SKIP_2_WEAK: фильтрует 2 weak коррелированных")
-    lines.append(f"💪 STRONG аномалии (PF>1.4): Laggard, ZScoreDev, LiqMagnet")
+    lines.append(f"💪 STRONG аномалии (PF>1.4): Laggard, ZScoreDev, LiqMagnet, TrendAlignment")
     _reset_daily_pnl_if_needed()
     long_pnl = _state.get("long_today_pnl", 0.0)
     short_pnl = _state.get("short_today_pnl", 0.0)
@@ -1524,6 +1531,7 @@ def cmd_status():
     lines.append(f"  /anomaly_off — выключить")
     lines.append(f"  /anomaly_close — закрыть позиции")
     lines.append(f"  /anomaly_clean — cleaner зависших")
+    lines.append(f"  /anomaly_alerts — вкл/выкл уведомления")
     return "\n".join(lines)
 
 def cmd_on():
@@ -1532,16 +1540,28 @@ def cmd_on():
     # V13.9: проверяем что scanner thread жив, если нет — перезапускаем
     global _scanner_thread, _scanner_running
     if _scanner_thread is None or not _scanner_thread.is_alive():
-        print(f"[anomaly A+] cmd_on: scanner thread мёртв, перезапускаю")
+        print(f"[anomaly V17b] cmd_on: scanner thread мёртв, перезапускаю")
         _scanner_running = True
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="anomaly-scanner-cmd-on")
         _scanner_thread.start()
-    return f"🚨 Anomaly A+ включён.\nСкан: :{SCAN_MINUTE:02d} каждого часа\nMAX_OPEN: {MAX_OPEN}\nАномалий: 5 (Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion)"
+    return (
+        f"🚨 <b>Anomaly V17b включён</b>\n\n"
+        f"📊 <b>Настройки:</b>\n"
+        f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}\n"
+        f"⏰ Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)\n"
+        f"🎯 6 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion, TrendAlignment\n"
+        f"⚡ Вход: MIN={MIN_ANOMALIES} (комбо-подтверждение)\n"
+        f"🛡️ SKIP_2_WEAK: combo из 2 слабых → skip\n"
+        f"🚫 LONG в BEAR: запрещён полностью\n"
+        f"🎯 Simple TP: trend={TP_TREND}×ATR, counter={TP_COUNTER}×ATR | SL={SL_MULT}×ATR\n"
+        f"⏱️ Кулдаун: {SYMBOL_COOLDOWN_SEC//3600}ч | Blacklist: 48ч\n"
+        f"🚀 Стратегия запущена"
+    )
 
 def cmd_off():
     _state["scan_mode"] = "off"
     _save()
-    return "🔴 Anomaly A+ выключен. Открытые позиции продолжают работать."
+    return "🔴 Anomaly V17b выключен. Открытые позиции продолжают работать."
 
 def cmd_close():
     if not B or not hasattr(B, "EXECUTOR"): return "⚠️ Executor недоступен"
@@ -1590,17 +1610,19 @@ def start():
     if _watchdog_thread is None:
         _watchdog_thread = threading.Thread(target=_scanner_watchdog, daemon=True, name="anomaly-watchdog")
         _watchdog_thread.start()
-    print(f"[anomaly A+] Старт: режим={_state.get('scan_mode','off')}")
+    print(f"[anomaly V17b] Старт: режим={_state.get('scan_mode','off')}")
     if B:
+        mode_str = "🟢 ВКЛ (авто)" if _state.get('scan_mode','off') == "auto" else "🔴 ВЫКЛ"
         B.send_telegram(
-            f"🚨 <b>Anomaly Scanner A+ запущен</b>\n"
-            f"📊 5 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion\n"
-            f"⏰ Скан: :{SCAN_MINUTE:02d} каждого часа (24/день)\n"
-            f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
-            f"🎯 TP: counter-trend (TREND={TP_TREND}, COUNTER={TP_COUNTER})\n"
-            f"🛡️ SL={SL_MULT}×ATR | Hold={MAX_HOLD_SEC//3600}ч\n"
-            f"🐻 BEAR фильтр: 3+ аномалии в BEAR → skip\n"
-            f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч\n"
-            f"💰 Комиссии: {COMMISSION_PCT*2}% + {SPREAD_PCT}% спред\n"
-            f"Команды: /anomaly /anomaly_on /anomaly_off /anomaly_close /anomaly_clean"
+            f"🚨 <b>Anomaly V17b запущен</b>\n"
+            f"📊 Стратегия: {mode_str}\n"
+            f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}\n"
+            f"⏰ Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)\n"
+            f"🎯 6 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion, TrendAlignment\n"
+            f"⚡ Вход: MIN={MIN_ANOMALIES} (комбо-подтверждение)\n"
+            f"🛡️ SKIP_2_WEAK: combo из 2 слабых → skip\n"
+            f"🚫 LONG в BEAR: запрещён полностью\n"
+            f"🎯 Simple TP: trend={TP_TREND}×ATR, counter={TP_COUNTER}×ATR | SL={SL_MULT}×ATR\n"
+            f"⏱️ Кулдаун: {SYMBOL_COOLDOWN_SEC//3600}ч | Blacklist: 48ч\n"
+            f"Команды: /anomaly /anomaly_on /anomaly_off /anomaly_close /anomaly_clean /anomaly_alerts"
         )
