@@ -41,7 +41,7 @@ try:
 except Exception:
     UE = None
 
-STRATEGY_TAG = "anomaly_v1"
+STRATEGY_TAG = "anomaly_v17b"
 GATE_API = "https://api.gateio.ws/api/v4/spot"
 MSK = dt.timezone(dt.timedelta(hours=3))
 
@@ -74,18 +74,15 @@ PAIRS = [
 # DOT (Long-loser, -$213)
 # Суммарно эти 9 пар дали -$3582 потерь на обеих стратегиях
 
-# === ПАРАМЕТРЫ (захардкожены) ===
+# === ПАРАМЕТРЫ V17b (захардкожены) ===
 MAX_OPEN = 2
 SL_MULT = 2.0
-# V14 (Task ID 78): TP_COUNTER = 2.0 (возврат к V3 REAL Task 64, который давал +$26K)
-# Бэктест на 385 днях показал:
-# - При TP_COUNTER=1.0 (V13.11): контр-тренд 228/430 сделок, PF 0.86, -$1134 (убыток)
-# - При TP_COUNTER=2.0 (V14): контр-тренд PnL удваивается на TP, PF 1.16, +$1217
-# RR 1:1 (симметричный) работает лучше чем RR 1:2 для Anomaly Scanner
-TP_TREND = 2.0       # trend-following direction (LONG в BULL, SHORT в BEAR)
-TP_COUNTER = 2.0     # V14: было 1.0 в V13.11. Симметричный TP=SL=2.0 (RR 1:1)
+# V17b: Simple TP — один TP без частичных закрытий
+# Бэктест на 95 парах: Simple TP PF 1.59 (+$3918) > Multi-TP PF 1.45 (+$3052)
+TP_TREND = 1.5       # V17b: TP по тренду (быстрый)
+TP_COUNTER = 1.0     # V17b: TP против тренда (очень быстрый)
 MAX_HOLD_SEC = 48 * 3600
-MIN_ANOMALIES = 2
+MIN_ANOMALIES = 2     # V16: комбо-подтверждение (2+ аномалии)
 RISK_USD = 100
 LEVERAGE = 5
 MAX_MARGIN = 3000.0
@@ -94,22 +91,18 @@ SYMBOL_COOLDOWN_SEC = 24 * 3600
 SIDE_DAILY_STOP_USD = 300.0
 BEAR_AWARE_ENABLED = True
 
-# V13.6: SKIP_2_WEAK логика комбо (по аудиту + идея пользователя)
-# Бэктест V13.6 показал: SKIP_2_WEAK даёт +$8,559 vs WEIGHTED_SCORE -$2,360 vs CURRENT +$903
-# Причина: после фиксов аномалий (ZScoreDev look-ahead + Divergence sign-based)
-# они стали менее коррелированы → WEIGHTED_SCORE penalty за корреляцию стал излишним
-# SKIP_2_WEAK просто фильтрует редкие combos из 2 weak коррелированных
-USE_SKIP_2_WEAK = os.environ.get("ANOMALY_SKIP_2_WEAK", "1") == "1"
-# Классификация аномалий по PF (для SKIP_2_WEAK фильтра)
-STRONG_ANOMALIES = {"Laggard", "ZScoreDev", "LiqMagnet"}  # PF > 1.4
-WEAK_ANOMALIES = {"Divergence", "Exhaustion"}              # PF < 1.4
+# V16: SKIP_2_WEAK — combo из 2 слабых (Divergence+Exhaustion) → skip
+USE_SKIP_2_WEAK = True
+# V16: добавили TrendAlignment в STRONG (6 аномалий вместо 5)
+STRONG_ANOMALIES = {"Laggard", "ZScoreDev", "LiqMagnet", "TrendAlignment"}  # PF > 1.4
+WEAK_ANOMALIES = {"Divergence", "Exhaustion"}                              # PF < 1.4
 # Коррелированные пары (если combo = ровно эти 2 → skip)
-# Это защищает от дублирования сигнала в MR-кластере
-CORRELATION_PAIRS = [
-    ("Laggard", "ZScoreDev"),     # оба Z-score MR
-    ("ZScoreDev", "Exhaustion"),  # Z-score MR + streak MR
-    ("Laggard", "Exhaustion"),    # отстающая монета падала 5+ свечей
-]
+CORRELATION_PAIRS = []
+
+# V16: запретить LONG в BEAR-режиме
+# По бэктесту: LONG в BEAR = PF 0.76, -$718; LONG в BULL = PF 1.42, +$1490
+# SHORT работает в обоих режимах (PF 2.14 / 2.21)
+BLOCK_LONG_IN_BEAR = True
 
 # Реальные комиссии Upscale
 COMMISSION_PCT = 0.008  # 0.008% за операцию
@@ -207,6 +200,34 @@ def _atr(c, p=14):
     if len(c) < 2: return 0
     trs = [max(c[i]["high"]-c[i]["low"], abs(c[i]["high"]-c[i-1]["close"]), abs(c[i]["low"]-c[i-1]["close"])) for i in range(1, len(c))]
     return statistics.mean(trs[-p:]) if len(trs) >= p else statistics.mean(trs)
+
+def _adx(c, p=14):
+    """V16: ADX (Average Directional Index) + Plus DI + Minus DI.
+    Возвращает (adx, plus_di, minus_di). При недостатке данных — (0, 0, 0).
+    Та же реализация, что в prophet_V15.py — для 6-й аномалии TrendAlignment.
+    """
+    if len(c) < p*2: return 0, 0, 0
+    pdm, mdm, trs = [], [], []
+    for i in range(1, len(c)):
+        h, l = c[i]["high"], c[i]["low"]
+        ph, pl = c[i-1]["high"], c[i-1]["low"]
+        u, d = h-ph, pl-l
+        pdm.append(u if (u>d and u>0) else 0)
+        mdm.append(d if (d>u and d>0) else 0)
+        pc = c[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    av = statistics.mean(trs[:p]); ps = statistics.mean(pdm[:p]); ms = statistics.mean(mdm[:p])
+    dxs = []
+    for i in range(p, len(trs)):
+        av = (av*(p-1)+trs[i])/p; ps = (ps*(p-1)+pdm[i])/p; ms = (ms*(p-1)+mdm[i])/p
+        if av > 0:
+            pdi = 100*ps/av; mdi = 100*ms/av
+            s = pdi+mdi
+            dxs.append(100*abs(pdi-mdi)/s if s > 0 else 0)
+    if len(dxs) < p: return 0, 0, 0
+    ax = statistics.mean(dxs[:p])
+    for dx in dxs[p:]: ax = (ax*(p-1)+dx)/p
+    return ax, 100*ps/av if av > 0 else 0, 100*ms/av if av > 0 else 0
 
 # === FETCH ===
 
@@ -364,6 +385,23 @@ def detect_anomalies(sym, scan_ts, c4h, market_returns, btc_reg):
         elif consecutive >= 5 and last_color == "red":
             anomalies.append(("Exhaustion", "LONG", f"{consecutive} красных подряд"))
 
+    # === АНОМАЛИЯ 6: TrendAlignment — Stacked MA + ADX растёт ===
+    # V16: добавлена 6-я аномалия (как в prophet_V15.py)
+    if len(c4) >= 89:
+        sma13 = _sma(closes, 13)
+        sma34 = _sma(closes, 34)
+        sma89 = _sma(closes, 89)
+        if sma13 and sma34 and sma89:
+            adx_now, pdi, mdi = _adx(c4, 14)
+            adx_prev = 0
+            if len(c4) > 30:
+                adx_prev, _, _ = _adx(c4[:-1], 14)
+            last_close = c4[-1]["close"]
+            if sma13 > sma34 > sma89 and last_close > sma13 and adx_now > 20 and adx_now > adx_prev:
+                anomalies.append(("TrendAlignment", "LONG", f"ADX={adx_now:.0f}↑ stack✓"))
+            if sma13 < sma34 < sma89 and last_close < sma13 and adx_now > 20 and adx_now > adx_prev:
+                anomalies.append(("TrendAlignment", "SHORT", f"ADX={adx_now:.0f}↑ stack✓"))
+
     return anomalies
 
 def _calc_market_returns(scan_ts, all_c4h):
@@ -513,7 +551,9 @@ def do_scan(scan_ts=None):
             if _is_2_weak_combo(long_anom) or _is_2_weak_combo(short_anom):
                 continue
             
-            if len(long_anom) >= MIN_ANOMALIES:
+            # V17b: BLOCK_LONG_IN_BEAR — запрет LONG в BEAR-режиме (бэктест PF 0.76)
+            # Если BTC в BEAR → полностью пропускаем LONG сигналы
+            if len(long_anom) >= MIN_ANOMALIES and not (BLOCK_LONG_IN_BEAR and btc_reg == -1):
                 # BEAR фильтр: 3+ uncorrelated LONG в BEAR → skip
                 if btc_reg == -1 and _count_uncorrelated(long_anom) >= 3:
                     continue
@@ -526,7 +566,8 @@ def do_scan(scan_ts=None):
                 active = short_anom
         else:
             # Старая логика: ≥2 аномалии в одну сторону
-            if len(long_anom) >= MIN_ANOMALIES:
+            # V17b: BLOCK_LONG_IN_BEAR — запрет LONG в BEAR-режиме
+            if len(long_anom) >= MIN_ANOMALIES and not (BLOCK_LONG_IN_BEAR and btc_reg == -1):
                 # BEAR фильтр: 3+ аномалии в BEAR → skip
                 if btc_reg == -1 and len(long_anom) >= 3:
                     continue
@@ -878,6 +919,120 @@ def execute_trade(setup):
 
 # === POSITION MANAGEMENT ===
 
+def _fetch_realized_pnl(executor, rec, pid):
+    """V16: правильно ищет realized PnL позиции в orders_history.
+
+    Что исправлено vs старого кода:
+    1. from_fp9 — Upscale хранит PnL как fixed-point9 ("24300000000" = $24.30).
+       float() давал 24e9, нужно UE.from_fp9().
+    2. Retry до 3 раз — API часто возвращает пустой список с первого раза.
+    3. Пробуем ОБА варианта asset: market_id И тикер (sym).
+    4. Суммируем PnL ВСЕХ ордеров после opened_ts (TP1, TP2, финал).
+
+    Реальный кейс 2026-10-24: SUI SHORT — TP в 03:47 (+$24.30) и закрытие
+    в 14:28 (+$43.37) = $67.67. Старый код возвращал $0.00.
+    """
+    if not executor or not executor.client or not executor.account_id:
+        return 0.0
+
+    sym = rec.get("sym", "")
+    opened_ts = rec.get("opened_ts", 0)
+    if not sym or not opened_ts:
+        return 0.0
+
+    # Готовим варианты asset: market_id и тикер
+    assets_to_try = []
+    try:
+        if executor._mk:
+            m = executor._mk.get(sym)
+            if m:
+                mid = str(m.get("id", "")).strip()
+                if mid:
+                    assets_to_try.append(mid)
+    except: pass
+    if sym and sym not in assets_to_try:
+        assets_to_try.append(sym)
+
+    if not assets_to_try:
+        return 0.0
+
+    # Helper: парсинг PnL (как _money в upscale_exec.py history)
+    def _parse_pnl(pv):
+        if pv is None: return None
+        t = str(pv).strip()
+        if not t or t in ("None", "null", "0"):
+            # "0" — это входной ордер (entry), PnL = 0, пропускаем
+            return None
+        try:
+            # Если число с точкой или экспонентой — это уже float
+            if "." in t or "e" in t.lower():
+                return float(t)
+            # Иначе это fixed-point9 — конвертируем
+            return float(UE.from_fp9(t))
+        except:
+            return None
+
+    # Helper: парсинг ts (как _when в upscale_exec.py)
+    def _parse_ts(o):
+        for k in ("closedAt", "filledAt", "updatedAt", "createdAt"):
+            v = o.get(k)
+            if not v: continue
+            try:
+                if isinstance(v, str) and "T" in v:
+                    return dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                fv = float(v)
+                return fv / 1000 if fv > 1e11 else fv
+            except: continue
+        return 0
+
+    total_pnl = 0.0
+    found_any = False
+
+    for asset in assets_to_try:
+        data = None
+        # V16: 3 попытки с backoff
+        for attempt in range(3):
+            try:
+                data = executor.client.orders_history(executor.account_id, asset, 100)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"[anomaly V17b] orders_history({asset}) failed 3x: {e}")
+                else:
+                    time.sleep(0.5 * (attempt + 1))
+
+        if data is None:
+            continue
+
+        orders = UE._as_list(data)
+        if not orders:
+            continue
+
+        # V16: суммируем все ордера после opened_ts - 60
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            ts = _parse_ts(o)
+            if not ts:
+                continue
+            if ts < opened_ts - 60:
+                continue
+            pv = _parse_pnl(o.get("realizedPnl"))
+            if pv is None:
+                continue
+            total_pnl += pv
+            found_any = True
+            o_pid = str(o.get("positionId", "") or o.get("id", "") or "")
+            print(f"[anomaly V17b] {sym} asset={asset}: order ts={ts:.0f} "
+                  f"pid={o_pid[:8] if o_pid else '-'} pnl=${pv:+.2f} "
+                  f"running=${total_pnl:+.2f}")
+
+        if found_any:
+            break
+
+    return total_pnl
+
+
 def manage_positions():
     if not B or not hasattr(B, "EXECUTOR"): return
     executor = B.EXECUTOR
@@ -930,37 +1085,17 @@ def manage_positions():
             continue
 
         if pid not in live_ids:
-            pnl = 0
-            try:
-                m = executor._mk.get(rec["sym"]) if executor._mk else None
-                if m:
-                    asset = str(m.get("id","")) or rec["sym"]
-                    data = executor.client.orders_history(executor.account_id, asset, 50)
-                    for o in UE._as_list(data):
-                        if isinstance(o, dict):
-                            ts_str = o.get("closedAt") or o.get("filledAt") or o.get("updatedAt") or o.get("createdAt")
-                            if ts_str:
-                                try:
-                                    if isinstance(ts_str, str) and "T" in ts_str:
-                                        ots = dt.datetime.fromisoformat(ts_str.replace("Z","+00:00")).timestamp()
-                                    elif float(ts_str) > 1e11: ots = float(ts_str)/1000
-                                    else: ots = float(ts_str)
-                                    if ots >= rec.get("opened_ts", 0) - 60:
-                                        pv = o.get("realizedPnl")
-                                        if pv is not None:
-                                            t = str(pv).strip()
-                                            if t and t not in ("None","null"):
-                                                try: pnl += float(t)
-                                                except: pass
-                                except: pass
-            except: pass
+            # V17b: правильный поиск realized PnL через _fetch_realized_pnl
+            # Старый код парсил realizedPnl как float() — на Upscale PnL хранится как
+            # fixed-point9 ("24300000000" = $24.30), float() давал 24e9.
+            # Также: один вызов orders_history без retry часто возвращает пустой список.
+            # Также: TP/SL — это разные ордера, их PnL надо суммировать.
+            pnl = _fetch_realized_pnl(executor, rec, pid)
+            debug_pnl_source = pnl  # для лога ниже
 
             # V13.5 FIX (audit #2): Корректное вычитание комиссии
-            # Раньше было: pnl -= 0.046 (безразмерное вычитание из долларового PnL!)
             # Биржа уже включила комиссии в realizedPnl, но мы добавляем спред (не учтённый биржей).
             # Спред = SPREAD_PCT% × позиции = (entry × leverage × SPREAD_PCT / 100)
-            # Также считаем commission_usd = (entry × pos_size × commission_pct / 100)
-            # если realizedPnl на бирже = net (после комиссий биржи).
             try:
                 pos_size_usd = rec.get("entry", 0) * LEVERAGE  # позиция в $
                 # спред + биржа (вход+выход) — учитываем как % от позиции
