@@ -913,9 +913,19 @@ class Executor:
                     tp1=new_tp1_decimal if new_tp1_decimal else b.get("tp1_price"),
                     tp2=new_tp2_decimal if new_tp2_decimal else b.get("tp2_price"),
                     tp3=new_tp3_decimal if new_tp3_decimal else b.get("tp3_price"),
+                    # V18-fix: передаём fractions в info, иначе _place_tps делит 50/50 вместо 70/30
+                    tp1_fraction=b.get("tp1_fraction"),
+                    tp2_fraction=b.get("tp2_fraction"),
+                    tp3_fraction=b.get("tp3_fraction"),
                 )
             else:
-                info.update(tp1=b.get("tp1_price"), tp2=b.get("tp2_price"), tp3=b.get("tp3_price"))
+                info.update(
+                    tp1=b.get("tp1_price"), tp2=b.get("tp2_price"), tp3=b.get("tp3_price"),
+                    # V18-fix: передаём fractions в info, иначе _place_tps делит 50/50 вместо 70/30
+                    tp1_fraction=b.get("tp1_fraction"),
+                    tp2_fraction=b.get("tp2_fraction"),
+                    tp3_fraction=b.get("tp3_fraction"),
+                )
         with self._lock:
             self._open_risk[info["id"]] = real_risk
         if exit_mode == "trailing":
