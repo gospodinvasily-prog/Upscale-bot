@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-anomaly_scanner.py — Anomaly Scanner V17b (6 аномалий, Simple TP, без BTC)
+anomaly_scanner_v18.py — Anomaly Scanner V18 (6 аномалий + HYBRID Checkpoints, без BTC)
 ==========================================================================
 Производственный модуль для авто-торговли. V17b = V16 + убран BTC.
 
@@ -48,7 +48,7 @@ try:
 except Exception:
     UE = None
 
-STRATEGY_TAG = "anomaly_v17b"
+STRATEGY_TAG = "anomaly_v18"
 GATE_API = "https://api.gateio.ws/api/v4/spot"
 MSK = dt.timezone(dt.timedelta(hours=3))
 
@@ -89,6 +89,10 @@ SL_MULT = 2.0
 TP_TREND = 1.5       # V17b: TP по тренду (быстрый)
 TP_COUNTER = 1.0     # V17b: TP против тренда (очень быстрый)
 MAX_HOLD_SEC = 48 * 3600
+# V18: HYBRID CHECKPOINTS — главное отличие от V17b
+# На 24h и 36h проверяем unrealized PnL. Если > 0 → закрываем по рынку.
+# Бэктест 297 дней: PnL +$10,264, WR 68.2%, PF 1.55, Max DD $-767, Sharpe 4.45
+CHECKPOINT_HOURS = [24, 36]   # закрытие в плюсе на 24h и 36h
 MIN_ANOMALIES = 2     # V16: комбо-подтверждение (2+ аномалии)
 RISK_USD = 100
 LEVERAGE = 5
@@ -862,7 +866,7 @@ def execute_trade(setup):
         strong_str = " | STRONG✓" if setup.get("has_strong") else ""
         if B:
             B.send_telegram(
-                f"🚨 <b>ANOMALY A+: {sym} {emoji_dir} открыт</b>\n"
+                f"🚨 <b>ANOMALY V18: {sym} {emoji_dir} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
                 f"Тейк: ${tp:.6g} ({setup['tp_pct']:.1f}%)\n"
@@ -1004,7 +1008,7 @@ def _fetch_realized_pnl(executor, rec, pid):
                 break
             except Exception as e:
                 if attempt == 2:
-                    print(f"[anomaly V17b] orders_history({asset}) failed 3x: {e}")
+                    print(f"[anomaly V18] orders_history({asset}) failed 3x: {e}")
                 else:
                     time.sleep(0.5 * (attempt + 1))
 
@@ -1030,7 +1034,7 @@ def _fetch_realized_pnl(executor, rec, pid):
             total_pnl += pv
             found_any = True
             o_pid = str(o.get("positionId", "") or o.get("id", "") or "")
-            print(f"[anomaly V17b] {sym} asset={asset}: order ts={ts:.0f} "
+            print(f"[anomaly V18] {sym} asset={asset}: order ts={ts:.0f} "
                   f"pid={o_pid[:8] if o_pid else '-'} pnl=${pv:+.2f} "
                   f"running=${total_pnl:+.2f}")
 
@@ -1085,7 +1089,7 @@ def manage_positions():
                 # V13.3: НЕ удаляем pending_ если markets не загружены —
                 # иначе теряем реально открытые позиции после рестарта
                 if not executor._mk:
-                    print(f"[anomaly V17b] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
+                    print(f"[anomaly V18] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
                 else:
                     # markets загружены, но символ не найден в live → реально нет позиции
                     del tracked[pid]; changed = True
@@ -1109,7 +1113,7 @@ def manage_positions():
                 cost_usd = pos_size_usd * (COMMISSION_PCT * 2 + SPREAD_PCT) / 100.0
                 pnl -= cost_usd
             except Exception as _e:
-                print(f"[anomaly V17b] commission calc error: {_e}")
+                print(f"[anomaly V18] commission calc error: {_e}")
 
             _stats["pnl"] += pnl
             direction_field = rec.get("direction", rec.get("dir", "long"))
@@ -1158,7 +1162,87 @@ def manage_positions():
             del tracked[pid]; changed = True
         else:
             hold = now - rec.get("opened_ts", now)
-            if hold >= MAX_HOLD_SEC:
+            hold_hours = hold / 3600
+            # ─── V18: HYBRID CHECKPOINT LOGIC ────────────────────────────
+            # На 24h и 36h проверяем unrealized PnL. Если > 0 → закрываем.
+            cp_triggered = None
+            for cp_h in CHECKPOINT_HOURS:
+                cp_key = f"cp_{cp_h}h_passed"
+                if hold_hours >= cp_h and not rec.get(cp_key):
+                    cp_triggered = cp_h
+                    break
+            if cp_triggered is not None:
+                cp_h = cp_triggered
+                cp_key = f"cp_{cp_h}h_passed"
+                pos = next((p for p in live if UE._pos_id(p) == pid), None)
+                if pos:
+                    mid = UE._pos_market(pos)
+                    if mid:
+                        # Оцениваем unrealized PnL
+                        try:
+                            upnl = pos.get("unrealizedPnl")
+                            if upnl is not None:
+                                try:
+                                    if str(upnl).isdigit() and len(str(upnl)) > 9:
+                                        pnl_check = float(UE.from_fp9(str(upnl)))
+                                    else:
+                                        pnl_check = float(upnl)
+                                except:
+                                    pnl_check = 0.0
+                            else:
+                                # Fallback через текущую цену
+                                cur_price = _fetch_current_price(rec["sym"])
+                                if not cur_price:
+                                    cur_price = pos.get("markPrice") or pos.get("lastPrice") or rec.get("entry", 0)
+                                try: cur_price = float(cur_price)
+                                except: cur_price = rec.get("entry", 0)
+                                entry_price = rec.get("entry", 0)
+                                direction = rec.get("direction", rec.get("dir", "long"))
+                                atr_pct = rec.get("atr_pct", 2.5)
+                                sl_mult = SL_MULT
+                                if direction in ("LONG", "long"):
+                                    pct_ret = (cur_price - entry_price) / entry_price * 100
+                                else:
+                                    pct_ret = (entry_price - cur_price) / entry_price * 100
+                                pct_ret -= (COMMISSION_PCT * 2 + SPREAD_PCT) / 100.0
+                                pos_size = (RISK_USD / (sl_mult * atr_pct) * 100)
+                                pnl_check = (pct_ret / 100) * pos_size
+                        except Exception as e:
+                            print(f"[anomaly V18] {rec.get('sym','?')}: cp_pnl calc error: {e}")
+                            pnl_check = 0.0
+
+                        if pnl_check > 0:
+                            dir_field = rec.get("dir", rec.get("direction", "long"))
+                            if dir_field in ("SHORT", "short"): dir_field = "short"
+                            else: dir_field = "long"
+                            info = {"id": pid, "mid": mid, "dir": dir_field}
+                            try:
+                                executor.close_position(info, reason=f"ANOMALY_CHECKPOINT_{cp_h}h")
+                                if B:
+                                    pnl_str = f"+${pnl_check:.2f}" if pnl_check >= 0 else f"-${abs(pnl_check):.2f}"
+                                    B.send_telegram(
+                                        f"💎 <b>ANOMALY V18 Checkpoint {cp_h}h</b>\n"
+                                        f"🎯 {rec['sym']} — позиция закрыта в плюсе\n"
+                                        f"⏱️ Удержание: {hold_hours:.1f}h\n"
+                                        f"💰 PnL: {pnl_str} (фиксируем прибыль)\n"
+                                        f"━━━━━━━━━━━━━━━━━━\n"
+                                        f"💎 V18 HYBRID: спасает прибыльные сделки до того, как они превратятся в убыток"
+                                    )
+                            except Exception as e:
+                                print(f"[anomaly V18] {rec['sym']}: cp close error: {e}")
+                        else:
+                            rec[cp_key] = True
+                            changed = True
+                            if B:
+                                pnl_str = f"${pnl_check:+.2f}"
+                                B.send_telegram(
+                                    f"⏸️ <b>ANOMALY V18 Checkpoint {cp_h}h — пропуск</b>\n"
+                                    f"🎯 {rec['sym']} — PnL {pnl_str} (не в плюсе)\n"
+                                    f"⏱️ Удержание: {hold_hours:.1f}h\n"
+                                    f"Продолжаем ждать до следующего чекпойнта или TP/SL"
+                                )
+            # ─── V18: 48h TIMEOUT (как в V17b) ──────────────────────────
+            elif hold >= MAX_HOLD_SEC:
                 pos = next((p for p in live if UE._pos_id(p) == pid), None)
                 if pos:
                     mid = UE._pos_market(pos)
@@ -1169,7 +1253,12 @@ def manage_positions():
                         info = {"id": pid, "mid": mid, "dir": dir_field}
                         try:
                             executor.close_position(info, reason=f"ANOMALY_TIMEOUT_{MAX_HOLD_SEC//3600}h")
-                            if B: B.send_telegram(f"⏱️ Anomaly {rec['sym']}: safety-net {MAX_HOLD_SEC//3600}ч")
+                            if B: B.send_telegram(
+                                f"⏱️ <b>ANOMALY V18 Timeout {MAX_HOLD_SEC//3600}h</b>\n"
+                                f"🎯 {rec['sym']} — принудительное закрытие\n"
+                                f"⏱️ Удержание: {hold_hours:.1f}h\n"
+                                f"Позиция не отработала TP/SL ни на одном чекпойнте"
+                            )
                         except: pass
 
     if changed:
@@ -1180,12 +1269,12 @@ def manage_positions():
 def _scanner_loop():
     global _scanner_running
     _scanner_running = True
-    print(f"[anomaly V17b] Scanner запущен. Скан в :{SCAN_MINUTE:02d} каждого часа")
+    print(f"[anomaly V18] Scanner запущен. Скан в :{SCAN_MINUTE:02d} каждого часа")
 
     while True:
         try:
             if not _scanner_running:
-                print(f"[anomaly V17b] Scanner: флаг _scanner_running=False, останавливаюсь")
+                print(f"[anomaly V18] Scanner: флаг _scanner_running=False, останавливаюсь")
                 return
 
             mode = _state.get("scan_mode", "off")
@@ -1219,7 +1308,7 @@ def _scanner_loop():
             # Manage positions
             try: manage_positions()
             except Exception as e:
-                print(f"[anomaly V17b] manage_positions error: {e}")
+                print(f"[anomaly V18] manage_positions error: {e}")
 
             # Auto-sync orphans
             try:
@@ -1235,8 +1324,8 @@ def _scanner_loop():
             skip_reason = ""
             if open_now >= MAX_OPEN:
                 skip_reason = f" ⏸️ MAX_OPEN достигнут ({open_now}/{MAX_OPEN}), скан пропущен"
-            scan_msg = f"🔍 Anomaly V17b скан в {scan_dt_str} МСК (открыто={open_now}/{MAX_OPEN}){skip_reason}"
-            print(f"[anomaly V17b] {scan_msg}")
+            scan_msg = f"🔍 Anomaly V18 скан в {scan_dt_str} МСК (открыто={open_now}/{MAX_OPEN}){skip_reason}"
+            print(f"[anomaly V18] {scan_msg}")
             if B:
                 try: B.send_telegram(scan_msg)
                 except: pass
@@ -1249,7 +1338,7 @@ def _scanner_loop():
             try:
                 setup = do_scan(now_ts)
             except Exception as e:
-                print(f"[anomaly V17b] do_scan error: {e}")
+                print(f"[anomaly V18] do_scan error: {e}")
                 setup = None
 
             _stats["scans"] += 1
@@ -1260,12 +1349,12 @@ def _scanner_loop():
                 emoji_dir = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
                 score_label = "🔥 СИЛЬНЫЙ" if setup["n_anomalies"] >= 4 else ("⭐ Приоритет" if setup["n_anomalies"] >= 3 else "обычный")
                 strong_str = " | STRONG✓" if setup.get("has_strong") else ""
-                print(f"[anomaly V17b] сигнал: {setup['symbol']} {direction} ({setup['n_anomalies']}/5 {score_label})")
+                print(f"[anomaly V18] сигнал: {setup['symbol']} {direction} ({setup['n_anomalies']}/5 {score_label})")
                 _stats["signals"] += 1
 
                 if B:
                     B.send_telegram(
-                        f"🚨 <b>ANOMALY A+ — сигнал найден</b>\n"
+                        f"🚨 <b>ANOMALY V18 — сигнал найден</b>\n"
                         f"🎯 {setup['symbol']} {emoji_dir} ({setup['n_anomalies']}/5 {score_label}{strong_str})\n"
                         f"📋 {setup['anomalies']}\n"
                         f"⏱️ Вхожу по рынку..."
@@ -1274,14 +1363,14 @@ def _scanner_loop():
             else:
                 if B:
                     B.send_telegram(
-                        f"🔍 Anomaly V17b скан {scan_dt_str}\n"
+                        f"🔍 Anomaly V18 скан {scan_dt_str}\n"
                         f"❌ Аномалий не найдено\n"
                         f"Открыто: {open_count}/{MAX_OPEN}"
                     )
 
             time.sleep(60)
         except Exception as e:
-            print(f"[anomaly V17b] loop error: {e}")
+            print(f"[anomaly V18] loop error: {e}")
             time.sleep(60)
 
 # === AUTO-SYNC ORPHANS ===
@@ -1371,7 +1460,7 @@ def _auto_sync_orphans(verbose_telegram=False):
     if cleaned > 0:
         msg = f"🔄 Anomaly SYNC: убрано {cleaned} orphan"
         if verbose_telegram and B: B.send_telegram(msg)
-        print(f"[anomaly V17b] {msg}")
+        print(f"[anomaly V18] {msg}")
         return msg
     return "✅ Anomaly SYNC: чисто"
 
@@ -1447,7 +1536,7 @@ def _scanner_watchdog():
             global _scanner_thread
 
             if _scanner_thread is None or not _scanner_thread.is_alive():
-                print(f"[anomaly V17b] WATCHDOG: scanner умер, перезапускаю...")
+                print(f"[anomaly V18] WATCHDOG: scanner умер, перезапускаю...")
                 if B:
                     try: B.send_telegram("🔄 Anomaly: scanner перезапускается (умер)")
                     except: pass
@@ -1463,7 +1552,7 @@ def _scanner_watchdog():
             if age_sec > HEARTBEAT_TIMEOUT_SEC and 5 <= now_msk.hour <= 23:
                 last_scan_str = dt.datetime.fromtimestamp(last_scan, tz=MSK).strftime("%Y-%m-%d %H:%M") if last_scan else "никогда"
                 age_hours = age_sec / 3600
-                print(f"[anomaly V17b] WATCHDOG: ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч)")
+                print(f"[anomaly V18] WATCHDOG: ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч)")
                 if B:
                     try: B.send_telegram(f"🚨 Anomaly: scanner ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч). Перезапуск.")
                     except: pass
@@ -1474,7 +1563,7 @@ def _scanner_watchdog():
                 _state["last_scan_ts"] = int(_now())
                 _save()
         except Exception as e:
-            print(f"[anomaly V17b] watchdog error: {e}")
+            print(f"[anomaly V18] watchdog error: {e}")
 
 # === COMMANDS ===
 
@@ -1484,7 +1573,7 @@ def cmd_status():
 
     mode = _state.get("scan_mode", "off")
     mode_str = "🤖 Авто (вкл)" if mode == "auto" else "🔴 Выкл"
-    lines = ["", "━━━ 🚨 Anomaly V17b ━━━"]
+    lines = ["", "━━━ 🚨 Anomaly V18 ━━━"]
     lines.append(f"Режим: {mode_str}")
     lines.append(f"Сделок сегодня: {_state.get('trades_today', 0)}")
     tracked = _load_tracked()
@@ -1540,12 +1629,12 @@ def cmd_on():
     # V13.9: проверяем что scanner thread жив, если нет — перезапускаем
     global _scanner_thread, _scanner_running
     if _scanner_thread is None or not _scanner_thread.is_alive():
-        print(f"[anomaly V17b] cmd_on: scanner thread мёртв, перезапускаю")
+        print(f"[anomaly V18] cmd_on: scanner thread мёртв, перезапускаю")
         _scanner_running = True
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="anomaly-scanner-cmd-on")
         _scanner_thread.start()
     return (
-        f"🚨 <b>Anomaly V17b включён</b>\n\n"
+        f"🚨 <b>Anomaly V18 включён</b>\n\n"
         f"📊 <b>Настройки:</b>\n"
         f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}\n"
         f"⏰ Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)\n"
@@ -1561,7 +1650,7 @@ def cmd_on():
 def cmd_off():
     _state["scan_mode"] = "off"
     _save()
-    return "🔴 Anomaly V17b выключен. Открытые позиции продолжают работать."
+    return "🔴 Anomaly V18 выключен. Открытые позиции продолжают работать."
 
 def cmd_close():
     if not B or not hasattr(B, "EXECUTOR"): return "⚠️ Executor недоступен"
@@ -1610,11 +1699,11 @@ def start():
     if _watchdog_thread is None:
         _watchdog_thread = threading.Thread(target=_scanner_watchdog, daemon=True, name="anomaly-watchdog")
         _watchdog_thread.start()
-    print(f"[anomaly V17b] Старт: режим={_state.get('scan_mode','off')}")
+    print(f"[anomaly V18] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         mode_str = "🟢 ВКЛ (авто)" if _state.get('scan_mode','off') == "auto" else "🔴 ВЫКЛ"
         B.send_telegram(
-            f"🚨 <b>Anomaly V17b запущен</b>\n"
+            f"🚨 <b>Anomaly V18 запущен</b>\n"
             f"📊 Стратегия: {mode_str}\n"
             f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}\n"
             f"⏰ Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)\n"

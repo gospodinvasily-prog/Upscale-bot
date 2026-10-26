@@ -1,8 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-prophet.py — Пророк V12 (Multi-TF Scanner + Auto-trade + SHORT + Dynamic TP + Confirmation)
+prophet_v18.py — Пророк V18 (Multi-TF + HYBRID Checkpoints + TP1/TP2 + Пирамидинг)
 ============================================================================================
-V12 ФИНАЛЬНАЯ ВЕРСИЯ. Изменения от рабочей V8:
+V18 = V16 + HYBRID checkpoint-логика (как в Anomaly V18).
+Бэктест 297 дней (94 пары, без BTC, MIN_SCORE=70):
+  • Total PnL: $+11,671 | WR 61.9% | PF 1.68 | Sharpe 4.68 | Max DD $-1,343
+  • Прогноз/год: $+14,343 | 9/10 месяцев в плюсе
+  • Checkpoint-закрытия: 78 сделок (+$1,212) спасены от превращения в таймауты
+
+V18 ОТЛИЧИЯ ОТ V16 (production):
+  1. MIN_SCORE = 70 (было 60) — пользователь подтвердил что критично
+  2. AUTO_SCORE = 70 (было 60)
+  3. CHECKPOINT_HOURS = [24, 36] — главное отличие:
+     На каждом чекпойнте если unrealized PnL > 0 → закрываем по рынку
+     Если PnL <= 0 → ждём дальше до следующего чекпойнта или MAX_HOLD
+  4. Все Telegram-сообщения обновлены под V18
+
+V16 КЛЮЧЕВЫЕ ФИЧИ (без изменений):
   1. Добавлен SHORT (зеркальная логика LONG в analyze())
   2. Динамический TP: ADX<25 → TP=2.5×ATR, ADX≥25 → TP=3.0×ATR
   3. MIN_SCORE = 60 (было 70)
@@ -41,7 +55,7 @@ try:
 except Exception:
     UE = None
 
-STRATEGY_TAG = "prophet_v16"
+STRATEGY_TAG = "prophet_v18"
 GATE_API = "https://api.gateio.ws/api/v4/spot"
 MSK = dt.timezone(dt.timedelta(hours=3))
 
@@ -89,8 +103,8 @@ CLEANER_GRACE_HOURS = int(os.environ.get("PROPHET_CLEANER_GRACE_HOURS", "2"))
 TP_MULT_STRONG = 3.0   # ADX>=25 (сильный тренд) — TP дальше
 TP_MULT_WEAK = 2.5     # ADX<25  (слабый тренд)   — TP ближе
 # V12: пороги скора
-MIN_SCORE = 60         # V12: 60 (V8 было 70) — было env, теперь хардкод
-AUTO_SCORE = 60        # V12: 60 (V8 было 90) — было env, теперь хардкод
+MIN_SCORE = 70         # V18: 70 (было 60 в V12) — пользователь подтвердил что критично
+AUTO_SCORE = 70        # V18: 70 (было 60 в V12) — пользователь подтвердил
 # V12: максимум одновременных позиций
 MAX_OPEN = 5           # V13.12: 5 (V8 было 2, V12-max3 было 3)
 # V13.12: ПИРАМИДИНГ — новая позиция в сторону только если предыдущие в плюсе
@@ -116,6 +130,12 @@ TP_COUNTER = 2.0     # для совместимости со старым ко�
 BEAR_AWARE_ENABLED = True
 MIN_SCORE_BEAR = 70       # в BEAR режиме строже отбор (vs 60 в BULL)
 BEAR_COOLDOWN_HOURS = 48  # в BEAR режиме 48ч cooldown (vs 24ч в BULL)
+
+# V18: HYBRID CHECKPOINTS — главное отличие от V16
+# На каждом чекпойнте если unrealized PnL > 0 → закрываем по рынку
+# Если PnL <= 0 → ждём дальше до следующего чекпойнта или MAX_HOLD
+# Бэктест 297 дней (94 пары, MIN_SCORE=70): +$11,671 PnL, WR 61.9%, PF 1.68, Sharpe 4.68
+CHECKPOINT_HOURS = [24, 36]  # закрытие в плюсе на 24h и 36h
 
 # V13.12: комиссии для расчёта прибыли в cmd_config()
 COMMISSION_PCT = 0.008  # Upscale crypto: 0.008% за операцию
@@ -678,17 +698,17 @@ def do_scan(scan_ts=None):
             # V13.12: per-side daily stop — блокируем убыточную сторону
             if _side_blocked(r["direction"]):
                 side_pnl = _state.get("long_today_pnl" if r["direction"]=="LONG" else "short_today_pnl", 0.0)
-                print(f"[prophet V13.12] {r['direction']} blocked: today PnL ${side_pnl:.0f} ≤ -${SIDE_DAILY_STOP_USD:.0f}")
+                print(f"[prophet V18] {r['direction']} blocked: today PnL ${side_pnl:.0f} ≤ -${SIDE_DAILY_STOP_USD:.0f}")
                 continue
             # V13.12: ПИРАМИДИНГ — не открываем 2-ю позицию в сторону если 1-я в минусе
             # (но 1-я в сторону — всегда можно)
             can_pyramid, pyramid_reason = _can_pyramid(r["direction"], tracked)
             if not can_pyramid:
-                print(f"[prophet V13.12] {r['symbol']} {r['direction']}: пирамидинг запрещён — {pyramid_reason}")
+                print(f"[prophet V18] {r['symbol']} {r['direction']}: пирамидинг запрещён — {pyramid_reason}")
                 continue
             results.append(r)
         except Exception as e:
-            print(f"[prophet] {sym}: {e}")
+            print(f"[prophet V18] {sym}: {e}")
 
     if not results: return None
     results.sort(key=lambda x: -x["score"])
@@ -709,7 +729,7 @@ def send_signal(setup):
     tp_mult = s.get("tp_mult", 3.0)
 
     msg = (
-        f"🔮 <b>ПРОРОК V12 — СИГНАЛ</b>\n\n"
+        f"🔮 <b>ПРОРОК V18 — СИГНАЛ</b>\n\n"
         f"🎯 {s['symbol']}/USDT — {emoji}\n"
         f"Score: <b>{s['score']:.0f}</b> | TP×ATR: {tp_mult:.1f}\n\n"
         f"📊 Анализ:\n"
@@ -737,7 +757,7 @@ def send_signal(setup):
         }
         requests.post(url, json=data, timeout=10)
     except Exception as e:
-        print(f"[prophet] send_signal error: {e}")
+        print(f"[prophet V18] send_signal error: {e}")
         B.send_telegram(msg)
 
 def _calc_profit_str(risk_val, tp_mult):
@@ -871,7 +891,7 @@ def cmd_config():
     p_30 = calc_profit(3.0)
     
     text = (
-        "⚙️ <b>Настройки Prophet V13</b>\n\n"
+        "⚙️ <b>Настройки Prophet V18</b>\n\n"
         f"💰 Текущий Risk: <b>${cur_risk}</b>\n"
         f"🎯 Текущий TP: <b>{cur_tp_str}</b>\n"
         f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n\n"
@@ -946,10 +966,10 @@ def _confirm_signal(setup):
             momentum_ok = last_c["close"] <= prev_c["close"]
 
         confirmed = candle_ok and price_ok and momentum_ok
-        print(f"[prophet] confirm {sym} {direction}: candle={candle_ok} price_dev={deviation:.2f}% momentum={momentum_ok} → {confirmed}")
+        print(f"[prophet V18] confirm {sym} {direction}: candle={candle_ok} price_dev={deviation:.2f}% momentum={momentum_ok} → {confirmed}")
         return confirmed
     except Exception as e:
-        print(f"[prophet] confirm error {sym}: {e}")
+        print(f"[prophet V18] confirm error {sym}: {e}")
         return False
 
 def _confirmation_worker(setup, fire_ts: int):
@@ -973,7 +993,7 @@ def _confirmation_worker(setup, fire_ts: int):
         # V13.7 FIX P0-7: проверка подтверждения свечи FIRST (без lock)
         if not _confirm_signal(setup):
             if B: B.send_telegram(
-                f"❌ <b>НЕ ПОДТВЕРЖДЕНО</b> — {sym} {emoji_dir}\n"
+                f"❌ <b>PROPHET V18: НЕ ПОДТВЕРЖДЕНО</b> — {sym} {emoji_dir}\n"
                 f"15m свеча не подтвердила направление. Сигнал отменён."
             )
             return
@@ -996,7 +1016,7 @@ def _confirmation_worker(setup, fire_ts: int):
                 for v in tracked.values()
             )
             if already_executed:
-                print(f"[prophet V13.7] {sym} {direction}: уже исполнен, пропускаю (idempotency)")
+                print(f"[prophet V18] {sym} {direction}: уже исполнен, пропускаю (idempotency)")
                 return
 
             # Проверка пирамидинга
@@ -1026,13 +1046,13 @@ def _confirmation_worker(setup, fire_ts: int):
         # pending_ уже в tracked — даже если execute_trade упадёт, при следующем
         # sync позиция будет найдена или pending_ будет очищен через 5 мин
         if B: B.send_telegram(
-            f"✅ <b>ПОДТВЕРЖДЕНО</b> — {sym} {emoji_dir}\n"
+            f"✅ <b>PROPHET V18: ПОДТВЕРЖДЕНО</b> — {sym} {emoji_dir}\n"
             f"Вход по рынку: ${setup['price']:.6g}"
         )
         execute_trade(setup)
     except Exception as e:
-        print(f"[prophet] confirmation_worker error: {e}")
-        if B: B.send_telegram(f"⚠️ Prophet: ошибка подтверждения {sym}: {e}")
+        print(f"[prophet V18] confirmation_worker error: {e}")
+        if B: B.send_telegram(f"⚠️ PROPHET V18: ошибка подтверждения {sym}: {e}")
         # V13.7: очищаем pending_ при ошибке
         try:
             with _tracked_lock:
@@ -1088,7 +1108,7 @@ def _fetch_upscale_entry_price(executor, sym: str):
                             except: continue
         return None
     except Exception as e:
-        print(f"[prophet V13.8] fetch_upscale_entry_price {sym}: {e}")
+        print(f"[prophet V18] fetch_upscale_entry_price {sym}: {e}")
         return None
 
 
@@ -1107,21 +1127,21 @@ def _apply_slippage_protection(executor, sym: str, side: str,
     
     up_entry = _fetch_upscale_entry_price(executor, sym)
     if not up_entry or up_entry <= 0:
-        print(f"[prophet V13.8] {sym}: не удалось получить up_entry")
+        print(f"[prophet V18] {sym}: не удалось получить up_entry")
         return result
     
     slippage_pct = abs(up_entry - planned_entry) / planned_entry * 100
     result["up_entry"] = up_entry
     result["slippage_pct"] = slippage_pct
     
-    print(f"[prophet V13.8] {sym} {side}: planned={planned_entry:.6g}, upscale={up_entry:.6g}, slippage={slippage_pct:.2f}%")
+    print(f"[prophet V18] {sym} {side}: planned={planned_entry:.6g}, upscale={up_entry:.6g}, slippage={slippage_pct:.2f}%")
     
     if slippage_pct <= SLIPPAGE_OK_PCT:
         result["action"] = "ok"
         return result
     
     if slippage_pct > SLIPPAGE_CLOSE_PCT:
-        print(f"[prophet V13.8] {sym}: SLIPPAGE {slippage_pct:.2f}% > {SLIPPAGE_CLOSE_PCT}% — ЗАКРЫВАЕМ!")
+        print(f"[prophet V18] {sym}: SLIPPAGE {slippage_pct:.2f}% > {SLIPPAGE_CLOSE_PCT}% — ЗАКРЫВАЕМ!")
         try:
             live = UE._as_list(executor.client.positions(executor.account_id))
             for p in live:
@@ -1138,7 +1158,7 @@ def _apply_slippage_protection(executor, sym: str, side: str,
                                 result["action"] = "closed"
                                 if B:
                                     B.send_telegram(
-                                        f"🚨 <b>SLIPPAGE PROTECTION: {sym} ЗАКРЫТА</b>\n"
+                                        f"🚨 <b>PROPHET V18 SLIPPAGE: {sym} ЗАКРЫТА</b>\n"
                                         f"Плановый вход: ${planned_entry:.6g}\n"
                                         f"Реальный вход: ${up_entry:.6g}\n"
                                         f"Slippage: {slippage_pct:.2f}% (>{SLIPPAGE_CLOSE_PCT}%)\n"
@@ -1147,10 +1167,10 @@ def _apply_slippage_protection(executor, sym: str, side: str,
                                     )
                                 return result
                             except Exception as e:
-                                print(f"[prophet V13.8] {sym}: close error: {e}")
+                                print(f"[prophet V18] {sym}: close error: {e}")
                                 break
         except Exception as e:
-            print(f"[prophet V13.8] {sym}: slippage close error: {e}")
+            print(f"[prophet V18] {sym}: slippage close error: {e}")
         return result
     
     # 1% < slippage ≤ 5% — корректируем TP/SL
@@ -1187,7 +1207,7 @@ def _apply_slippage_protection(executor, sym: str, side: str,
                         result["new_tp"] = new_tp
                         if B:
                             B.send_telegram(
-                                f"📐 <b>SLIPPAGE ADJUST: {sym} {side.upper()}</b>\n"
+                                f"📐 <b>PROPHET V18 SLIPPAGE ADJUST: {sym} {side.upper()}</b>\n"
                                 f"Плановый вход: ${planned_entry:.6g}\n"
                                 f"Реальный вход: ${up_entry:.6g}\n"
                                 f"Slippage: +{slippage_pct:.2f}%\n"
@@ -1197,7 +1217,7 @@ def _apply_slippage_protection(executor, sym: str, side: str,
                             )
                         return result
     except Exception as e:
-        print(f"[prophet V13.8] {sym}: adjust error: {e}")
+        print(f"[prophet V18] {sym}: adjust error: {e}")
     
     return result
 
@@ -1250,7 +1270,7 @@ def execute_trade(setup):
         emoji_dir = "🟢 LONG" if side == "long" else "🔴 SHORT"
         if B:
             B.send_telegram(
-                f"✅ <b>ПРОРОК V16: {sym} {emoji_dir} открыт</b>\n"
+                f"✅ <b>ПРОРОК V18: {sym} {emoji_dir} открыт</b>\n"
                 f"Вход: ${entry:.6g}\n"
                 f"Стоп: ${stop:.6g} ({sp:.1f}%)\n"
                 f"📊 TP1 (70%): ${tp1_price:.6g} ({tp1_pct:.1f}%)\n"
@@ -1305,9 +1325,9 @@ def execute_trade(setup):
                         tr[k]["close_reason"] = "SLIPPAGE_PROTECTION"
                     _save_tracked(tr)
         except Exception as e:
-            print(f"[prophet V13.8] {sym}: slippage protection error: {e}")
+            print(f"[prophet V18] {sym}: slippage protection error: {e}")
     except Exception as e:
-        if B: B.send_telegram(f"⚠️ Prophet {sym}: ошибка — {e}")
+        if B: B.send_telegram(f"⚠️ PROPHET V18 {sym}: ошибка — {e}")
 
 # === POSITION MANAGEMENT ===
 
@@ -1389,7 +1409,7 @@ def _fetch_realized_pnl(executor, rec, pid):
                 break
             except Exception as e:
                 if attempt == 2:
-                    print(f"[prophet V16] orders_history({asset}) failed 3x: {e}")
+                    print(f"[prophet V18] orders_history({asset}) failed 3x: {e}")
                 else:
                     time.sleep(0.5 * (attempt + 1))
         
@@ -1415,7 +1435,7 @@ def _fetch_realized_pnl(executor, rec, pid):
             total_pnl += pv
             found_any = True
             o_pid = str(o.get("positionId", "") or o.get("id", "") or "")
-            print(f"[prophet V16] {sym} asset={asset}: order ts={ts:.0f} "
+            print(f"[prophet V18] {sym} asset={asset}: order ts={ts:.0f} "
                   f"pid={o_pid[:8] if o_pid else '-'} pnl=${pv:+.2f} "
                   f"running=${total_pnl:+.2f}")
         
@@ -1469,7 +1489,7 @@ def manage_positions():
                 # V13.3: НЕ удаляем pending_ если markets не загружены —
                 # иначе теряем реально открытые позиции после рестарта
                 if not executor._mk:
-                    print(f"[prophet V13.12] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
+                    print(f"[prophet V18] WARNING: markets не загружены, сохраняем pending_ {sym_m}")
                 else:
                     del tracked[pid]; changed = True
             continue
@@ -1488,11 +1508,11 @@ def manage_positions():
 
             # V16 DEBUG: логируем найденный PnL
             if abs(debug_pnl_source) < 0.01:
-                print(f"[prophet V16] ⚠ {rec.get('sym','?')} pid={pid}: "
+                print(f"[prophet V18] ⚠ {rec.get('sym','?')} pid={pid}: "
                       f"realizedPnl не найден в orders_history! gross=$0.00 — "
                       f"проверь API Upscale / формат asset")
             else:
-                print(f"[prophet V16] {rec.get('sym','?')} pid={pid}: "
+                print(f"[prophet V18] {rec.get('sym','?')} pid={pid}: "
                       f"realized gross=${debug_pnl_source:+.2f}")
 
             _stats["pnl"] += pnl
@@ -1521,7 +1541,7 @@ def manage_positions():
             if side_pnl_now <= -SIDE_DAILY_STOP_USD:
                 side_name = "LONG" if direction_field in ("LONG","long") else "SHORT"
                 if B: B.send_telegram(
-                    f"🚫 <b>V13.12: {side_name} заблокирован до завтра</b>\n"
+                    f"🚫 <b>PROPHET V18: {side_name} заблокирован до завтра</b>\n"
                     f"Сегодняшний PnL по {side_name}: ${side_pnl_now:+.0f}\n"
                     f"Лимит стороны: -${SIDE_DAILY_STOP_USD:.0f}\n"
                     f"Обратная сторона продолжает работать."
@@ -1543,7 +1563,7 @@ def manage_positions():
                     else:
                         tp2_str = " (TP1+TP2 сразу)"
                     B.send_telegram(
-                        f"✅ <b>PROPHET: {sym_name} {emoji_dir} ЗАКРЫТА В ПЛЮС</b>\n"
+                        f"✅ <b>PROPHET V18: {sym_name} {emoji_dir} ЗАКРЫТА В ПЛЮС</b>\n"
                         f"💰 PnL: ${pnl:+.2f}\n"
                         f"📍 Вход: ${entry_price:.6g}\n"
                         f"⏱️ Hold: {hold_min}мин{tp2_str}"
@@ -1552,7 +1572,7 @@ def manage_positions():
                     hold_h = hold_sec // 3600
                     reason = f"тайм-аут {hold_h}ч" if hold_sec >= MAX_HOLD else "стоп-лосс"
                     B.send_telegram(
-                        f"❌ <b>PROPHET: {sym_name} {emoji_dir} ЗАКРЫТА В УБЫТОК</b>\n"
+                        f"❌ <b>PROPHET V18: {sym_name} {emoji_dir} ЗАКРЫТА В УБЫТОК</b>\n"
                         f"💸 PnL: ${pnl:+.2f}\n"
                         f"📍 Вход: ${entry_price:.6g}\n"
                         f"⏱️ Hold: {hold_min}мин\n"
@@ -1594,17 +1614,103 @@ def manage_positions():
                                     if B:
                                         emoji = "🟢" if is_long else "🔴"
                                         B.send_telegram(
-                                            f"🛡️ <b>СТОП В БЕЗУБЫТОК — {rec['sym']} {emoji}</b>\n"
+                                            f"🛡️ <b>PROPHET V18: СТОП В БЕЗУБЫТОК — {rec['sym']} {emoji}</b>\n"
                                             f"TP1 сработал (70% закрыто)\n"
                                             f"Стоп перенесён на цену входа: ${entry:.6g}\n"
                                             f"Остаток 30% работает без риска"
                                         )
-                                    print(f"[prophet V16] {rec['sym']}: TP1 hit → стоп в безубыток ${entry:.6g}")
+                                    print(f"[prophet V18] {rec['sym']}: TP1 hit → стоп в безубыток ${entry:.6g}")
                                 except Exception as e:
-                                    print(f"[prophet V16] {rec['sym']}: move_stop error: {e}")
+                                    print(f"[prophet V18] {rec['sym']}: move_stop error: {e}")
             
             hold = now - rec.get("opened_ts", now)
-            if hold >= MAX_HOLD:
+            hold_hours = hold / 3600
+            # ─── V18: HYBRID CHECKPOINT LOGIC ────────────────────────────
+            # На 24h и 36h проверяем unrealized PnL позиции (через цену mark).
+            # Если PnL > 0 → закрываем по рынку (фиксируем прибыль).
+            # Если PnL <= 0 → отмечаем cp_{cp_h}h_passed=True, ждём дальше.
+            cp_triggered = None
+            for cp_h in CHECKPOINT_HOURS:
+                cp_key = f"cp_{cp_h}h_passed"
+                if hold_hours >= cp_h and not rec.get(cp_key):
+                    cp_triggered = cp_h
+                    break
+            if cp_triggered is not None:
+                cp_h = cp_triggered
+                cp_key = f"cp_{cp_h}h_passed"
+                pos = next((p for p in live if UE._pos_id(p) == pid), None)
+                if pos:
+                    mid = UE._pos_market(pos)
+                    if mid:
+                        # Оцениваем unrealized PnL через текущую цену
+                        try:
+                            upnl = pos.get("unrealizedPnl")
+                            if upnl is not None:
+                                try:
+                                    if str(upnl).isdigit() and len(str(upnl)) > 9:
+                                        pnl_check = float(UE.from_fp9(str(upnl)))
+                                    else:
+                                        pnl_check = float(upnl)
+                                except:
+                                    pnl_check = 0.0
+                            else:
+                                # Fallback — считаем через текущую цену
+                                cur_price = _fetch_current_price_for_sym(rec["sym"])
+                                if not cur_price:
+                                    cur_price = pos.get("markPrice") or pos.get("lastPrice") or rec.get("entry", 0)
+                                try: cur_price = float(cur_price)
+                                except: cur_price = rec.get("entry", 0)
+                                entry_price = rec.get("entry", 0)
+                                direction = rec.get("direction", rec.get("dir", "long"))
+                                atr_pct = rec.get("atr_pct", 2.5)
+                                sl_mult = SL_MULT
+                                if direction in ("LONG", "long"):
+                                    pct_ret = (cur_price - entry_price) / entry_price * 100
+                                else:
+                                    pct_ret = (entry_price - cur_price) / entry_price * 100
+                                pct_ret -= (COMMISSION_PCT * 2 + SPREAD_PCT) / 100.0
+                                # Учёт только оставшейся части позиции (если TP1 был hit)
+                                remaining = 1.0 - (TP1_FRACTION if rec.get("tp1_hit") else 0.0)
+                                pos_size = (RISK_USD / (sl_mult * atr_pct) * 100) * remaining
+                                pnl_check = (pct_ret / 100) * pos_size
+                        except Exception as e:
+                            print(f"[prophet V18] {rec.get('sym','?')}: cp_pnl calc error: {e}")
+                            pnl_check = 0.0
+
+                        if pnl_check > 0:
+                            # В плюсе → закрываем по рынку
+                            dir_field = rec.get("dir", rec.get("direction", "long"))
+                            if dir_field in ("SHORT", "short"): dir_field = "short"
+                            else: dir_field = "long"
+                            info = {"id": pid, "mid": mid, "dir": dir_field}
+                            try:
+                                executor.close_position(info, reason=f"PROPHET_CHECKPOINT_{cp_h}h")
+                                if B:
+                                    pnl_str = f"+${pnl_check:.2f}" if pnl_check >= 0 else f"-${abs(pnl_check):.2f}"
+                                    B.send_telegram(
+                                        f"💎 <b>PROPHET V18 Checkpoint {cp_h}h</b>\n"
+                                        f"🎯 {rec['sym']} — позиция закрыта в плюсе\n"
+                                        f"⏱️ Удержание: {hold_hours:.1f}h\n"
+                                        f"💰 PnL: {pnl_str} (фиксируем прибыль)\n"
+                                        f"━━━━━━━━━━━━━━━━━━\n"
+                                        f"💎 V18 HYBRID: спасает прибыльные сделки до того, как они превратятся в убыток"
+                                    )
+                            except Exception as e:
+                                print(f"[prophet V18] {rec['sym']}: cp close error: {e}")
+                        else:
+                            # Не в плюсе → отмечаем, ждём дальше
+                            rec[cp_key] = True
+                            changed = True
+                            if B:
+                                pnl_str = f"${pnl_check:+.2f}"
+                                B.send_telegram(
+                                    f"⏸️ <b>PROPHET V18 Checkpoint {cp_h}h — пропуск</b>\n"
+                                    f"🎯 {rec['sym']} — PnL {pnl_str} (не в плюсе)\n"
+                                    f"⏱️ Удержание: {hold_hours:.1f}h\n"
+                                    f"Продолжаем ждать до следующего чекпойнта или TP/SL"
+                                )
+            # ─── V18: 48h TIMEOUT (как в V16) ──────────────────────────────
+            elif hold >= MAX_HOLD:
                 pos = next((p for p in live if UE._pos_id(p) == pid), None)
                 if pos:
                     mid = UE._pos_market(pos)
@@ -1615,7 +1721,12 @@ def manage_positions():
                         info = {"id": pid, "mid": mid, "dir": dir_field}
                         try:
                             executor.close_position(info, reason=f"PROPHET_TIMEOUT_{MAX_HOLD//3600}h")
-                            if B: B.send_telegram(f"⏱️ Prophet {rec['sym']}: safety-net {MAX_HOLD//3600}ч")
+                            if B: B.send_telegram(
+                                f"⏱️ <b>PROPHET V18 Timeout {MAX_HOLD//3600}h</b>\n"
+                                f"🎯 {rec['sym']} — принудительное закрытие\n"
+                                f"⏱️ Удержание: {hold_hours:.1f}h\n"
+                                f"Позиция не отработала TP/SL ни на одном чекпойнте"
+                            )
                         except: pass
 
     if changed:
@@ -1633,19 +1744,19 @@ def _scanner_loop():
     # V13.7 FIX P0-3: используем threading.Event для атомарной остановки
     # (старый flag _scanner_running был race condition)
     _scanner_stop_event.clear()  # сбрасываем флаг остановки при запуске нового thread
-    print(f"[prophet V13.12] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
+    print(f"[prophet V18] Scanner запущен. Часы скана: {AUTO_HOURS_MSK}, мин={SCAN_MINUTE}")
     # V13.12: диагностика TZ — проверяем что часовой пояс правильный
     _now_diag = dt.datetime.now(MSK)
     _utc_diag = dt.datetime.now(dt.timezone.utc)
-    print(f"[prophet V13.12] TZ диагностика: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, разница={(_now_diag.hour - _utc_diag.hour) % 24}ч")
+    print(f"[prophet V18] TZ диагностика: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, разница={(_now_diag.hour - _utc_diag.hour) % 24}ч")
     if B:
-        try: B.send_telegram(f"🕐 V13.12 TZ проверка: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, ожидаемая разница=3ч (MSK=UTC+3)")
+        try: B.send_telegram(f"🕐 PROPHET V18 TZ проверка: MSK={_now_diag.strftime('%H:%M:%S')}, UTC={_utc_diag.strftime('%H:%M:%S')}, ожидаемая разница=3ч (MSK=UTC+3)")
         except: pass
     while True:
         try:
             # V13.7 FIX P0-3: atomic event check — если watchdog установил event — выходим
             if _scanner_stop_event.is_set():
-                print(f"[prophet V13.12] Scanner: stop event установлен, останавливаюсь")
+                print(f"[prophet V18] Scanner: stop event установлен, останавливаюсь")
                 return  # выход из потока — watchdog создаст новый
             
             mode = _state.get("scan_mode", "off")
@@ -1691,7 +1802,7 @@ def _scanner_loop():
                     if closed_n > 0 and B:
                         tracked = _load_tracked()
                 except Exception as e:
-                    print(f"[prophet] cleaner error in scanner loop: {e}")
+                    print(f"[prophet V18] cleaner error in scanner loop: {e}")
 
             # V13.12: AUTO-SYNC — убираем orphan'ы перед сканом
             # (позиция уже закрыта на Upscale, но запись осталась в tracked)
@@ -1699,7 +1810,7 @@ def _scanner_loop():
                 if B and hasattr(B, "EXECUTOR") and B.EXECUTOR and B.EXECUTOR.client:
                     _auto_sync_orphans()
             except Exception as e:
-                print(f"[prophet V13.12] auto-sync error: {e}")
+                print(f"[prophet V18] auto-sync error: {e}")
 
             # Уже есть открытая позиция?
             tracked = _load_tracked()
@@ -1711,13 +1822,13 @@ def _scanner_loop():
             skip_reason = ""
             if open_count >= MAX_OPEN:
                 skip_reason = f" ⏸️ MAX_OPEN достигнут ({open_count}/{MAX_OPEN}), скан пропущен"
-            scan_started_msg = f"🔍 V13.12 скан в {scan_dt_str} МСК (UTC={utc_dt_str}, режим={mode}, открыто={open_count}/{MAX_OPEN}){skip_reason}"
-            print(f"[prophet V13.12] {scan_started_msg}")
+            scan_started_msg = f"🔍 PROPHET V18 скан в {scan_dt_str} МСК (UTC={utc_dt_str}, режим={mode}, открыто={open_count}/{MAX_OPEN}){skip_reason}"
+            print(f"[prophet V18] {scan_started_msg}")
             if B and mode == "auto":
                 try:
                     B.send_telegram(scan_started_msg)
                 except Exception as e:
-                    print(f"[prophet V13.12] send start msg error: {e}")
+                    print(f"[prophet V18] send start msg error: {e}")
 
             if open_count >= MAX_OPEN:
                 time.sleep(60); continue
@@ -1725,7 +1836,7 @@ def _scanner_loop():
             try:
                 setup = do_scan(now_ts)
             except Exception as e:
-                print(f"[prophet V13.12] do_scan error: {e}")
+                print(f"[prophet V18] do_scan error: {e}")
                 if B:
                     try: B.send_telegram(f"⚠️ V13.12: ошибка скана в {scan_dt_str}: {e}")
                     except: pass
@@ -1738,7 +1849,7 @@ def _scanner_loop():
             if setup:
                 direction = setup.get("direction", "LONG")
                 emoji_dir = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
-                print(f"[prophet V12] скан {scan_dt_str}: лучший сигнал {setup['symbol']} {direction} score={setup['score']:.0f}")
+                print(f"[prophet V18] скан {scan_dt_str}: лучший сигнал {setup['symbol']} {direction} score={setup['score']:.0f}")
                 min_s = AUTO_SCORE if mode == "auto" else MIN_SCORE
                 if setup["score"] >= min_s:
                     _stats["signals"] += 1
@@ -1747,22 +1858,22 @@ def _scanner_loop():
                     if mode == "auto":
                         if B:
                             B.send_telegram(
-                                f"🔮 <b>V12 — сигнал найден</b>\n"
+                                f"🔮 <b>PROPHET V18 — сигнал найден</b>\n"
                                 f"🎯 {setup['symbol']} {emoji_dir} score={setup['score']:.0f}\n"
                                 f"⚡ Вхожу сразу (V13.12)"
                             )
                         execute_trade(setup)
                     else:
                         # Continuous (ручной режим): отправляем в Telegram с кнопками
-                        print(f"[prophet V12] сигнал {setup['symbol']} score={setup['score']:.0f} → отправляю в Telegram")
+                        print(f"[prophet V18] сигнал {setup['symbol']} score={setup['score']:.0f} → отправляю в Telegram")
                         send_signal(setup)
                 else:
-                    print(f"[prophet V12] сигнал {setup['symbol']} score={setup['score']:.0f} < порога {min_s} → пропуск")
+                    print(f"[prophet V18] сигнал {setup['symbol']} score={setup['score']:.0f} < порога {min_s} → пропуск")
                     if B:
                         threshold_str = f"авто ≥{AUTO_SCORE}" if mode == "auto" else f"ручной ≥{MIN_SCORE}"
                         mode_label = {"auto": "🤖 Авто", "continuous": "🔄 Непрерывный", "single": "🔍 Разовый"}.get(mode, mode)
                         B.send_telegram(
-                            f"🔮 V12 Скан {scan_dt_str} МСК ({mode_label})\n"
+                            f"🔮 PROPHET V18 скан {scan_dt_str} МСК ({mode_label})\n"
                             f"━━━━━━━━━━━━━━━━━━\n"
                             f"Проверено пар: {len(PAIRS)}\n"
                             f"Лучший: {setup['symbol']} {emoji_dir} score={setup['score']:.0f}\n"
@@ -1770,11 +1881,11 @@ def _scanner_loop():
                             f"Открыто: {open_count}/{MAX_OPEN}"
                         )
             else:
-                print(f"[prophet V12] скан {scan_dt_str}: сигналов не найдено")
+                print(f"[prophet V18] скан {scan_dt_str}: сигналов не найдено")
                 if B:
                     mode_label = {"auto": "🤖 Авто", "continuous": "🔄 Непрерывный", "single": "🔍 Разовый"}.get(mode, mode)
                     B.send_telegram(
-                        f"🔮 V12 Скан {scan_dt_str} МСК ({mode_label})\n"
+                        f"🔮 PROPHET V18 скан {scan_dt_str} МСК ({mode_label})\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"Проверено пар: {len(PAIRS)}\n"
                         f"❌ Сигналов не найдено\n"
@@ -1783,7 +1894,7 @@ def _scanner_loop():
 
             time.sleep(60)
         except Exception as e:
-            print(f"[prophet V12] loop error: {e}")
+            print(f"[prophet V18] loop error: {e}")
             time.sleep(60)
 
 # === COMMANDS ===
@@ -1798,13 +1909,13 @@ def cmd_status():
         if sync_msg and ("SYNC:" in sync_msg and "убрано" in sync_msg):
             if B: B.send_telegram("🧹 " + sync_msg)
     except Exception as e:
-        print(f"[prophet V13.12] status auto-sync error: {e}")
+        print(f"[prophet V18] status auto-sync error: {e}")
 
     mode = _state.get("scan_mode", "off")
     mode_str = {"off": "🔴 Выкл",
                 "continuous": "🔄 Непрерывный (каждый час в :15)",
                 "auto": f"🤖 Авто (V16 часы: {AUTO_HOURS_MSK}, без 11:00 МСК)"}.get(mode, mode)
-    lines = ["", "━━━ 🔮 Пророк V16 ━━━"]
+    lines = ["", "━━━ 🔮 Пророк V18 ━━━"]
     lines.append(f"Режим: {mode_str}")
     tracked = _load_tracked()
     open_n = sum(1 for v in tracked.values() if v.get("status") == "open")
@@ -1834,6 +1945,7 @@ def cmd_status():
     lines.append(f"🎯 SL: {SL_MULT}×ATR | TP1({int(TP1_FRACTION*100)}%)={TP1_MULT}×ATR + TP2({int(TP2_FRACTION*100)}%)={TP2_MULT}×ATR")
     lines.append(f"🛡️ При TP1 → стоп в безубыток | Hold={MAX_HOLD//3600}ч")
     lines.append(f"⚡ Вход сразу (без 15m подтверждения)")
+    lines.append(f"💎 V18 Checkpoints: {CHECKPOINT_HOURS} — закрытие в плюсе на 24h/36h")
     if BEAR_AWARE_ENABLED:
         lines.append(f"🐻 Bear-aware: BULL→LONG+SHORT | BEAR→SHORT+LONG | Cooldown: 24ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
@@ -1881,7 +1993,7 @@ def cmd_on():
     # V13.9: проверяем что scanner thread жив, если нет — перезапускаем
     global _scanner_thread, _scanner_stop_event
     if _scanner_thread is None or not _scanner_thread.is_alive():
-        print(f"[prophet V13.9] cmd_on: scanner thread мёртв, перезапускаю")
+        print(f"[prophet V18] cmd_on: scanner thread мёртв, перезапускаю")
         _scanner_stop_event.clear()
         _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-cmd-on")
         _scanner_thread.start()
@@ -1897,13 +2009,15 @@ def cmd_on():
     total_profit = tp1_profit + tp2_profit
     
     return (
-        f"🤖 <b>Prophet V16 включён</b>\n\n"
+        f"🤖 <b>Prophet V18 включён</b> (HYBRID Checkpoints)\n\n"
         f"📊 <b>Настройки:</b>\n"
         f"💰 Risk: <b>${RISK_USD:.0f}</b>\n"
         f"🎯 SL: <b>{SL_MULT}×ATR</b> (≈{sl_pct:.1f}%)\n"
         f"📊 TP1 (70%): <b>{TP1_MULT}×ATR</b> (≈{tp1_pct:.1f}%)\n"
         f"📊 TP2 (30%): <b>{TP2_MULT}×ATR</b> (≈{tp2_pct:.1f}%)\n"
         f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
+        f"💎 V18 Checkpoints: {CHECKPOINT_HOURS} — закрытие в плюсе на 24h/36h\n"
+        f"⏱️ MAX_HOLD: {MAX_HOLD//3600}h (timeout) | Кулдаун: 24ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR\n"
         f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
         f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
         f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | Порог: ≥{AUTO_SCORE}\n\n"
@@ -1911,6 +2025,7 @@ def cmd_on():
         f"  TP1 (70%) → +${tp1_profit:.0f}\n"
         f"  TP2 (30%) → +${tp2_profit:.0f}\n"
         f"  Итого → +${total_profit:.0f}\n"
+        f"📈 Бэктест 297д: WR 61.9%, PF 1.68, +$11,671, Sharpe 4.68\n"
         f"🚀 Стратегия запущена"
     )
 
@@ -1919,14 +2034,14 @@ def cmd_off():
     _state["scan_mode"] = "off"
     _state["pending_signal"] = None
     _save()
-    return "🔴 Prophet V12 выключен. Открытые позиции продолжают работать."
+    return "🔴 Prophet V18 выключен. Открытые позиции продолжают работать."
 
 def cmd_alerts_toggle():
     """V15-fix: Переключение уведомлений в Telegram (входы/TP1/TP2/SL)."""
     _state["alerts_enabled"] = not _state.get("alerts_enabled", True)
     _save()
     state_str = "ВКЛ ✅" if _state["alerts_enabled"] else "ВЫКЛ 🔕"
-    return f"🔔 Prophet уведомления: {state_str}"
+    return f"🔔 PROPHET V18 уведомления: {state_str}"
 
 def cmd_close():
     if not B or not hasattr(B, "EXECUTOR"): return "⚠️ Executor недоступен"
@@ -1953,9 +2068,9 @@ def cmd_close():
                         tr = _load_tracked()
                         if pid in tr: tr[pid]["status"] = "closed"; _save_tracked(tr)
                     closed += 1
-                    if B: B.send_telegram(f"🛑 Prophet {rec['sym']}: закрыто ({res})")
+                    if B: B.send_telegram(f"🛑 PROPHET V18 {rec['sym']}: закрыто ({res})")
         except Exception as e:
-            print(f"[prophet] close error: {e}")
+            print(f"[prophet V18] close error: {e}")
     return f"🛑 Закрыто: {closed}"
 
 def cmd_clean():
@@ -2013,7 +2128,7 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     # ВАЖНО: если markets не загружены — НЕ трогаем pending_, можем снести реальные
     markets_ok = bool(executor._mk)
     if not markets_ok:
-        print(f"[prophet V13.12] WARNING: markets не загружены, пропускаем pending_ cleanup")
+        print(f"[prophet V18] WARNING: markets не загружены, пропускаем pending_ cleanup")
 
     # V13.7 FIX P0-1 (audit): КРИТИЧНО — если live_ids пустой но в tracked есть открытые позиции,
     # это означает API failure (transient error). НЕ удалять tracked — иначе теряем управление!
@@ -2024,9 +2139,9 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     if len(live_ids) == 0 and real_open_in_tracked > 0:
         err_msg = (f"⚠️ SYNC ABORTED: live positions empty but tracked has {real_open_in_tracked} open — "
                    f"possibly API failure. NOT deleting tracked records.")
-        print(f"[prophet V13.12] {err_msg}")
+        print(f"[prophet V18] {err_msg}")
         if B:
-            try: B.send_telegram(f"🚨 <b>SYNC ABORTED</b>\nAPI вернул 0 позиций, но tracked имеет {real_open_in_tracked} открытых. "
+            try: B.send_telegram(f"🚨 <b>PROPHET V18 SYNC ABORTED</b>\nAPI вернул 0 позиций, но tracked имеет {real_open_in_tracked} открытых. "
                                 f"Возможно transient failure. Записи НЕ удалены.")
             except: pass
         return err_msg
@@ -2107,14 +2222,14 @@ def _auto_sync_orphans(verbose_telegram: bool = False) -> str:
     open_n = sum(1 for v in tracked_after.values() if v.get("status") == "open")
 
     if cleaned_count > 0:
-        msg_lines = [f"🔄 V13.12 SYNC: убрано {cleaned_count} orphan-записей:"]
+        msg_lines = [f"🔄 PROPHET V18 SYNC: убрано {cleaned_count} orphan-записей:"]
         for c in cleaned_list:
             msg_lines.append(f"  • {c}")
         msg_lines.append(f"\n📊 Теперь открыто: {open_n}")
         msg = "\n".join(msg_lines)
         if verbose_telegram and B:
             B.send_telegram(msg)
-        print(f"[prophet V13.12] auto-sync: убрано {cleaned_count} orphan, теперь открыто {open_n}")
+        print(f"[prophet V18] auto-sync: убрано {cleaned_count} orphan, теперь открыто {open_n}")
         return msg
     else:
         live_count = len(live_ids)
@@ -2201,10 +2316,10 @@ def run_cleaner(reason="AUTO_CLEAN"):
                         tr[pid]["closed_ts"] = now
                         _save_tracked(tr)
             except Exception as e:
-                print(f"[prophet] cleaner error for {sym} ({pid}): {e}")
+                print(f"[prophet V18] cleaner error for {sym} ({pid}): {e}")
 
     if closed_count > 0:
-        msg_lines = [f"🧹 Cleaner V12 ({reason}): закрыто {closed_count} позиций:"]
+        msg_lines = [f"🧹 PROPHET V18 Cleaner ({reason}): закрыто {closed_count} позиций:"]
         for c in closed_list:
             msg_lines.append(f"  • {c}")
         msg = "\n".join(msg_lines)
@@ -2212,10 +2327,10 @@ def run_cleaner(reason="AUTO_CLEAN"):
             B.send_telegram(msg)
         return closed_count, msg
     else:
-        return 0, f"🧹 Cleaner V12 ({reason}): все открытые позиции в норме (проверено {len(open_recs)})"
+        return 0, f"🧹 PROPHET V18 Cleaner ({reason}): все открытые позиции в норме (проверено {len(open_recs)})"
 
 def cmd_stats():
-    lines = ["", "━━━ 🔮 Пророк V16 — Статистика ━━━"]
+    lines = ["", "━━━ 🔮 Пророк V18 — Статистика ━━━"]
     lines.append(f"Сканирований: {_stats['scans']}")
     lines.append(f"Сигналов: {_stats['signals']}")
     lines.append(f"Сделок: {_stats['trades']}")
@@ -2247,9 +2362,9 @@ def _scanner_watchdog():
             
             # Проверка 1: thread умер (классический случай)
             if _scanner_thread is None or not _scanner_thread.is_alive():
-                print(f"[prophet V13.12] WATCHDOG: scanner thread умер, перезапускаю...")
+                print(f"[prophet V18] WATCHDOG: scanner thread умер, перезапускаю...")
                 if B:
-                    try: B.send_telegram("🔄 V13.12: scanner thread перезапускается (умер, watchdog)")
+                    try: B.send_telegram("🔄 PROPHET V18: scanner перезапускается (умер, watchdog)")
                     except: pass
                 _scanner_thread = threading.Thread(target=_scanner_loop, daemon=True, name="prophet-scanner-v12-restart")
                 _scanner_thread.start()
@@ -2275,10 +2390,10 @@ def _scanner_watchdog():
                 last_scan_msk = dt.datetime.fromtimestamp(last_scan, tz=MSK) if last_scan else None
                 last_scan_str = last_scan_msk.strftime("%Y-%m-%d %H:%M") if last_scan_msk else "никогда"
                 age_hours = age_sec / 3600
-                print(f"[prophet V13.12] WATCHDOG: scanner ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч назад), перезапускаю...")
+                print(f"[prophet V18] WATCHDOG: scanner ЗАВИС! Последний скан: {last_scan_str} ({age_hours:.1f}ч назад), перезапускаю...")
                 if B:
                     try: B.send_telegram(
-                        f"🚨 <b>V13.12: scanner ЗАВИС!</b>\n"
+                        f"🚨 <b>PROPHET V18: scanner ЗАВИС!</b>\n"
                         f"Последний скан: {last_scan_str} ({age_hours:.1f}ч назад)\n"
                         f"Принудительный перезапуск scanner thread."
                     )
@@ -2293,7 +2408,7 @@ def _scanner_watchdog():
                 if _scanner_thread is not None:
                     _scanner_thread.join(timeout=10)  # ждём до 10 сек реальной остановки
                     if _scanner_thread.is_alive():
-                        print(f"[prophet V13.12] WATCHDOG: старый scanner не остановился за 10с, всё равно запускаю новый")
+                        print(f"[prophet V18] WATCHDOG: старый scanner не остановился за 10с, всё равно запускаю новый")
                 _scanner_stop_event.clear()  # сбрасываем event для нового thread
                 time.sleep(1)
                 # Принудительно создаём новый thread
@@ -2303,7 +2418,7 @@ def _scanner_watchdog():
                 _state["last_scan_ts"] = int(_now())
                 _save()
         except Exception as e:
-            print(f"[prophet V13.12] watchdog error: {e}")
+            print(f"[prophet V18] watchdog error: {e}")
 
 def _manager_loop():
     """V15-fix: Отдельный поток управления позициями — работает ВСЕГДА,
@@ -2313,12 +2428,12 @@ def _manager_loop():
     ДО ФИКСА: manage_positions() вообще нигде не вызывалась →
     TP1→безубыток в Prophet никогда не работал автоматически.
     """
-    print(f"[prophet V16] Manager запущен: интервал 30с (работает даже при OFF)")
+    print(f"[prophet V18] Manager запущен: интервал 30с (работает даже при OFF)")
     while True:
         try:
             manage_positions()
         except Exception as e:
-            print(f"[prophet V16] manager error: {e}")
+            print(f"[prophet V18] manager error: {e}")
         time.sleep(30)
 
 def start():
@@ -2338,12 +2453,12 @@ def start():
     if _manager_thread is None or not _manager_thread.is_alive():
         _manager_thread = threading.Thread(target=_manager_loop, daemon=True, name="prophet-manager")
         _manager_thread.start()
-    print(f"[prophet V16] Старт: режим={_state.get('scan_mode','off')}")
+    print(f"[prophet V18] Старт: режим={_state.get('scan_mode','off')}")
     if B:
         mode = _state.get('scan_mode','off')
         mode_str = "🟢 ВКЛ (авто)" if mode == "auto" else "🔴 ВЫКЛ"
         B.send_telegram(
-            f"🔮 <b>Пророк V16 запущен</b>\n"
+            f"🔮 <b>Пророк V18 запущен</b> (HYBRID Checkpoints)\n"
             f"📊 Стратегия: {mode_str}\n"
             f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN}\n"
             f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
@@ -2351,7 +2466,10 @@ def start():
             f"📊 TP1 (70%): {TP1_MULT}×ATR\n"
             f"📊 TP2 (30%): {TP2_MULT}×ATR\n"
             f"🛡️ При TP1 → стоп в безубыток (работает даже при OFF)\n"
+            f"💎 V18 Checkpoints: {CHECKPOINT_HOURS} — закрытие в плюсе на 24h/36h\n"
+            f"⏱️ MAX_HOLD: {MAX_HOLD//3600}h (timeout) | Кулдаун: 24ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR\n"
             f"📌 Пирамидинг: новые только если предыдущие в плюсе\n"
+            f"📈 Бэктест 297д: WR 61.9%, PF 1.68, +$11,671, Sharpe 4.68\n"
             f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'}\n"
             f"Команды: /prophet /prophet_on /prophet_off /prophet_close /prophet_clean /prophet_config"
         )
