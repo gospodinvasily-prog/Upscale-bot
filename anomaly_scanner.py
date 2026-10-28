@@ -398,7 +398,10 @@ def detect_anomalies(sym, scan_ts, c4h, market_returns, btc_reg):
 
     # === АНОМАЛИЯ 6: TrendAlignment — Stacked MA + ADX растёт ===
     # V16: добавлена 6-я аномалия (как в prophet_V15.py)
+    # V18 FIX (2026-10-28): добавлено определение `closes` — было NameError
+    # «name 'closes' is not defined» на каждом скане, стратегия не работала.
     if len(c4) >= 89:
+        closes = [c["close"] for c in c4]
         sma13 = _sma(closes, 13)
         sma34 = _sma(closes, 34)
         sma89 = _sma(closes, 89)
@@ -1339,6 +1342,24 @@ def _scanner_loop():
                 setup = do_scan(now_ts)
             except Exception as e:
                 print(f"[anomaly V18] do_scan error: {e}")
+                # V18 FIX (2026-10-28): отправляем ошибку в Telegram (с троттлингом 30 мин)
+                # Раньше: только print() → в TG тишина, баг не видно.
+                # Теперь: 1-е сообщение об ошибке → TG, дальше тишина 30 мин.
+                try:
+                    err_key = "_last_do_scan_error_ts"
+                    last_err = _state.get(err_key, 0)
+                    if _now() - last_err > 1800:  # 30 минут
+                        if B:
+                            B.send_telegram(
+                                f"⚠️ <b>Anomaly V18: ошибка do_scan</b>\n"
+                                f"🐍 <code>{str(e)[:200]}</code>\n"
+                                f"⏱️ Скан продолжается, но сигналы не ищутся. "
+                                f"Следующее сообщение через 30 мин."
+                            )
+                        _state[err_key] = int(_now())
+                        _save()
+                except Exception as _e:
+                    print(f"[anomaly V18] send error to TG failed: {_e}")
                 setup = None
 
             _stats["scans"] += 1
