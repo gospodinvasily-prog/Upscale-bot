@@ -517,7 +517,12 @@ def _execute_signal(signal):
         "max_same_side": 1,  # только 1 сделка Big Candle одновременно
         "strategy": STRATEGY_TAG,
         "leverage_override": BC_LEVERAGE,
-        "ext_atr": float(signal["atr"]),
+        # V18 FIX (2026-10-28): "ext_atr" = отклонение цены в единицах ATR (0 = нет отклонения).
+        # Раньше: float(signal["atr"]) — передавало АБСОЛЮТНЫЙ ATR ($73.43), а chase_skip в
+        # upscale_exec.py интерпретировал это как "цена ушла на 73.43 ATR (>0.3)" → ВСЕГДА SKIP.
+        # Это и есть причина "пропускаем сигнал из-за отклонения цены > 0.3 ATR".
+        # Anomaly Scanner передаёт 0.0 — там бага нет. Big Candle должен делать так же.
+        "ext_atr": 0.0,
     }
 
     try:
