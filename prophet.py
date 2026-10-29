@@ -129,7 +129,8 @@ TP_COUNTER = 2.0     # для совместимости со старым ко�
 # - NEUTRAL (0): не торгуем
 BEAR_AWARE_ENABLED = True
 MIN_SCORE_BEAR = 70       # в BEAR режиме строже отбор (vs 60 в BULL)
-BEAR_COOLDOWN_HOURS = 48  # в BEAR режиме 48ч cooldown (vs 24ч в BULL)
+BULL_COOLDOWN_HOURS = 12  # V18-fix: 12ч в BULL (было 24ч) — альткоины меняют regime за 3-7 дней
+BEAR_COOLDOWN_HOURS = 24  # V18-fix: 24ч в BEAR (было 48ч) — тоже сокращено
 
 # V18: HYBRID CHECKPOINTS — главное отличие от V16
 # На каждом чекпойнте если unrealized PnL > 0 → закрываем по рынку
@@ -1522,9 +1523,9 @@ def manage_positions():
             side_pnl_now = _state.get("long_today_pnl" if direction_field in ("LONG","long") else "short_today_pnl", 0.0)
             # V12: cooldown после убытка
             if pnl < 0:
-                # V12-bear-aware: 48ч cooldown в BEAR, 24ч в BULL
+                # V18-fix: кулдаун после убытка — 12ч BULL / 24ч BEAR
                 btc_reg_close = _btc_regime(int(_now()))
-                cd_hours = BEAR_COOLDOWN_HOURS if (BEAR_AWARE_ENABLED and btc_reg_close == -1) else 24
+                cd_hours = BEAR_COOLDOWN_HOURS if (BEAR_AWARE_ENABLED and btc_reg_close == -1) else BULL_COOLDOWN_HOURS
                 if direction_field in ("LONG", "long"):
                     _state["long_cooldown_until"] = int(_now()) + cd_hours * 3600
                 else:
@@ -1947,7 +1948,7 @@ def cmd_status():
     lines.append(f"⚡ Вход сразу (без 15m подтверждения)")
     lines.append(f"💎 V18 Checkpoints: {CHECKPOINT_HOURS} — закрытие в плюсе на 24h/36h")
     if BEAR_AWARE_ENABLED:
-        lines.append(f"🐻 Bear-aware: BULL→LONG+SHORT | BEAR→SHORT+LONG | Cooldown: 24ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR")
+        lines.append(f"🐻 Bear-aware: BULL→LONG+SHORT | BEAR→SHORT+LONG | Cooldown: {BULL_COOLDOWN_HOURS}ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR")
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
     lines.append(f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'} (grace +{CLEANER_GRACE_HOURS}ч)")
     # V13.12: per-side daily PnL
@@ -2017,7 +2018,7 @@ def cmd_on():
         f"📊 TP2 (30%): <b>{TP2_MULT}×ATR</b> (≈{tp2_pct:.1f}%)\n"
         f"🛡️ При TP1 → стоп в безубыток (цена входа)\n"
         f"💎 V18 Checkpoints: {CHECKPOINT_HOURS} — закрытие в плюсе на 24h/36h\n"
-        f"⏱️ MAX_HOLD: {MAX_HOLD//3600}h (timeout) | Кулдаун: 24ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR\n"
+        f"⏱️ MAX_HOLD: {MAX_HOLD//3600}h (timeout) | Кулдаун: {BULL_COOLDOWN_HOURS}ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR\n"
         f"📊 Позиция: ~${pos_size:.0f} (маржа × {LEVERAGE}x)\n"
         f"⏰ Сканы: {AUTO_HOURS_MSK} МСК в :{SCAN_MINUTE:02d}\n"
         f"👥 Пар: {len(PAIRS)} | MAX_OPEN={MAX_OPEN} | Порог: ≥{AUTO_SCORE}\n\n"
@@ -2467,7 +2468,7 @@ def start():
             f"📊 TP2 (30%): {TP2_MULT}×ATR\n"
             f"🛡️ При TP1 → стоп в безубыток (работает даже при OFF)\n"
             f"💎 V18 Checkpoints: {CHECKPOINT_HOURS} — закрытие в плюсе на 24h/36h\n"
-            f"⏱️ MAX_HOLD: {MAX_HOLD//3600}h (timeout) | Кулдаун: 24ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR\n"
+            f"⏱️ MAX_HOLD: {MAX_HOLD//3600}h (timeout) | Кулдаун: {BULL_COOLDOWN_HOURS}ч BULL / {BEAR_COOLDOWN_HOURS}ч BEAR\n"
             f"📌 Пирамидинг: новые только если предыдущие в плюсе\n"
             f"📈 Бэктест 297д: WR 61.9%, PF 1.68, +$11,671, Sharpe 4.68\n"
             f"🧹 Cleaner: {'вкл' if CLEANER_ENABLED else 'выкл'}\n"
