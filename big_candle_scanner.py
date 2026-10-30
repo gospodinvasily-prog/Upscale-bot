@@ -722,10 +722,13 @@ def _manage_positions():
             _stats["total_pnl"] += pnl
             if pnl > 0:
                 _stats["wins"] += 1
-            else:
+            elif pnl < 0:
                 _stats["losses"] += 1
+            # else: pnl == 0 → PnL не получен, не считаем ни в wins ни в losses
 
-            # V15-fix: уведомление о закрытии позиции (TP/SL/timeout)
+            # V18-fix: уведомление о закрытии позиции — 3 ветки (плюс / убыток / PnL не получен)
+            # Раньше было if/else (pnl>0 → плюс, иначе → убыток). При pnl=0.00 (API не вернул
+            # realizedPnl) бот говорил "УБЫТОК $0.00 стоп-лосс" — вводил в заблуждение.
             if _state.get("alerts_enabled", True) and B:
                 sym_name = rec.get("sym", "?")
                 side = rec.get("side", "long")
@@ -741,7 +744,7 @@ def _manage_positions():
                         f"⏱️ Hold: {hold_min}мин\n"
                         f"📝 Причина: {reason_str}"
                     )
-                else:
+                elif pnl < 0:
                     hold_h = hold_sec // 3600
                     reason = f"тайм-аут {hold_h}ч" if hold_sec >= BC_MAX_HOLD_SEC else "стоп-лосс"
                     B.send_telegram(
@@ -750,6 +753,17 @@ def _manage_positions():
                         f"📍 Вход: ${entry_price:.2f}\n"
                         f"⏱️ Hold: {hold_min}мин\n"
                         f"📝 Причина: {reason}"
+                    )
+                else:
+                    # V18-fix: pnl == 0.00 — API не вернул realizedPnl
+                    # Раньше: шло в ветку "УБЫТОК" с причиной "стоп-лосс" — вводило в заблуждение
+                    # Теперь: честно говорим что PnL не получен, причина неизвестна
+                    B.send_telegram(
+                        f"⚠️ <b>BIG CANDLE: {sym_name} {emoji_dir} ЗАКРЫТА (PnL не получен)</b>\n"
+                        f"💰 PnL: $0.00 (API не вернул realizedPnl)\n"
+                        f"📍 Вход: ${entry_price:.2f}\n"
+                        f"⏱️ Hold: {hold_min}мин\n"
+                        f"📝 Причина: неизвестна — проверьте историю сделок на Upscale"
                     )
 
             del tracked[pos_id]
@@ -778,48 +792,120 @@ def _manage_positions():
 
 
 def _fetch_realized_pnl(executor, sym, since_ts):
-    """Получает PnL реализованный по символу с since_ts."""
-    try:
-        m = executor._mk.get(sym) if executor._mk else None
-        if not m:
-            return 0.0
-        asset = str(m.get("id", "")) or sym
-        data = executor.client.orders_history(executor.account_id, asset, 100)
-    except Exception:
+    """V18-fix: правильный поиск realized PnL (как в Prophet V18).
+
+    Что исправлено vs старой версии:
+    1. 3 попытки с backoff (API часто возвращает пустой список с первого раза)
+    2. Пробует ОБА варианта asset: market_id И тикер (если первый не работает)
+    3. Суммирует PnL ВСЕХ ордеров после since_ts (TP1, TP2, финал — разные ордера)
+    4. Логирует найденные ордера для дебага
+
+    Реальный кейс 2026-10-30: BTC SHORT — TP1 в 14:06 (+$43.79) и
+    TP2 в 15:16 (+$87.30) = +$131.09. Старый код возвращал $0.00.
+    """
+    if not executor or not executor.client or not executor.account_id:
         return 0.0
-    total = 0.0
-    for o in UE._as_list(data):
-        if not isinstance(o, dict):
-            continue
-        ts_str = o.get("closedAt") or o.get("filledAt") or o.get("updatedAt") or o.get("createdAt")
-        if not ts_str:
-            continue
+
+    if not sym or not since_ts:
+        return 0.0
+
+    # Готовим варианты asset: market_id и тикер
+    assets_to_try = []
+    try:
+        if executor._mk:
+            m = executor._mk.get(sym)
+            if m:
+                mid = str(m.get("id", "")).strip()
+                if mid:
+                    assets_to_try.append(mid)
+    except:
+        pass
+    if sym and sym not in assets_to_try:
+        assets_to_try.append(sym)
+
+    if not assets_to_try:
+        return 0.0
+
+    # Helper: парсинг PnL (как в upscale_exec.py history)
+    def _parse_pnl(pv):
+        if pv is None:
+            return None
+        t = str(pv).strip()
+        if not t or t in ("None", "null", "0"):
+            # "0" — это входной ордер (entry), PnL = 0, пропускаем
+            return None
         try:
-            if isinstance(ts_str, str) and "T" in ts_str:
-                ots = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-            elif float(ts_str) > 1e11:
-                ots = float(ts_str) / 1000
-            else:
-                ots = float(ts_str)
-            if ots < since_ts - 60:
+            if "." in t or "e" in t.lower():
+                return float(t)
+            return float(UE.from_fp9(t))
+        except:
+            return None
+
+    # Helper: парсинг ts (как в upscale_exec.py history)
+    def _parse_ts(o):
+        for k in ("closedAt", "filledAt", "updatedAt", "createdAt"):
+            v = o.get(k)
+            if not v:
                 continue
-            v = None
-            pv = o.get("realizedPnl")
-            if pv is not None:
-                t = str(pv).strip()
-                if t and t not in ("None", "null"):
-                    try:
-                        if "." in t or "e" in t.lower():
-                            v = float(t)
-                        else:
-                            v = float(UE.from_fp9(t))
-                    except Exception:
-                        pass
-            if v is not None:
-                total += v
-        except Exception:
+            try:
+                if isinstance(v, str) and "T" in v:
+                    return dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+                fv = float(v)
+                return fv / 1000 if fv > 1e11 else fv
+            except:
+                continue
+        return 0
+
+    total_pnl = 0.0
+    found_any = False
+
+    for asset in assets_to_try:
+        data = None
+        # V18-fix: 3 попытки с backoff (как в Prophet)
+        for attempt in range(3):
+            try:
+                data = executor.client.orders_history(executor.account_id, asset, 100)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"[bc V18] orders_history({asset}) failed 3x: {e}")
+                else:
+                    time.sleep(0.5 * (attempt + 1))
+
+        if data is None:
             continue
-    return total
+
+        orders = UE._as_list(data)
+        if not orders:
+            continue
+
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            ts = _parse_ts(o)
+            if not ts:
+                continue
+            if ts < since_ts - 60:
+                continue
+            pv = _parse_pnl(o.get("realizedPnl"))
+            if pv is None:
+                continue
+            total_pnl += pv
+            found_any = True
+            o_pid = str(o.get("positionId", "") or o.get("id", "") or "")
+            print(f"[bc V18] {sym} asset={asset}: order ts={ts:.0f} "
+                  f"pid={o_pid[:8] if o_pid else '-'} pnl=${pv:+.2f} "
+                  f"running=${total_pnl:+.2f}")
+
+        if found_any:
+            break
+
+    if not found_any:
+        print(f"[bc V18] ⚠ {sym}: realizedPnl не найден в orders_history! "
+              f"Проверь API Upscale / формат asset. assets_tried={assets_to_try}")
+
+    return total_pnl
+
 
 
 # =====================================================================
