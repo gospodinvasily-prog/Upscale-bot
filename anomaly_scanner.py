@@ -240,6 +240,110 @@ def _adx(c, p=14):
     for dx in dxs[p:]: ax = (ax*(p-1)+dx)/p
     return ax, 100*ps/av if av > 0 else 0, 100*ms/av if av > 0 else 0
 
+
+# === V18-fix: ПИРАМИДИНГ (как в Prophet V18) ===
+# Скопировано из prophet_v18.py — 1-я позиция всегда, 2-я только если 1-я в плюсе
+
+def _fetch_current_price_for_sym(sym: str):
+    """V18-fix: Получить текущую рыночную цену для символа.
+    
+    Старая _fetch_current_price использовала Gate.io /ticker endpoint —
+    он требует заголовок Timestamp и сейчас сломан (всегда None).
+    
+    Способ 1: Gate.io /candlesticks (последняя свеча close) — работает без auth.
+    Способ 2: Binance /ticker/price как fallback — работает без auth.
+    
+    Используется в _can_pyramid для проверки "1-я позиция в плюсе?".
+    """
+    # Способ 1: Gate.io candlesticks — последняя свеча close
+    try:
+        r = _session.get(
+            f"{GATE_API}/candlesticks",
+            params={"currency_pair": f"{sym}_USDT", "interval": "15m", "limit": 1},
+            timeout=10
+        )
+        if r.ok:
+            data = r.json()
+            if isinstance(data, list) and data:
+                # Gate.io candle: [ts, vol, close, high, low, open, base_vol, ok]
+                return float(data[0][2])
+    except: pass
+    # Способ 2: Binance как fallback
+    try:
+        r = _session.get(
+            f"https://api.binance.com/api/v3/ticker/price?symbol={sym}USDT",
+            timeout=10
+        )
+        if r.ok:
+            d = r.json()
+            return float(d.get("price", 0))
+    except: pass
+    return None
+
+
+def _can_pyramid(direction: str, tracked: dict) -> tuple:
+    """V18-fix: ПИРАМИДИНГ — можно ли открыть новую позицию в эту сторону?
+    
+    Логика (как в Prophet V18):
+      - 1-я позиция в сторону: ВСЕГДА можно (если есть свободный слот MAX_OPEN)
+      - 2-я позиция в сторону: только если ВСЕ предыдущие позиции в этой стороне В ПЛЮСЕ
+        (по текущей рыночной цене, порог > 0.5% — выше комиссий+slippage)
+    
+    Возвращает (can_open: bool, reason: str)
+    """
+    side_long = direction in ("LONG", "long")
+    
+    # Собираем все открытые позиции в эту сторону (исключая pending_)
+    side_positions = []
+    for pid, rec in tracked.items():
+        if rec.get("status") != "open": continue
+        if pid.startswith("pending_"): continue
+        rec_dir = rec.get("direction", rec.get("dir", "long"))
+        rec_is_long = rec_dir in ("LONG", "long")
+        if rec_is_long == side_long:
+            side_positions.append(rec)
+    
+    n_side = len(side_positions)
+    
+    # 1-я позиция в сторону — всегда можно
+    if n_side == 0:
+        return True, "первая позиция в сторону"
+    
+    # Для последующих — проверяем что ВСЕ предыдущие в плюсе
+    profitable = 0
+    losing = 0
+    unknown = 0
+    for rec in side_positions:
+        sym = rec.get("sym")
+        entry = rec.get("entry", 0)
+        if not sym or not entry:
+            unknown += 1
+            continue
+        cur_price = _fetch_current_price_for_sym(sym)
+        if not cur_price:
+            # V18-fix: network failure — НЕ можем проверить цену
+            # Лучше пропустить сигнал чем открыть 2-ю позицию когда 1-я в убытке
+            unknown += 1
+            continue
+        if side_long:
+            # LONG: прибыль если cur > entry
+            pnl_pct = (cur_price - entry) / entry * 100
+        else:
+            # SHORT: прибыль если cur < entry
+            pnl_pct = (entry - cur_price) / entry * 100
+        if pnl_pct > 0.5:  # порог 0.5% (комиссии+slippage)
+            profitable += 1
+        else:
+            losing += 1
+    
+    if losing > 0:
+        return False, f"в {direction} уже {n_side} позиций, {losing} в убытке — пирамидинг запрещён"
+    
+    if unknown > 0:
+        return False, f"в {direction} {n_side} позиций, {unknown} цена неизвестна — пирамидинг заблокирован (network)"
+    
+    return True, f"в {direction} {n_side} позиций, все в плюсе — пирамидинг разрешён"
+
 # === FETCH ===
 
 def _fetch(sym, iv, start_ts, end_ts):
@@ -272,13 +376,13 @@ def _btc_regime(at_ts):
     return +1 if bc[-1]["close"] > sma else -1
 
 def _fetch_current_price(sym):
-    try:
-        r = _session.get(f"{GATE_API}/ticker", params={"currency_pair": f"{sym}_USDT"}, timeout=10)
-        if r.ok:
-            d = r.json()
-            return float(d.get("last", 0))
-    except: pass
-    return None
+    """V18-fix: Redirect to _fetch_current_price_for_sym (candlesticks + Binance).
+    
+    Старая версия использовала Gate.io /ticker endpoint — он требует заголовок
+    Timestamp и сейчас сломан (всегда None). Это ломало checkpoint-логику и
+    проверку пирамидинга (никогда не знали реальную цену).
+    """
+    return _fetch_current_price_for_sym(sym)
 
 # === DETECT ANOMALIES ===
 
@@ -604,6 +708,13 @@ def do_scan(scan_ts=None):
         # Per-side daily stop
         if _side_blocked(direction): continue
 
+        # V18-fix: ПИРАМИДИНГ — 2-я позиция в сторону только если 1-я в плюсе (>0.5%)
+        # (как в Prophet V18). 1-я позиция — всегда можно.
+        can_pyramid, pyramid_reason = _can_pyramid(direction, tracked)
+        if not can_pyramid:
+            print(f"[anomaly V18] {sym} {direction}: пирамидинг запрещён — {pyramid_reason}")
+            continue
+
         # Считаем TP/SL
         c4 = [cc for cc in c4h if cc["ts"] + 14400 <= scan_ts][-100:]
         if len(c4) < 14: continue
@@ -856,7 +967,7 @@ def execute_trade(setup):
         "symbol": sym, "side": side, "price": entry,
         "stop": stop, "stop_pct": sp, "tp1_price": tp,
         "exit_mode": "tp_ladder", "risk_usd": RISK_USD,
-        "max_pos_usd": pos_size, "max_same_side": 1,
+        "max_pos_usd": pos_size, "max_same_side": 2,  # V18-fix: пирамидинг (как Prophet) — 2 позиции в сторону если 1-я в плюсе
         "strategy": STRATEGY_TAG, "leverage_override": LEVERAGE, "ext_atr": 0.0,
     }
 
@@ -1608,7 +1719,7 @@ def cmd_status():
         lines.append(f"Сделок: {_stats['trades']} (WR {wr:.0f}%)")
         lines.append(f"PnL: ${_stats['pnl']:+.2f}")
     lines.append(f"\n📅 Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)")
-    lines.append(f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}")
+    lines.append(f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE=2")
     lines.append(f"🎯 Аномалии: 6 шт (Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion, TrendAlignment)")
     lines.append(f"⚡ Вход: MIN={MIN_ANOMALIES} (комбо-подтверждение)")
     lines.append(f"🛡️ SKIP_2_WEAK: combo из 2 слабых → skip")
@@ -1617,7 +1728,8 @@ def cmd_status():
     lines.append(f"🛡️ Per-side daily stop: -${SIDE_DAILY_STOP_USD:.0f}")
     lines.append(f"⏱️ Кулдаун по паре: {SYMBOL_COOLDOWN_SEC//3600}ч")
     lines.append(f"⛔ Blacklist после стопа: 48ч")
-    lines.append(f"🏷️ Версия: V17b (без BTC + 6 аномалий + Simple TP)")
+    lines.append(f"📌 Пирамидинг: 2-я позиция в сторону — только если 1-я в плюсе (>0.5%)")
+    lines.append(f"🏷️ Версия: V18 (без BTC + 6 аномалий + Simple TP + Пирамидинг)")
     if USE_SKIP_2_WEAK:
         lines.append(f"✅ SKIP_2_WEAK: фильтрует 2 weak коррелированных")
     lines.append(f"💪 STRONG аномалии (PF>1.4): Laggard, ZScoreDev, LiqMagnet, TrendAlignment")
@@ -1657,7 +1769,7 @@ def cmd_on():
     return (
         f"🚨 <b>Anomaly V18 включён</b>\n\n"
         f"📊 <b>Настройки:</b>\n"
-        f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}\n"
+        f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE=2\n"
         f"⏰ Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)\n"
         f"🎯 6 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion, TrendAlignment\n"
         f"⚡ Вход: MIN={MIN_ANOMALIES} (комбо-подтверждение)\n"
@@ -1665,6 +1777,7 @@ def cmd_on():
         f"🚫 LONG в BEAR: запрещён полностью\n"
         f"🎯 Simple TP: trend={TP_TREND}×ATR, counter={TP_COUNTER}×ATR | SL={SL_MULT}×ATR\n"
         f"⏱️ Кулдаун: {SYMBOL_COOLDOWN_SEC//3600}ч | Blacklist: 48ч\n"
+        f"📌 Пирамидинг: 2-я позиция в сторону — только если 1-я в плюсе (>0.5%)\n"
         f"🚀 Стратегия запущена"
     )
 
@@ -1726,7 +1839,7 @@ def start():
         B.send_telegram(
             f"🚨 <b>Anomaly V18 запущен</b>\n"
             f"📊 Стратегия: {mode_str}\n"
-            f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN}\n"
+            f"👥 Пар: {len(PAIRS)} (без BTC) | MAX_OPEN={MAX_OPEN} | MAX_SAME_SIDE=2\n"
             f"⏰ Скан: :{SCAN_MINUTE:02d}, 04:00-22:00 МСК (без 07:00, 15:00)\n"
             f"🎯 6 аномалий: Laggard, ZScoreDev, Divergence, LiqMagnet, Exhaustion, TrendAlignment\n"
             f"⚡ Вход: MIN={MIN_ANOMALIES} (комбо-подтверждение)\n"
@@ -1734,5 +1847,6 @@ def start():
             f"🚫 LONG в BEAR: запрещён полностью\n"
             f"🎯 Simple TP: trend={TP_TREND}×ATR, counter={TP_COUNTER}×ATR | SL={SL_MULT}×ATR\n"
             f"⏱️ Кулдаун: {SYMBOL_COOLDOWN_SEC//3600}ч | Blacklist: 48ч\n"
+            f"📌 Пирамидинг: 2-я позиция в сторону — только если 1-я в плюсе (>0.5%)\n"
             f"Команды: /anomaly /anomaly_on /anomaly_off /anomaly_close /anomaly_clean /anomaly_alerts"
         )
